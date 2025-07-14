@@ -46,7 +46,7 @@ const long minPos=-stepsPerRot/4, maxPos=stepsPerRot/4;
 
 void sendPos(){
   long curtime=millis();
-  if (abs(curtime-lastWrite)>=2){
+  if (abs(curtime-lastWrite)>=5){
     Serial.println(stepper.currentPosition());
     lastWrite=curtime;
   }
@@ -66,40 +66,66 @@ void wiggle(long period_len, long amplitude){
 }
 
 bool wiggling=false;
-
+char lastVarId='-';
 String inputBuffer;
+
+double Pos0=0, Vel0=0, Acc0=0, Thd0=0;
+long T0=0;
+long lastPosUpd=0;
 
 void loop() {
   sendPos();
 
   while (Serial.available()) {
     char c = Serial.read();
+    
+
+    if ('A'<=c && c<='Z'){
+      lastVarId = c;
+      continue;
+    }
+
     if (c == '\n') {
-      long val = inputBuffer.toInt();
-      goal = val;        
+      long val = inputBuffer.toDouble();
+
+      switch (lastVarId){
+        case 'P':
+          Pos0=val;
+          T0=millis();
+          break;
+
+        case 'V':
+          Vel0=val;
+          break;
+
+        case 'A':
+          Acc0=val;
+          break;
+
+        case 'T':
+          Thd0=val;
+          break;
+      }       
       inputBuffer = "";
-    } else if ((c >= '0' && c <= '9') || c == '-') {
+      continue;
+    } 
+     
+    if ((c >= '0' && c <= '9') || c == '-' || c == '.') {
       inputBuffer += c;
       // ignore any other characters
     }
   }
 
-  
-  if (goal==32123){
-    wiggling=true;
-    goal=0;
-  }
-  else{
-    //Serial.println("Got "+String(goal));32123
-    wiggling=false;
+
+  if (abs(millis()-lastPosUpd)>=5){
+    double dt=(millis()-T0+0.0)/1000.0;
+    goal=round(dt*(dt*(dt*Thd0+Acc0)+Vel0)+Pos0);
     goal=min(max(goal, minPos), maxPos);
     stepper.moveTo(goal);
   }
 
-  if (wiggling){
-    wiggle(10000, stepsPerRot/2);
-    wiggling=false;
-  }
+  
+  sendPos();
     
   stepper.run();
 }

@@ -6,7 +6,10 @@ from scipy.interpolate import CubicSpline
 x = sp.symbols('x')
 
 
-def gen_traj(dt=1., dur=30., grav=0.25, thd_ampl=1., draw=False):
+def gen_traj(dt=1., dur=30., grav=0.25, thd_ampl=1., draw=False, seed=None):
+    if seed:
+        np.random.seed(seed)
+
     ct, pos, vel, acc = 0., 0., 0., 0.
 
     X, Y = [ct], [pos]
@@ -37,18 +40,22 @@ def gen_traj(dt=1., dur=30., grav=0.25, thd_ampl=1., draw=False):
     return spl
 
 
-def sample_pts(min_delay=0.2, max_delay=0.5, noise_ampl=1., traj_dt=1., dur=30., grav=0.25, thd_ampl=1., draw=False):
-    spl = gen_traj(traj_dt, dur, grav, thd_ampl, draw=draw)
+def sample_pts(min_delay=0.2, max_delay=0.5, noise_scale=1., traj_dt=1., dur=30., grav=0.25, thd_ampl=1., draw=False,
+               seed=None):
+    if seed:
+        np.random.seed(seed)
+
+    spl = gen_traj(traj_dt, dur, grav, thd_ampl, draw=draw, seed=seed)
     ct = 0
     X, Y = [], []
     while ct < dur:
         X.append(ct)
-        Y.append(spl(ct) + np.random.uniform(-noise_ampl, noise_ampl))
+        Y.append(spl(ct) + np.random.normal(0, noise_scale))
         ct += np.random.uniform(min_delay, max_delay)
 
     if draw:
-        plt.plot(X, Y, '.', label=r'samples')
-    return X, Y
+        plt.plot(X, Y, 'o', label=r'samples')
+    return X, Y, spl
 
 
 if __name__ == '__main__':

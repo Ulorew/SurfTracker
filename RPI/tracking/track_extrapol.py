@@ -4,7 +4,6 @@ import sys
 from collections import deque
 
 import psutil
-import serial
 from picamera2 import Picamera2
 import libcamera
 import os
@@ -14,7 +13,62 @@ import numpy as np
 from ultralytics import YOLO
 from scipy.interpolate import CubicSpline, CubicHermiteSpline, PPoly
 from time import perf_counter
+from motor_driver import motor_driver_process
 
+
+class KalmanFilterVarDT:
+    def __init__(self, process_var, meas_var):
+        # H и R неизменны, измеряется только положение
+        self.H = np.array([[1., 0., 0.]])
+        self.R = np.array([[meas_var]])
+
+        # Q задаётся динамически в predict(), init тут только форма
+        self.process_var = process_var
+
+        # Состояние: [p, v, a]
+        self.x = np.zeros((3, 1))
+        self.P = np.eye(3) * 1000
+
+    def _make_F_Q(self, dt):
+        # Составляем матрицу перехода и ковариацию шума процесса для данного dt
+        F = np.array([
+            [1, dt, 0.5 * dt ** 2],
+            [0, 1, dt],
+            [0, 0, 1]
+        ])
+        q = self.process_var
+        Q = q * np.array([
+            [dt ** 4 / 4, dt ** 3 / 2, dt ** 2 / 2],
+            [dt ** 3 / 2, dt ** 2, dt],
+            [dt ** 2 / 2, dt, 1]
+        ])
+        return F, Q
+
+    def predict(self, dt):
+        """Шаг предсказания с произвольным шагом времени dt."""
+        F, Q = self._make_F_Q(dt)
+        self.x = F @ self.x
+        self.P = F @ self.P @ F.T + Q
+
+    def update(self, z):
+        """Корректировка по измерению позиции z."""
+        z = np.array([[z]])
+        y = z - (self.H @ self.x)
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ y
+        I = np.eye(self.P.shape[0])
+        self.P = (I - K @ self.H) @ self.P
+
+    def forecast(self, T):
+        """
+        Прогноз положения через произвольный промежуток T.
+        Возвращает одно число — прогнозируемую позицию.
+        """
+        # Матрица перехода на шаг T
+        F_T, _ = self._make_F_Q(T)
+        x_pred = F_T @ self.x
+        return float(x_pred[0])
 
 class catchtime:
     def __init__(self, name: str = "Time"):
@@ -42,20 +96,20 @@ def normalize_frame(frame):
     return sharp
 
 
-img_w, img_h = 640, 480
+IMG_W, IMG_H = 640, 480
 FOV = (63.5 / 180) * math.pi
-cam_depth = (0.5) / math.tan(FOV / 2)  # H/w
-join_time = 1.5
-lose_time = 2.
-ser_upd_time = 0.01
+CAM_DEPTH = (0.5) / math.tan(FOV / 2)  # H/w
+JOIN_TIME = 1.5
+LOSE_TIME = 2.
+
+STEPS_PER_REV = 8800
 
 streak_frame_id = 0
 
-print(f"Working in resolution {img_w}x{img_h}")
-print(f"FOV: {FOV} rad, cam_depth: {cam_depth}")
-print(f"Join time: {join_time}")
+print(f"Working in resolution {IMG_W}x{IMG_H}")
+print(f"FOV: {FOV} rad, cam_depth: {CAM_DEPTH}")
+print(f"Join time: {JOIN_TIME}")
 
-steps_per_rev = 8800
 
 surf_traj = CubicSpline([0, 1], [0, 0])
 cam_traj = CubicSpline([0, 1], [0, 0])
@@ -65,27 +119,6 @@ target_classes = [0]
 draw = True
 inference_times = deque(maxlen=5)
 
-
-def upd_cur_pos(ser):
-    st = time.time()
-    lns = ser.read_all().decode().split('\n')
-    if time.time() - st > 0.2:
-        print(f"I've been reading for {time.time() - st:.2f} seconds!")
-    if len(lns) <= 2:
-        print("Unable to get current position! Not enough position marks from arduino")
-        print(f"lns = {lns}")
-        return 0
-    cur_pos = int(lns[-2])
-    # print(f"Read {cur_pos}")
-    return cur_pos
-
-
-def set_goal(ser, goal):
-    goal = int(round(goal))
-    try:
-        ser.write(f"{goal}\n".encode())
-    except serial.serialutil.SerialTimeoutException as e:
-        print("Serial write timed out")
 
 
 def eval_traj(traj, dur):
@@ -107,7 +140,7 @@ def update_traj(ns):
     # print(f"Surf traj pred: {eval_traj(surf_traj, join_time)}")
     # print(f"Cam traj previous: {eval_traj(cam_traj, join_time)}")
 
-    tl, tr = time.time(), time.time() + join_time
+    tl, tr = time.time(), time.time() + JOIN_TIME
 
     yl, yr = cam_traj(tl), surf_traj(tr)
     dl, dr = cam_traj.derivative()(tl), surf_traj.derivative()(tr)
@@ -119,7 +152,7 @@ def process_image(ns, picam, model):
     global cam_traj, X, Y, streak_frame_id
     cap_pos = ns.cam_pos
     frame = picam.capture_array()
-    frame = cv2.resize(frame, (img_w, img_h), interpolation=cv2.INTER_AREA)
+    frame = cv2.resize(frame, (IMG_W, IMG_H), interpolation=cv2.INTER_AREA)
     frame = normalize_frame(frame)
     inference_times.append(time.time())
     if len(inference_times) > 1:
@@ -133,16 +166,16 @@ def process_image(ns, picam, model):
         targ = np.argmax(list(res.boxes.conf))
         b_x, b_y, b_w, b_h = res.boxes.xywhn[targ][:4]
 
-        ang_dif = math.atan2((float(b_x) - 0.5), cam_depth)
-        dsteps = -round(steps_per_rev * ang_dif / (2 * math.pi))
+        ang_dif = math.atan2((float(b_x) - 0.5), CAM_DEPTH)
+        dsteps = -round(STEPS_PER_REV * ang_dif / (2 * math.pi))
         # dsteps //= 2
         obj_pos = cap_pos + dsteps
 
         if draw:
-            x1 = int((b_x - b_w / 2) * img_w)
-            y1 = int((b_y - b_h / 2) * img_h)
-            w1 = int(b_w * img_w)
-            h1 = int(b_h * img_h)
+            x1 = int((b_x - b_w / 2) * IMG_W)
+            y1 = int((b_y - b_h / 2) * IMG_H)
+            w1 = int(b_w * IMG_W)
+            h1 = int(b_h * IMG_H)
             cv2.rectangle(frame, (x1, y1), (x1 + w1, y1 + h1), (0, 255, 0), 2)
             cv2.putText(frame, f"Obj at {obj_pos:.0f}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
@@ -155,17 +188,17 @@ def process_image(ns, picam, model):
         Y.append(float(obj_pos))
         update_traj(ns)
         print("Planned trajectories:")
-        print(f"Surf traj: {eval_traj(surf_traj, join_time)}")
-        print(f"Cam  traj: {eval_traj(cam_traj, join_time)}")
+        print(f"Surf traj: {eval_traj(surf_traj, JOIN_TIME)}")
+        print(f"Cam  traj: {eval_traj(cam_traj, JOIN_TIME)}")
 
         ns.last_det = time.time()
     else:
         print("Nothing found")
-        if time.time() - ns.last_det > lose_time:
+        if time.time() - ns.last_det > LOSE_TIME:
             streak_frame_id = 0
             print("Lost target")
             X, Y = [], []
-            if time.time() - ns.last_det <= lose_time + 5:
+            if time.time() - ns.last_det <= LOSE_TIME + 5:
                 cam_traj = CubicSpline([0, 1], [ns.cam_pos, ns.cam_pos])
             else:
                 cam_traj = CubicSpline([0, 1], [0., 0.])
@@ -217,47 +250,6 @@ def inference_process(ns):
             time.sleep(0.1)
 
 
-def arduino_communication_process(ns):
-    # p = psutil.Process(os.getpid())
-    # p.cpu_affinity([0, 1])
-
-    ser = serial.Serial('/dev/ttyACM0', 115200, timeout=0.1, write_timeout=0.1)
-    ser.reset_input_buffer()
-    ser.write("0\n".encode())
-
-    print("Starting serial monitoring")
-    ser_upd_times = deque(maxlen=1000)
-    last_msg_time = time.time()
-    sum_lag = 0.
-    silent_iter = 0
-
-    while True:
-        ser_upd_times.append(time.time())
-        if len(ser_upd_times) > 1 and time.time() - last_msg_time >= 1:
-            IPS = (len(ser_upd_times) - 1.0) / (ser_upd_times[-1] - ser_upd_times[0])
-            avg_lag = sum_lag / silent_iter
-            print(f"Serial update IPS: {IPS:.0f} | Avg lag: {lag:.1f}")
-            sum_lag = 0
-            silent_iter = 0
-            last_msg_time = time.time()
-
-        ns.cam_pos = upd_cur_pos(ser)
-        cam_traj = PPoly(ns.cam_traj_coeffs, ns.cam_traj_knots)
-        # print(f"Got cam traj: {eval_traj(cam_traj, join_time)}")
-        loop_start = time.time()
-        goal = float(cam_traj(loop_start))
-
-        silent_iter += 1
-        lag = abs(goal - ns.cam_pos)
-        if lag > 300:
-            print(f"Lag: {lag}! Pos: {ns.cam_pos}, Goal: {goal}")
-        sum_lag += abs(goal - ns.cam_pos)
-        # print(f"Going to {goal}, {type(goal)}")
-        set_goal(ser, goal)
-
-        sleep_time = max(0., ser_upd_time - (time.time() - loop_start))
-        time.sleep(sleep_time)
-
 
 if __name__ == "__main__":
     mp.set_start_method('fork')  # на Raspberry Pi обычно 'fork' работает лучше
@@ -271,7 +263,7 @@ if __name__ == "__main__":
     ns.cam_traj_coeffs = [[0], [0]]
 
     p1 = mp.Process(target=inference_process, name="InferenceProcess", args=(ns,))
-    p2 = mp.Process(target=arduino_communication_process, name="ArduinoCommunicationProcess", args=(ns,))
+    p2 = mp.Process(target=motor_driver_process, name="MotorDriverProcess", args=(ns,))
 
     p1.start()
     p2.start()
