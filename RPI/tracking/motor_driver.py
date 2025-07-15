@@ -26,14 +26,8 @@ def upd_cur_pos():
 #     except serial.serialutil.SerialTimeoutException as e:
 #         print("Serial write timed out")
 
-def set_traj(pos, vel=None, acc=None, thd=None):
-    msg=f"P{pos:0.2f}\n"
-    if vel is not None:
-        msg+=f"V{vel:0.2f}\n"
-    if acc is not None:
-        msg+=f"A{acc:0.2f}\n"
-    if thd is not None:
-        msg+=f"T{thd:0.2f}\n"
+def set_traj(A, B, C, D): # y = A dt^3 + B dt^2 + C dt + D
+    msg=f"A{A:0.2f}\nB{B:0.2f}\nC{C:0.2f}\nD{D:0.2f}\n"
 
     print(f"New cam trajectory:\n{msg}", end='')
     ser.write(msg.encode())

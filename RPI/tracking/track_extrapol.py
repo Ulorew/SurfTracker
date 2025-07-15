@@ -7,7 +7,6 @@ import os
 import time
 import cv2
 import numpy as np
-from responses import start
 from scipy.misc import derivative
 from ultralytics import YOLO
 from scipy.interpolate import CubicSpline, CubicHermiteSpline, PPoly, make_interp_spline, KroghInterpolator
@@ -31,19 +30,19 @@ class catchtime:
 
 
 class Kalman1D:
-    def __init__(self, pos0, vel0=0, acc0=0, process_var=1.0, meas_var=10.0):
+    def __init__(self, pos0, vel0=0, process_var=1.0, meas_var=10.0):
         # Состояние: [позиция, скорость, ускорение]
-        self.x = np.array([[pos0], [vel0], [acc0]])
+        self.x = np.array([[pos0], [vel0]])
 
         # Начальная ковариация
-        self.P = np.eye(3) * 100.0
+        self.P = np.eye(2) * 100.0
 
         # Дисперсии
         self.process_var = process_var  # шум модели
         self.meas_var = meas_var  # шум измерения
 
         # Матрица наблюдения (мы наблюдаем только позицию)
-        self.H = np.array([[1, 0, 0]])
+        self.H = np.array([[1, 0]])
 
         # Дисперсия измерения
         self.R = np.array([[meas_var]])
@@ -52,26 +51,24 @@ class Kalman1D:
 
     def reset(self, pos0=None, t0=None):
         if pos0 is not None:
-            self.x = np.array([[pos0], [0], [0]])
-        self.P = np.eye(3) * 100.0
+            self.x = np.array([[pos0], [0]])
+        self.P = np.eye(2) * 100.0
 
         self.last_t = t0
 
     def predict(self, dt):
         # Модель перехода
         F = np.array([
-            [1, dt, 0.5 * dt ** 2],
-            [0, 1, dt],
-            [0, 0, 1]
+            [1, dt],
+            [0, 1],
         ])
         # Модель шумов (дискретизированная для постоянного ускорения)
         G = np.array([
-            [0.5 * dt ** 2],
             [dt],
             [1]
         ])
         # Q = self.process_var * (G @ G.T)
-        dynamic_coef = (dt / 0.2) ** 2  # (dt ** 2)
+        dynamic_coef = (dt / 0.2)  # (dt ** 2)
         Q = self.process_var * dynamic_coef * (G @ G.T)
         # Предсказание
         self.x = F @ self.x
@@ -107,9 +104,8 @@ class Kalman1D:
         x_pred = self.x.copy()
         for _ in range(steps):
             F = np.array([
-                [1, dt_future, 0.5 * dt_future ** 2],
-                [0, 1, dt_future],
-                [0, 0, 1]
+                [1, dt_future],
+                [0, 1],
             ])
             x_pred = F @ x_pred
         return x_pred
@@ -151,9 +147,9 @@ CAM_DEPTH = (0.5) / math.tan(FOV / 2)  # H/w
 JOIN_TIME = 2.
 LOSE_TIME = 2.
 
-STEPS_PER_REV = 8800
+STEPS_PER_REV = 4400
 
-kalman = Kalman1D(0, 0, 0, 100, 10)
+kalman = Kalman1D(0, 0, 250, 1)
 
 streak_frame_id = 0
 
@@ -205,13 +201,10 @@ def update_traj():
     cur_surf_pos = Y[-1]
 
     traj_info = kalman.step(cur_surf_pos, cur_time)
-    pos, vel, acc = traj_info.squeeze()
+    pos, vel = traj_info.squeeze()
 
-    print(f"Kalman info | pos: {pos:.1f}     vel: {vel:.1f}     acc: {acc:.1f}")
-
-    surf_traj = shifted_parabola(cur_time, pos, vel, acc)
-    # if len(X) == 1:
-    #     return CubicSpline([0., 1.], [Y[0], Y[0]])
+    print(f"Kalman info | pos: {pos:.1f}     vel: {vel:.1f}")
+    surf_traj = CubicSpline([cur_time, cur_time + 1], [pos, pos + vel])
 
     print(f"Surf traj pred: {eval_traj(surf_traj, JOIN_TIME)}")
     print(f"Cam traj previous: {eval_traj(cam_traj, JOIN_TIME)}")
@@ -220,14 +213,14 @@ def update_traj():
 
     yl, yr = cam_traj(cur_time), surf_traj(tr)
     dl, dr = cam_traj.derivative()(tl), surf_traj.derivative()(tr)
-    #cam_traj = CubicHermiteSpline([tl, tr], [yl, yr], [dl, dr])
-    # cam_traj
-    # cam_vel = cam_traj.derivative()
-    # cam_acc = cam_vel.derivative()
-    # cam_thd = cam_acc.derivative()
+    cam_traj = CubicHermiteSpline([tl, tr], [yl, yr], [dl, dr])
 
-    set_traj(pos, vel, acc, 0)
-    # set_traj(cam_traj(cur_time), cam_vel(cur_time), cam_acc(cur_time), cam_thd(cur_time))
+    cam_vel = cam_traj.derivative()
+    cam_acc = cam_vel.derivative()
+    cam_thd = cam_acc.derivative()
+
+    # set_traj(pos, cam_vel, cam_acc, cam_thd)
+    set_traj(cam_thd(cur_time)/6., cam_acc(cur_time)/2., cam_vel(cur_time), cam_traj(cur_time))
     # print(f"Cam traj new: {eval_traj(cam_traj, join_time)}")
 
 
@@ -236,7 +229,7 @@ def process_image(picam, model):
     cap_pos = upd_cur_pos()
     frame = picam.capture_array()
     frame = cv2.resize(frame, (IMG_W, IMG_H), interpolation=cv2.INTER_AREA)
-    #frame[:IMG_H//2, :] = normalize_frame(frame[:IMG_H//2, :])
+    # frame[:IMG_H//2, :] = normalize_frame(frame[:IMG_H//2, :])
     frame = normalize_frame(frame)
     inference_times.append(time.perf_counter())
     if len(inference_times) > 1:

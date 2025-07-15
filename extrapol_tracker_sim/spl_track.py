@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
 from scipy.interpolate import CubicSpline, CubicHermiteSpline
 
 from extrapol_tracker_sim.movement_sim import sample_pts
@@ -9,40 +10,45 @@ import time
 
 
 class Kalman1D:
-    def __init__(self, pos0, vel0=0, acc0=0, process_var=1.0, meas_var=10.0):
+    def __init__(self, pos0, vel0=0, process_var=1.0, meas_var=10.0):
         # Состояние: [позиция, скорость, ускорение]
-        self.x = np.array([[pos0], [vel0], [acc0]])
+        self.x = np.array([[pos0], [vel0]])
 
         # Начальная ковариация
-        self.P = np.eye(3) * 100.0
+        self.P = np.eye(2) * 100.0
 
         # Дисперсии
         self.process_var = process_var  # шум модели
         self.meas_var = meas_var  # шум измерения
 
         # Матрица наблюдения (мы наблюдаем только позицию)
-        self.H = np.array([[1, 0, 0]])
+        self.H = np.array([[1, 0]])
 
         # Дисперсия измерения
         self.R = np.array([[meas_var]])
 
         self.last_t = None
 
+    def reset(self, pos0=None, t0=None):
+        if pos0 is not None:
+            self.x = np.array([[pos0], [0]])
+        self.P = np.eye(2) * 100.0
+
+        self.last_t = t0
+
     def predict(self, dt):
         # Модель перехода
         F = np.array([
-            [1, dt, 0.5 * dt ** 2],
-            [0, 1, dt],
-            [0, 0, 1]
+            [1, dt],
+            [0, 1],
         ])
         # Модель шумов (дискретизированная для постоянного ускорения)
         G = np.array([
-            [0.5 * dt ** 2],
             [dt],
             [1]
         ])
         # Q = self.process_var * (G @ G.T)
-        dynamic_coef = (dt / 0.2) ** 2  # (dt ** 2)
+        dynamic_coef = (dt / 0.2)  # (dt ** 2)
         Q = self.process_var * dynamic_coef * (G @ G.T)
         # Предсказание
         self.x = F @ self.x
@@ -78,9 +84,8 @@ class Kalman1D:
         x_pred = self.x.copy()
         for _ in range(steps):
             F = np.array([
-                [1, dt_future, 0.5 * dt_future ** 2],
-                [0, 1, dt_future],
-                [0, 0, 1]
+                [1, dt_future],
+                [0, 1],
             ])
             x_pred = F @ x_pred
         return x_pred
@@ -153,15 +158,48 @@ def track(join_timeout=2., fov_ampl=31., proc_var=100., meas_var=1., min_delay=0
 if __name__ == '__main__':
 
     num_iter = 25
+    noise_scale = 10
 
-    for proc_var in [1, 3, 6, 10, 25, 60, 100, 250, 600, 1000, 2500, 6000, 7500, 10000, 15000, 25000, 45000, 60000,
-                     1e10]:
-        cerr = 0
-        for seed in range(num_iter):
-            cerr += track(join_timeout=1, dur=20., proc_var=proc_var, noise_scale=1, draw=False, fov_ampl=100000000,
-                          seed=seed)
-        print(f"Proc var {proc_var}: {cerr / num_iter:.2f}")
+    print(f"noise_scale: {noise_scale}")
+
+    proc_vars = [60, 100, 250, 600, 1000, 2500]
+    meas_vars = [0.1, 0.25, 0.6, 1, 3, 6, 10]
+    num_iter = 25  # Количество итераций для усреднения
+
+    # Создаем пустой DataFrame для результатов
+    results = pd.DataFrame(
+        index=proc_vars,
+        columns=meas_vars
+    )
+    results.index.name = 'proc_var'
+    results.columns.name = 'meas_var'
+
+    # Заполняем таблицу результатами
+    for proc_var in proc_vars:
+        for meas_var in meas_vars:
+            cerr = 0
+            for seed in range(num_iter):
+                # Вызов функции трекинга (замените на реальную реализацию)
+                error = track(
+                    join_timeout=1,
+                    dur=20.0,
+                    proc_var=proc_var,
+                    meas_var=meas_var,
+                    noise_scale=noise_scale,
+                    draw=False,
+                    fov_ampl=100000000,
+                    seed=seed
+                )
+                cerr += error
+            avg_error = cerr / num_iter
+            results.loc[proc_var, meas_var] = avg_error
+            print(f"proc_var {proc_var}, meas_var {meas_var}: {avg_error:.2f}")
+
+    # Выводим отформатированную таблицу
+    print("\nИтоговая таблица результатов:")
+    print(results)
+
     # for seed in range(5):
-    #     track(join_timeout=1, dur=10., proc_var=250, noise_scale=10, draw=True, fov_ampl=10000000, seed=seed)
+    #     track(join_timeout=1, dur=10., proc_var=250, noise_scale=25, draw=True, fov_ampl=10000000, seed=seed)
     #     plt.legend()
     #     plt.show()

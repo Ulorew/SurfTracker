@@ -15,12 +15,12 @@ const int dirZPin = 7; // Z.DIR
 int stepPin=stepXPin;
 int dirPin=dirXPin;
 
-const long stepsPerRev=1600; // stepper
+const long stepsPerRev=800; // stepper
 int stepsPerChase=10;
 int pulseWidthMicros = 100;  // microseconds
 long millisBtwnSteps = 1000;
 
-const long stepsPerRot=8800; // camera
+const long stepsPerRot=4400; // camera
 
 AccelStepper stepper(MOTOR_INTERFACE_TYPE, stepPin, dirPin);
 
@@ -32,8 +32,8 @@ void setup() {
   digitalWrite(enPin, LOW);
   pinMode(stepPin, OUTPUT);
   pinMode(dirPin, OUTPUT);
-  stepper.setMaxSpeed(15000);  // Set maximum speed (steps/second)
-  stepper.setAcceleration(30000);  // Set acceleration (steps/second^2)
+  stepper.setMaxSpeed(2000);  // Set maximum speed (steps/second)
+  stepper.setAcceleration(4000);  // Set acceleration (steps/second^2)
  
   Serial.println(F("CNC Shield Initialized"));
 }
@@ -55,9 +55,10 @@ void sendPos(){
 void wiggle(long period_len, long amplitude){
   long st_time=millis();
   while (millis()<st_time+period_len){
-    sendPos();
+        
     double arg=(millis()-st_time+0.0)/period_len;
     long goal=round(sin(arg*2*PI)*amplitude);
+    sendPos();
     stepper.moveTo(goal);
     stepper.run();
     //Serial.println(stepper.currentPosition());
@@ -69,7 +70,7 @@ bool wiggling=false;
 char lastVarId='-';
 String inputBuffer;
 
-double Pos0=0, Vel0=0, Acc0=0, Thd0=0;
+double A=0, B=0, C=0, D=0;
 long T0=0;
 long lastPosUpd=0;
 
@@ -89,21 +90,21 @@ void loop() {
       long val = inputBuffer.toDouble();
 
       switch (lastVarId){
-        case 'P':
-          Pos0=val;
+        case 'A':
+          A=val;
           T0=millis();
           break;
 
-        case 'V':
-          Vel0=val;
+        case 'B':
+          B=val;
           break;
 
-        case 'A':
-          Acc0=val;
+        case 'C':
+          C=val;
           break;
 
-        case 'T':
-          Thd0=val;
+        case 'D':
+          D=val;
           break;
       }       
       inputBuffer = "";
@@ -117,13 +118,16 @@ void loop() {
   }
 
 
-  if (abs(millis()-lastPosUpd)>=5){
+  if (abs(millis()-lastPosUpd)>=1){
     double dt=(millis()-T0+0.0)/1000.0;
-    goal=round(dt*(dt*(dt*Thd0+Acc0)+Vel0)+Pos0);
+    goal=round(dt*(dt*(dt*A+B)+C)+D);
     goal=min(max(goal, minPos), maxPos);
     stepper.moveTo(goal);
   }
 
+  // while (true){
+  //   wiggle(4000, 500);
+  // }
   
   sendPos();
     
