@@ -41,8 +41,9 @@ class Kalman1D:
             [dt],
             [1]
         ])
-        Q = self.process_var * (G @ G.T)
-
+        # Q = self.process_var * (G @ G.T)
+        dynamic_coef = (dt / 0.2) ** 2  # (dt ** 2)
+        Q = self.process_var * dynamic_coef * (G @ G.T)
         # Предсказание
         self.x = F @ self.x
         self.P = F @ self.P @ F.T + Q
@@ -103,7 +104,7 @@ def join_traj(cur_traj, goal_traj, tl, tr):
     return spl
 
 
-def track(join_timeout=2., fov_ampl=31., proc_var=1000., meas_var=1., min_delay=0.2, max_delay=0.5, noise_scale=1.,
+def track(join_timeout=2., fov_ampl=31., proc_var=100., meas_var=1., min_delay=0.2, max_delay=0.5, noise_scale=1.,
           traj_dt=2., dur=30., grav=0.2,
           thd_ampl=3., seed=None, draw=False):
     X, Y, real_traj = sample_pts(min_delay=min_delay, max_delay=max_delay, noise_scale=noise_scale, traj_dt=traj_dt,
@@ -123,11 +124,12 @@ def track(join_timeout=2., fov_ampl=31., proc_var=1000., meas_var=1., min_delay=
         ct = X[i]
         cy = Y[i]
 
-        if abs(cur_traj(ct) - Y[i]) <= fov_ampl:
+        if abs(cur_traj(ct) - Y[i]) <= fov_ampl or True:
             kalm_info = kalman.step(cy, ct)
             KX.append(ct)
             KY.append(kalm_info[0, 0])
             err_sum += (kalm_info[0, 0] - real_traj(ct)) ** 2
+            # err_sum += (cy - real_traj(ct)) ** 2
             goal_traj = predict_movement(KX, KY)
             cur_traj = join_traj(cur_traj, goal_traj, ct, ct + join_timeout)
 
@@ -143,22 +145,23 @@ def track(join_timeout=2., fov_ampl=31., proc_var=1000., meas_var=1., min_delay=
         plt.plot(KX, KY, '.', color='red')
 
     RMSE = np.sqrt(err_sum / len(KY))
-    print(f"Kalman RMSE: {RMSE:.3f}")
-    print(f"Kalman RMSE / NOISE_SCALE : {RMSE / noise_scale:.3f}")
+    # print(f"Kalman RMSE: {RMSE:.3f}")
+    # print(f"Kalman RMSE / NOISE_SCALE : {RMSE / noise_scale:.3f}")
     return RMSE / noise_scale
 
 
 if __name__ == '__main__':
 
-    num_iter = 100
+    num_iter = 25
 
-    # for proc_var in [1, 3, 6, 10, 25, 60, 100, 250, 600, 1000, 2500, 6000]:
-    #     cerr = 0
-    #     for seed in range(num_iter):
-    #         cerr += track(join_timeout=1, dur=20., proc_var=proc_var, noise_scale=3, draw=False, fov_ampl=10000,
-    #                       seed=seed)
-    #     print(f"Proc var {proc_var}: {cerr / num_iter:.2f}")
-    for seed in range(5):
-        track(join_timeout=1, dur=10., proc_var=250, noise_scale=10, draw=True, fov_ampl=10000, seed=seed)
-        plt.legend()
-        plt.show()
+    for proc_var in [1, 3, 6, 10, 25, 60, 100, 250, 600, 1000, 2500, 6000, 7500, 10000, 15000, 25000, 45000, 60000,
+                     1e10]:
+        cerr = 0
+        for seed in range(num_iter):
+            cerr += track(join_timeout=1, dur=20., proc_var=proc_var, noise_scale=1, draw=False, fov_ampl=100000000,
+                          seed=seed)
+        print(f"Proc var {proc_var}: {cerr / num_iter:.2f}")
+    # for seed in range(5):
+    #     track(join_timeout=1, dur=10., proc_var=250, noise_scale=10, draw=True, fov_ampl=10000000, seed=seed)
+    #     plt.legend()
+    #     plt.show()

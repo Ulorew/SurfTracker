@@ -112,7 +112,7 @@ void loop() {
      
     if ((c >= '0' && c <= '9') || c == '-' || c == '.') {
       inputBuffer += c;
-      // ignore any other characters
+      // ignore any other characters  rpicam-hello --hflip --vflip -t 1000  P8800
     }
   }
 
