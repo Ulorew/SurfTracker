@@ -9,15 +9,16 @@ import cv2
 import numpy as np
 from scipy.misc import derivative
 from ultralytics import YOLO
-from scipy.interpolate import CubicSpline, CubicHermiteSpline, PPoly, make_interp_spline, KroghInterpolator
+from scipy.interpolate import CubicSpline, CubicHermiteSpline
 from time import perf_counter
 
 from motor_driver import *
 
 
 class catchtime:
-    def __init__(self, name: str = "Time"):
+    def __init__(self, name: str = "Time", target_duration=None):
         self.name = name
+        self.target_duration = target_duration
 
     def __enter__(self):
         self.start = perf_counter()
@@ -25,7 +26,15 @@ class catchtime:
 
     def __exit__(self, type, value, traceback):
         self.time = perf_counter() - self.start
-        self.readout = f'{self.name}: {self.time * 1000:.0f} ms'
+        if self.target_duration is not None and self.time < self.target_duration:
+            time.sleep(self.target_duration - self.time)
+        elif self.time > self.target_duration * 2:
+            print("Time overhead!")
+
+        if self.target_duration is not None:
+            self.readout = f'{self.name}: {self.time * 1000:.0f} + {(self.target_duration - self.time) * 1000:.0f} +  ms'
+        else:
+            self.readout = f'{self.name}: {self.time * 1000:.0f} ms'
         print(self.readout)
 
 
