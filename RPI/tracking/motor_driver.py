@@ -1,5 +1,5 @@
 import time
-import serial
+
 
 ser = serial.Serial('/dev/ttyACM0', 115200, timeout=0.1, write_timeout=0.1)
 ser.reset_input_buffer()
@@ -29,7 +29,7 @@ def upd_cur_pos():
 def set_traj(A, B, C, D): # y = A dt^3 + B dt^2 + C dt + D
     msg=f"A{A:0.2f}\nB{B:0.2f}\nC{C:0.2f}\nD{D:0.2f}\n"
 
-    print(f"New cam trajectory:\n{msg}", end='')
+    # print(f"New cam trajectory:\n{msg}", end='')
     ser.write(msg.encode())
 
 
