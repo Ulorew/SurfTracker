@@ -12,7 +12,7 @@ from scipy.misc import derivative
 from ultralytics import YOLO
 from scipy.interpolate import CubicSpline, CubicHermiteSpline, PPoly, make_interp_spline, KroghInterpolator
 from time import perf_counter
-
+from phone_communication.full_communication import *
 from motor_driver import *
 
 clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
@@ -46,7 +46,7 @@ def normalize_frame(frame):
 
 
 IMG_W, IMG_H = 640, 480
-FOV = (63.8 / 180) * math.pi
+FOV = (72 / 180) * math.pi
 CAM_DEPTH = (0.5) / math.tan(FOV / 2)  # H/w
 JOIN_TIME = 2.
 LOSE_TIME = 2.
@@ -79,12 +79,10 @@ def eval_traj(traj, dur):
     return ', '.join([f"{float(traj(i)):0.1f}" for i in t])
 
 
-def process_image(picam, model):
+def process_image(frame):
     global cam_traj, X, Y, streak_frame_id, last_det, last_seen_pos
     cap_pos = upd_cur_pos()
-    frame = picam.capture_array()
-    frame = cv2.resize(frame, (IMG_W, IMG_H), interpolation=cv2.INTER_AREA)
-    frame[:, :IMG_W//2] = normalize_frame(frame[:, :IMG_W//2])
+
     inference_times.append(time.perf_counter())
     if len(inference_times) > 1:
         print(f"Infer FPS: {(len(inference_times) - 1.0) / (inference_times[-1] - inference_times[0]):.1f}")
@@ -132,39 +130,16 @@ def process_image(picam, model):
 
 
 def tracking():
-    global start_time, last_det
+    global start_time, last_det, model
     start_time = time.perf_counter()
     last_det = start_time - 100
 
-    picam = Picamera2()
-    cam_w, cam_h = picam.sensor_resolution
-
-    config = picam.create_preview_configuration(
-        transform=libcamera.Transform(hflip=1, vflip=1),
-        main={"size": (cam_w, cam_h), "format": "RGB888"},
-        controls={
-            # "FrameDurationLimits": (100000//5, 300000//5),
-            # "AnalogueGain": 1.0,
-            # "AwbEnable": True,
-            "ExposureTime": 20000,  # 10 мс (1/100 секунд) — уменьшает размытие
-            # "AnalogueGain": 2.5,  # ISO ~ 2.5 * базового — баланс шум/светочувствительность
-            "AwbEnable": True  # авто-баланс белого
-        }
-    )
-    picam.configure(config)
-    picam.start()
-    print("Камера запущена")
+    register_camera_callback(process_image)
 
     # model = YOLO("models/yolo11n_ncnn_model/", task="detect")
     model = YOLO("models/people_sub_3_ncnn_model/", task="detect")
     print("Модель загружена")
     run_time = time.time()
-    while True:
-        if time.time() - run_time > 0.5:
-            process_image(picam, model)
-        else:
-            time.sleep(0.1)
-
 
 if __name__ == "__main__":
     tracking()

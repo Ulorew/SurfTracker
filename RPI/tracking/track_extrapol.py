@@ -1,16 +1,11 @@
 import math
+import time
 from collections import deque
 
-from picamera2 import Picamera2
-import libcamera
-import os
-import time
-import cv2
-import numpy as np
-from scipy.misc import derivative
 from ultralytics import YOLO
 from scipy.interpolate import CubicSpline, CubicHermiteSpline
 from time import perf_counter
+from phone_communication.full_communication import *
 
 from motor_driver import *
 
@@ -121,33 +116,61 @@ class Kalman1D:
         return x_pred
 
 
-picam = None
+class TrajectoryPlanner:
+    def __init__(self, join_time, process_var=250., measure_var=1.):
+        self.join_time = join_time
+        self.X = []
+        self.Y = []
+        self.prey_traj = CubicSpline([0, 1], [0, 0])
+        self.hunter_traj = CubicSpline([0, 1], [0, 0])
+        self.kalman = Kalman1D(0, 0, process_var, measure_var)
+
+    def update(self, x, y):
+        self.X.append(x)
+        self.Y.append(y)
+        xl, xr = x, x + JOIN_TIME
+        traj_info = self.kalman.step(y, x)
+        pos, vel = traj_info.squeeze()
+        self.prey_traj = CubicSpline([x, x + 1], [pos, pos + vel])
+        yl, yr = self.hunter_traj(xl), self.prey_traj(xr)
+        dl, dr = self.hunter_traj.derivative()(xl), self.prey_traj.derivative()(xr)
+        self.hunter_traj = CubicHermiteSpline([xl, xr], [yl, yr], [dl, dr])
+
+    def reset(self, prey_pos=0., hunter_pos=0.):
+        self.kalman.reset(pos0=prey_pos, t0=time.perf_counter() - start_time)
+
+        self.prey_traj = CubicSpline([0., 1.], [prey_pos, prey_pos])
+        self.hunter_traj = CubicSpline([0., 1.], [hunter_pos, hunter_pos])
 
 
-def init_camera():
-    global picam
-    picam = Picamera2()
-    cam_w, cam_h = picam.sensor_resolution
+# def init_camera():
+#     global picam
+#     picam = Picamera2()
+#     # create_video_configuration(main={"size": (1920, 1080)}, lores={"size": (640, 480)}, display="lores")
+#     config = picam.create_video_configuration(
+#         transform=libcamera.Transform(hflip=1, vflip=1),
+#         main={"size": (CAM_W, CAM_H), "format": "RGB888"},
+#         # lores={"size": (640, 480)},
+#         controls={
+#             # "FrameDurationLimits": (100000//5, 300000//5),
+#             # "AnalogueGain": 1.0,
+#             # "AwbEnable": True,
+#             "ExposureTime": 20000,  # 10 мс (1/100 секунд) — уменьшает размытие
+#             # "AnalogueGain": 2.5,  # ISO ~ 2.5 * базового — баланс шум/светочувствительность
+#             "AwbEnable": True  # авто-баланс белого
+#         }
+#     )
+#     picam.configure(config)
+#     encoder = H264Encoder(bitrate=10000000)
+#     output = "images/video.h264"
+#     picam.start_recording(encoder, output)
+#     print("Камера запущена")
 
-    config = picam.create_preview_configuration(
-        transform=libcamera.Transform(hflip=1, vflip=1),
-        main={"size": (cam_w, cam_h), "format": "RGB888"},
-        controls={
-            # "FrameDurationLimits": (100000//5, 300000//5),
-            # "AnalogueGain": 1.0,
-            # "AwbEnable": True,
-            "ExposureTime": 20000,  # 10 мс (1/100 секунд) — уменьшает размытие
-            # "AnalogueGain": 2.5,  # ISO ~ 2.5 * базового — баланс шум/светочувствительность
-            "AwbEnable": True  # авто-баланс белого
-        }
-    )
-    picam.configure(config)
-    picam.start()
-    print("Камера запущена")
 
-SHARPEN_KERNEL = np.array([[ 0, -1,  0],
-                           [-1,  5, -1],
-                           [ 0, -1,  0]], dtype=np.float32)
+SHARPEN_KERNEL = np.array([[0, -1, 0],
+                           [-1, 5, -1],
+                           [0, -1, 0]], dtype=np.float32)
+
 
 def normalize_frame(frame):
     yuv = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV)
@@ -157,53 +180,54 @@ def normalize_frame(frame):
 
     denoised = cv2.GaussianBlur(eq, (3, 3), sigmaX=0.5)
 
-
     gauss = cv2.GaussianBlur(denoised, (0, 0), sigmaX=1.0)
     sharpened = cv2.addWeighted(denoised, 1.3, gauss, -0.3, 0)
     return sharpened
 
-def take_photo():
-    frame = picam.capture_array()
-    frame = cv2.resize(frame, (IMG_W, IMG_H), interpolation=cv2.INTER_LINEAR)
-    # frame[:IMG_H//2, :] = normalize_frame(frame[:IMG_H//2, :])
-    frame = normalize_frame(frame)
-    return frame
+
+# def take_photo():
+#     frame = picam.capture_array()
+#     if len(frame) != IMG_W or len(frame[0]) != IMG_H:
+#         frame = cv2.resize(frame, (IMG_W, IMG_H), interpolation=cv2.INTER_LINEAR)
+#     # frame[:IMG_H//2, :] = normalize_frame(frame[:IMG_H//2, :])
+#     frame = normalize_frame(frame)
+#     return frame
 
 
 IMG_W, IMG_H = 640, 480
-FOV = (63.7 / 180) * math.pi
-CAM_DEPTH = (0.5) / math.tan(FOV / 2)  # H/w
+CAM_FOV = (72 / 180) * math.pi
+# REC_FOV = np.arctan(IMG_W /)
+CAM_DEPTH = (0.5) / math.tan(CAM_FOV / 2)  # H/w
 JOIN_TIME = 2.
 LOSE_TIME = 2.
 WAIT_TIME = 3.
-YOLO_TRACK_INTERVAL = 0.1
+SHOT_OFFSET = 0.100
+DRAW = False
 
-STEPS_PER_REV = 4400
+STEPS_PER_REV = 6600 * 4
 
-kalman = Kalman1D(0, 0, 250, 1)
+YOLO_CONF_TH = 0.5
+MIN_SWITCH_CONF = 0.6
+
+# kalman = Kalman1D(0, 0, 250, 1)
 yolo = None
-cvtracker = None
 
 streak_frame_id = 0
 
 print(f"Working in resolution {IMG_W}x{IMG_H}")
-print(f"FOV: {FOV} rad, cam_depth: {CAM_DEPTH}")
+print(f"FOV: {CAM_FOV} rad, cam_depth: {CAM_DEPTH}")
 print(f"Join time: {JOIN_TIME}")
 
 last_det = 0
 last_yolo_infer = time.perf_counter() - 10000
-surf_traj = CubicSpline([0, 1], [0, 0])
-cam_traj = CubicSpline([0, 1], [0, 0])
-start_time = 0.
-last_tracker=""
 
-X = deque(maxlen=50)
-Y = deque(maxlen=50)
+start_time = None
 
 target_classes = [0]
-draw = False
+target_id = None
 inference_times = deque(maxlen=10)
 last_seen_pos = 0
+cam_planner = TrajectoryPlanner(join_time=JOIN_TIME, process_var=250., measure_var=1.)
 
 
 def eval_traj(traj, dur):
@@ -212,140 +236,150 @@ def eval_traj(traj, dur):
     return ', '.join([f"{float(traj(i)):0.1f}" for i in t])
 
 
-class Parabola:
-    def __init__(self, a, b, c):
-        self.a = a
-        self.b = b
-        self.c = c
-
-    def __call__(self, x):
-        return self.a * (x ** 2) + self.b * x + self.c
-
-    def derivative(self):
-        return Parabola(0, self.a * 2, self.b)
+def poly_coeffs(poly, x, deg=3):
+    answer = []
+    mult = 1.
+    for i in range(deg + 1):
+        answer.append(poly(x) / mult)
+        poly = poly.derivative()
+        # mult *= (i + 1)
+    return answer
 
 
-def shifted_parabola(x, y, dy, ddy):
-    ta, tb, tc = ddy / 2., dy, y
-    return Parabola(ta, tb - 2 * ta * x, tc + ta * (x ** 2) - tb * x)
-
-
-def update_traj():
-    global cam_traj, surf_traj
-    cur_time = time.perf_counter() - start_time
-    cur_surf_pos = Y[-1]
-
-    traj_info = kalman.step(cur_surf_pos, cur_time)
-    pos, vel = traj_info.squeeze()
-
-    print(f"Kalman info | pos: {pos:.1f}     vel: {vel:.1f}")
-    surf_traj = CubicSpline([cur_time, cur_time + 1], [pos, pos + vel])
-
-    print(f"Surf traj pred: {eval_traj(surf_traj, JOIN_TIME)}")
-    print(f"Cam traj previous: {eval_traj(cam_traj, JOIN_TIME)}")
-
-    tl, tr = cur_time, cur_time + JOIN_TIME
-
-    yl, yr = cam_traj(cur_time), surf_traj(tr)
-    dl, dr = cam_traj.derivative()(tl), surf_traj.derivative()(tr)
-    cam_traj = CubicHermiteSpline([tl, tr], [yl, yr], [dl, dr])
-
-    cam_vel = cam_traj.derivative()
-    cam_acc = cam_vel.derivative()
-    cam_thd = cam_acc.derivative()
-
-    # set_traj(pos, cam_vel, cam_acc, cam_thd)
-    set_traj(cam_thd(cur_time) / 6., cam_acc(cur_time) / 2., cam_vel(cur_time), cam_traj(cur_time))
-    # print(f"Cam traj new: {eval_traj(cam_traj, join_time)}")
+def _to_numpy(x):
+    """Универсальное безопасное чтение тензора / списка в numpy array"""
+    try:
+        return x.cpu().numpy()
+    except Exception:
+        return np.array(x)
 
 
 def track(frame):
-    global last_yolo_infer, cvtracker, last_tracker
+    global last_yolo_infer, last_det, target_id
+    switch = False
+    # пометим время вызова инференса (абсолютное perf_counter)
+    last_yolo_infer = time.perf_counter()
+    print("Tracking with YOLO")
 
-    if time.perf_counter() - last_yolo_infer >= YOLO_TRACK_INTERVAL or cvtracker is None:
-        print("Tracking with YOLO")
-        last_tracker="YOLO"
-        last_yolo_infer = time.perf_counter()
-        with catchtime(name="YOLO tracker"):
-            det = yolo.predict(frame, verbose=False, classes=target_classes, conf=0.6)[0]
-        if len(det.boxes.conf) == 0:
-            return None, None, None, None
+    with catchtime(name="YOLO tracker"):
+        det = yolo.track(frame, verbose=False, persist=True, classes=target_classes, conf=YOLO_CONF_TH)[0]
 
-        targ = np.argmax(list(det.boxes.conf))
-        b_x, b_y, b_w, b_h = det.boxes.xywhn[targ][:4]
-        x1, y1 = int((b_x - b_w / 2) * IMG_W), int((b_y - b_h / 2) * IMG_H)
-        w1, h1 = int(b_w * IMG_W), int(b_h * IMG_H)
+    # безопасно получить confs / ids / xywhn как numpy
+    try:
+        confs = _to_numpy(det.boxes.conf)
+    except Exception:
+        confs = np.array([])
 
-        cvtracker = cv2.TrackerKCF_create()
-        cvtracker.init(frame, (x1, y1, w1, h1))
-        return b_x, b_y, b_w, b_h
+    if confs.size == 0 or det.boxes.id is None:
+        if confs.size > 0:
+            print("Ids are not ready, but there are boxes. Still skipping")
+        # нет боксов
+        return (None, None, None, None), False
 
+    ids = _to_numpy(det.boxes.id)
+    xywhn = _to_numpy(det.boxes.xywhn)  # shape (N,4)
+
+    # защита: ids может быть float / negative. Приведём к int-list для сравнения
+    print(f"ids: {ids}")
+    try:
+        ids_list = [int(x) for x in ids]
+    except Exception:
+        ids_list = list(ids.astype(int))
+
+    # если цели нет (target_id==None) — сразу выбрать самый confident
+    if target_id is None:
+        idx = int(np.argmax(confs))
+        if confs[idx] >= MIN_SWITCH_CONF:
+            target_id = int(ids_list[idx])
+            last_det = last_yolo_infer
+            switch = True
+            print(f"Initial target -> id={target_id} conf={float(confs[idx]):.3f}")
+        else:
+            # самый уверенный слишком слабый — не брать
+            return (None, None, None, None), False
     else:
-        print("Tracking with CV2")
-        last_tracker = "CV2"
-        with catchtime(name="CV tracker"):
-            success, bbox = cvtracker.update(frame)
-        if not success:
-            return None, None, None, None
-        x1, y1, w1, h1 = map(int, bbox)
-        b_x = (x1 + w1 / 2) / IMG_W
-        b_y = (y1 + h1 / 2) / IMG_H
-        return b_x, b_y, w1 / IMG_W, h1 / IMG_H
+        # если текущий id есть в новых треках
+        if target_id in ids_list:
+            idx = ids_list.index(target_id)
+            last_det = last_yolo_infer
+            # продолжаем отслеживать этот id
+        else:
+            # текущий id отсутствует на кадре
+            time_since_last_det = last_yolo_infer - last_det
+            if time_since_last_det > LOSE_TIME:
+                # переключаемся на наиболее уверенный (если он достаточно уверенный)
+                idx_best = int(np.argmax(confs))
+                if confs[idx_best] >= MIN_SWITCH_CONF:
+                    target_id = int(ids_list[idx_best])
+                    idx = idx_best
+                    last_det = last_yolo_infer
+                    print(f"Switched target -> id={target_id} conf={float(confs[idx]):.3f}")
+                else:
+                    # нет достойной цели
+                    return (None, None, None, None), True
+            else:
+                # цель временно пропала — не переключаемся; возвращаем None для краткого loss
+                print(f"Target {target_id} missing but within LOSE_TIME ({time_since_last_det:.3f}s).")
+                return (None, None, None, None), False
+
+    # извлекаем bbox (нормализованные)
+    b_x, b_y, b_w, b_h = xywhn[idx][:4].astype(float)
+    return (b_x, b_y, b_w, b_h), switch
 
 
-def process_image():
-    global cam_traj, X, Y, streak_frame_id, last_det, last_seen_pos
-    cap_pos = upd_cur_pos()
-    frame = take_photo()
+def process_image(frame):
+    global streak_frame_id, last_det, last_seen_pos
+    infer_time = time.perf_counter() - start_time
+    cap_time = infer_time - SHOT_OFFSET
+    cap_pos = max(min(cam_planner.hunter_traj(cap_time), STEPS_PER_REV / 4), -STEPS_PER_REV / 4)
     inference_times.append(time.perf_counter())
     if len(inference_times) > 1:
         print(f"Infer FPS: {(len(inference_times) - 1.0) / (inference_times[-1] - inference_times[0]):.1f}")
 
-    cap_time = time.perf_counter() - start_time
+    print(f"Time: {infer_time:.2f} s  |  Capturing at {cap_pos}, {cap_time:.2f} s")
 
-    print(f"Time: {cap_time:.2f} s  |  Capturing at {cap_pos}")
+    (b_x, b_y, b_w, b_h), switch = track(frame)
 
-    b_x, b_y, b_w, b_h = track(frame)
     if b_x is not None:
         ang_dif = math.atan2((float(b_x) - 0.5), CAM_DEPTH)
-        dsteps = -round(STEPS_PER_REV * ang_dif / (2 * math.pi))
+        dsteps = round(STEPS_PER_REV * ang_dif / (2 * math.pi))
         obj_pos = cap_pos + dsteps
 
         last_seen_pos = obj_pos
-        last_det = time.perf_counter() - start_time
+        last_det = cap_time
 
-        if draw:
+        if DRAW:
             x1, y1 = int((b_x - b_w / 2) * IMG_W), int((b_y - b_h / 2) * IMG_H)
             w1, h1 = int(b_w * IMG_W), int(b_h * IMG_H)
-            cv2.rectangle(frame, (x1, y1), (x1 + w1, y1 + h1), (0, 255, 0) if last_tracker=="YOLO" else (255, 55, 0), 2)
+            cv2.rectangle(frame, (x1, y1), (x1 + w1, y1 + h1), (0, 255, 0), 2)
             cv2.putText(frame, f"Obj at {obj_pos:.0f}", (200, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
         print(f'Found at {b_x}. Object pos: {obj_pos}')
 
-        X.append(float(cap_time))
-        Y.append(float(obj_pos))
-        update_traj()
+        if switch:
+            cam_planner.reset(prey_pos=obj_pos, hunter_pos=cap_pos)
+        cam_planner.update(float(cap_time), float(obj_pos))
         print("Planned trajectories:")
-        print(f"Surf traj: {eval_traj(surf_traj, JOIN_TIME)}")
-        print(f"Cam  traj: {eval_traj(cam_traj, JOIN_TIME)}")
+        print(f"Surf traj: {eval_traj(cam_planner.prey_traj, JOIN_TIME)}")
+        print(f"Cam  traj: {eval_traj(cam_planner.hunter_traj, JOIN_TIME)}")
     else:
-        print("Nothing found")
+        print("Nothing found, ", end="")
         if cap_time - last_det > LOSE_TIME:
             streak_frame_id = 0
-            print("Lost target")
-
-            kalman.reset(pos0=last_seen_pos, t0=time.perf_counter())
-            X.clear()
-            Y.clear()
+            print("lost target, ", end="")
 
             if cap_time - last_det <= LOSE_TIME + WAIT_TIME:
-                cam_traj = CubicSpline([0., 1.], [last_seen_pos, last_seen_pos])
-                set_traj(last_seen_pos, 0, 0, 0)
+                cam_planner.reset(prey_pos=last_seen_pos)
+                print("waiting on last seen pos")
             else:
-                cam_traj = CubicSpline([0., 1.], [0, 0])
-                set_traj(0, 0, 0, 0)
+                cam_planner.reset(prey_pos=0)
+                print("returning to home")
+        else:
+            print("following predicted trajectories")
+    upd_cur_pos()
+    set_traj(*poly_coeffs(cam_planner.hunter_traj, x=cap_time, deg=3))
 
-    if draw:
+    if DRAW:
         with catchtime(name="Drawing&Saving"):
             cv2.putText(frame, f"Cam at {cap_pos:.0f}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
             cv2.putText(frame, f"Time: {cap_time:.2f} s", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
@@ -353,23 +387,32 @@ def process_image():
             cv2.imwrite(f"images/YOLOchka_{streak_frame_id}.png", frame)
             # cv2.imshow("frame", frame)
             streak_frame_id += 1
+    print(f"Processed image in {(time.perf_counter() - start_time - infer_time) * 1000:.0f} ms")
     print()
 
 
+def frame_meta_callback(data):
+    global CAM_FOV, CAM_DEPTH
+    CAM_FOV = (data.get("hfov") / 180) * math.pi
+    CAM_DEPTH = (0.5) / math.tan(CAM_FOV / 2)  # H/w
+    print(f"New CAM FOV: {CAM_FOV:.2f} rad, Depth: {CAM_DEPTH:.2f}")
+
+
 if __name__ == "__main__":
-    init_camera()
     start_time = time.perf_counter()
     last_det = - 100
     set_traj(0, 0, 0, 0)
-
     # model = YOLO("models/yolo11n_ncnn_model/", task="detect")
-    yolo = YOLO("models/people_sub_3_ncnn_model/", task="detect")
+    yolo = YOLO("models/people_sub_3_ncnn_model/")
     print("Модель загружена")
     run_time = time.time()
-    while True:
-        if time.time() - run_time > 0.5:
-            process_image()
-        else:
-            time.sleep(0.1)
-        # if time.perf_counter() - start_time > 30:
-        #     break
+
+    register_camera_callback(process_image)
+    register_meta_callback(frame_meta_callback)
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Interrupted by user — exiting")
+    finally:
+        print("That's all, folks!")

@@ -1,11 +1,18 @@
 import time
+import serial
 
+ser = None
+try:
+    ser = serial.Serial('/dev/ttyACM0', 115200, timeout=0.1, write_timeout=0.1)
+    ser.reset_input_buffer()
+    ser.write("P0\n".encode())
+except serial.serialutil.SerialException as e:
+    print("Could not connect to Arduino serial port")
 
-ser = serial.Serial('/dev/ttyACM0', 115200, timeout=0.1, write_timeout=0.1)
-ser.reset_input_buffer()
-ser.write("P0\n".encode())
 
 def upd_cur_pos():
+    if ser is None:
+        return 0
     st = time.time()
     lns = ser.read_all().decode().split('\n')
     if time.time() - st > 0.2:
@@ -26,12 +33,13 @@ def upd_cur_pos():
 #     except serial.serialutil.SerialTimeoutException as e:
 #         print("Serial write timed out")
 
-def set_traj(A, B, C, D): # y = A dt^3 + B dt^2 + C dt + D
-    msg=f"A{A:0.2f}\nB{B:0.2f}\nC{C:0.2f}\nD{D:0.2f}\n"
+def set_traj(P, V, A, T):
+    if ser is None:
+        return
+    msg = f"P{P:0.2f}\nV{V:0.2f}\nA{A:0.2f}\nT{T:0.2f}\n"
 
-    # print(f"New cam trajectory:\n{msg}", end='')
+    print(f"New cam trajectory:\n{msg}", end='')
     ser.write(msg.encode())
-
 
 # def motor_driver_process(ns):
 #     # p = psutil.Process(os.getpid())
