@@ -201,7 +201,8 @@ CAM_DEPTH = (0.5) / math.tan(CAM_FOV / 2)  # H/w
 JOIN_TIME = 2.
 LOSE_TIME = 2.
 WAIT_TIME = 3.
-SHOT_OFFSET = 0.100
+SHOT_OFFSET = 0.030
+CAM_PRED_COEF = 0.0
 DRAW = False
 
 STEPS_PER_REV = 6600 * 4
@@ -214,9 +215,9 @@ yolo = None
 
 streak_frame_id = 0
 
-print(f"Working in resolution {IMG_W}x{IMG_H}")
-print(f"FOV: {CAM_FOV} rad, cam_depth: {CAM_DEPTH}")
-print(f"Join time: {JOIN_TIME}")
+logging.info(f"Working in resolution {IMG_W}x{IMG_H}")
+logging.info(f"FOV: {CAM_FOV} rad, cam_depth: {CAM_DEPTH}")
+logging.info(f"Join time: {JOIN_TIME}")
 
 last_det = 0
 last_yolo_infer = time.perf_counter() - 10000
@@ -259,7 +260,7 @@ def track(frame):
     switch = False
     # пометим время вызова инференса (абсолютное perf_counter)
     last_yolo_infer = time.perf_counter()
-    print("Tracking with YOLO")
+    logging.info("Tracking with YOLO")
 
     with catchtime(name="YOLO tracker"):
         det = yolo.track(frame, verbose=False, persist=True, classes=target_classes, conf=YOLO_CONF_TH)[0]
@@ -272,7 +273,7 @@ def track(frame):
 
     if confs.size == 0 or det.boxes.id is None:
         if confs.size > 0:
-            print("Ids are not ready, but there are boxes. Still skipping")
+            logging.debug("Ids are not ready, but there are boxes. Still skipping")
         # нет боксов
         return (None, None, None, None), False
 
@@ -280,7 +281,6 @@ def track(frame):
     xywhn = _to_numpy(det.boxes.xywhn)  # shape (N,4)
 
     # защита: ids может быть float / negative. Приведём к int-list для сравнения
-    print(f"ids: {ids}")
     try:
         ids_list = [int(x) for x in ids]
     except Exception:
@@ -293,7 +293,7 @@ def track(frame):
             target_id = int(ids_list[idx])
             last_det = last_yolo_infer
             switch = True
-            print(f"Initial target -> id={target_id} conf={float(confs[idx]):.3f}")
+            logging.info(f"Initial target -> id={target_id} conf={float(confs[idx]):.3f}")
         else:
             # самый уверенный слишком слабый — не брать
             return (None, None, None, None), False
@@ -331,12 +331,15 @@ def process_image(frame):
     global streak_frame_id, last_det, last_seen_pos
     infer_time = time.perf_counter() - start_time
     cap_time = infer_time - SHOT_OFFSET
-    cap_pos = max(min(cam_planner.hunter_traj(cap_time), STEPS_PER_REV / 4), -STEPS_PER_REV / 4)
+    cur_pos = upd_cur_pos()
+    pred_pos = max(min(cam_planner.hunter_traj(cap_time), STEPS_PER_REV / 4), -STEPS_PER_REV / 4)
+    cap_pos = cur_pos * (1 - CAM_PRED_COEF) + pred_pos * CAM_PRED_COEF
+
     inference_times.append(time.perf_counter())
     if len(inference_times) > 1:
-        print(f"Infer FPS: {(len(inference_times) - 1.0) / (inference_times[-1] - inference_times[0]):.1f}")
+        logging.info(f"Infer FPS: {(len(inference_times) - 1.0) / (inference_times[-1] - inference_times[0]):.1f}")
 
-    print(f"Time: {infer_time:.2f} s  |  Capturing at {cap_pos}, {cap_time:.2f} s")
+    logging.info(f"Capturing at {cap_pos}, {cap_time:.2f} s")
 
     (b_x, b_y, b_w, b_h), switch = track(frame)
 
@@ -354,28 +357,28 @@ def process_image(frame):
             cv2.rectangle(frame, (x1, y1), (x1 + w1, y1 + h1), (0, 255, 0), 2)
             cv2.putText(frame, f"Obj at {obj_pos:.0f}", (200, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-        print(f'Found at {b_x}. Object pos: {obj_pos}')
+        logging.info(f'Found at {b_x}. Object pos: {obj_pos}')
 
         if switch:
             cam_planner.reset(prey_pos=obj_pos, hunter_pos=cap_pos)
         cam_planner.update(float(cap_time), float(obj_pos))
-        print("Planned trajectories:")
-        print(f"Surf traj: {eval_traj(cam_planner.prey_traj, JOIN_TIME)}")
-        print(f"Cam  traj: {eval_traj(cam_planner.hunter_traj, JOIN_TIME)}")
+        logging.info("Planned trajectories:")
+        logging.info(f"Surf traj: {eval_traj(cam_planner.prey_traj, JOIN_TIME)}")
+        logging.info(f"Cam  traj: {eval_traj(cam_planner.hunter_traj, JOIN_TIME)}")
     else:
-        print("Nothing found, ", end="")
+        logging.info("Nothing found")
         if cap_time - last_det > LOSE_TIME:
             streak_frame_id = 0
-            print("lost target, ", end="")
+            logging.info("Lost target")
 
             if cap_time - last_det <= LOSE_TIME + WAIT_TIME:
                 cam_planner.reset(prey_pos=last_seen_pos)
-                print("waiting on last seen pos")
+                logging.info("Waiting on last seen pos")
             else:
                 cam_planner.reset(prey_pos=0)
-                print("returning to home")
+                logging.info("Returning to home")
         else:
-            print("following predicted trajectories")
+            logging.info("following predicted trajectories")
     upd_cur_pos()
     set_traj(*poly_coeffs(cam_planner.hunter_traj, x=cap_time, deg=3))
 
@@ -387,24 +390,35 @@ def process_image(frame):
             cv2.imwrite(f"images/YOLOchka_{streak_frame_id}.png", frame)
             # cv2.imshow("frame", frame)
             streak_frame_id += 1
-    print(f"Processed image in {(time.perf_counter() - start_time - infer_time) * 1000:.0f} ms")
-    print()
+    logging.info(f"Processed image in {(time.perf_counter() - start_time - infer_time) * 1000:.0f} ms")
 
 
 def frame_meta_callback(data):
     global CAM_FOV, CAM_DEPTH
     CAM_FOV = (data.get("hfov") / 180) * math.pi
     CAM_DEPTH = (0.5) / math.tan(CAM_FOV / 2)  # H/w
-    print(f"New CAM FOV: {CAM_FOV:.2f} rad, Depth: {CAM_DEPTH:.2f}")
+    logging.debug(f"New CAM FOV: {CAM_FOV:.2f} rad, Depth: {CAM_DEPTH:.2f}")
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s: %(message)s",
+        handlers=[
+            logging.FileHandler("surftracker.log"),  # пишем в файл
+            logging.StreamHandler()  # и в консоль
+        ],
+        force=True
+    )
+    connect_serial()
+    init_pos()
+
     start_time = time.perf_counter()
     last_det = - 100
     set_traj(0, 0, 0, 0)
     # model = YOLO("models/yolo11n_ncnn_model/", task="detect")
     yolo = YOLO("models/people_sub_3_ncnn_model/")
-    print("Модель загружена")
+    logging.info("Модель загружена")
     run_time = time.time()
 
     register_camera_callback(process_image)
@@ -415,4 +429,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logging.info("Interrupted by user — exiting")
     finally:
-        print("That's all, folks!")
+        logging.info("That's all, folks!")

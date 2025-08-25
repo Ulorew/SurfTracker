@@ -1,22 +1,43 @@
+import logging
 import time
 import serial
 
 ser = None
-try:
-    ser = serial.Serial('/dev/ttyACM0', 115200, timeout=0.1, write_timeout=0.1)
-    ser.reset_input_buffer()
-    ser.write("P0\n".encode())
-except serial.serialutil.SerialException as e:
-    print("Could not connect to Arduino serial port")
 
+def connect_serial():
+    global ser
+    try:
+        ser = serial.Serial('/dev/ttyACM0', 115200, timeout=0.1, write_timeout=0.1)
+        return True
+    except serial.serialutil.SerialException as e:
+        try:
+            ser = serial.Serial('/dev/ttyACM1', 115200, timeout=0.1, write_timeout=0.1)
+            return True
+        except serial.serialutil.SerialException as e:
+            logging.error("Could not connect to Arduino serial port")
+            return False
+
+def init_pos():
+    if ser is None:
+        if not connect_serial():
+            return
+
+    try:
+        ser.reset_input_buffer()
+        ser.write("P0\n".encode())
+    except serial.serialutil.SerialException as e:
+        logging.error("Could not send init stepper command")
 
 def upd_cur_pos():
     if ser is None:
         return 0
     st = time.time()
-    lns = ser.read_all().decode().split('\n')
-    if time.time() - st > 0.2:
-        print(f"I've been reading for {time.time() - st:.2f} seconds!")
+    try:
+        lns = ser.read_all().decode().split('\n')
+    except OSError as e:
+        logging.error(e)
+        logging.debug("Could not read lines from serial port, reconnecting serial")
+        connect_serial()
     if len(lns) <= 2:
         print("Unable to get current position! Not enough position marks from arduino")
         print(f"lns = {lns}")
@@ -36,9 +57,9 @@ def upd_cur_pos():
 def set_traj(P, V, A, T):
     if ser is None:
         return
-    msg = f"P{P:0.2f}\nV{V:0.2f}\nA{A:0.2f}\nT{T:0.2f}\n"
+    msg = f"P{P:0.0f}\nV{V:0.0f}\nA{A:0.0f}\nT{T:0.0f}\n"
 
-    print(f"New cam trajectory:\n{msg}", end='')
+    logging.info(f"New cam trajectory:\n{msg}")
     ser.write(msg.encode())
 
 # def motor_driver_process(ns):

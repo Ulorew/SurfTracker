@@ -1,24 +1,35 @@
-from picamera2 import Picamera2
-import libcamera
-import datetime
-from ultralytics import YOLO
-import serial
-import numpy as np
-import time
 import math
-from collections import deque
+import time
 
-ser = serial.Serial('/dev/ttyACM0', 115200, timeout=1)
-ser.reset_input_buffer()
+import serial
+
+ser = None 
+try:
+    ser = serial.Serial('/dev/ttyACM0', 115200, timeout=0.1, write_timeout=0.1)
+    ser.reset_input_buffer()
+    ser.write("P0\n".encode())
+except serial.serialutil.SerialException as e:
+    try:
+        ser = serial.Serial('/dev/ttyACM1', 115200, timeout=0.1, write_timeout=0.1)
+        ser.reset_input_buffer()
+        ser.write("P0\n".encode())
+    except serial.serialutil.SerialException as e:
+        print("Could not connect to Arduino serial port")
 
 
-def send_int(value):
-    data = f"{value}\n".encode('ascii')
+def send_pos(value):
+    data = f"P{value:0.2f}\n".encode()
+    ser.read_all()
     ser.write(data)
     ser.flush()
 
+
+AMPLITUDE = 4000
+PERIOD_LEN = 10
+
 while True:
-    send_int(32123)
+    tm = time.time()
+    send_pos(math.sin(tm / PERIOD_LEN * 2 * math.pi)*AMPLITUDE)
     time.sleep(0.1)
 
 # https://roboticsbackend.com/raspberry-pi-arduino-serial-communication/#Serial_via_USB
