@@ -1,11 +1,32 @@
+# --- данные и артефакты обучения: в репозиторий не идут ---
+Data/
+Datasets/
+models/
+runs/
+reports/v1_viz/
+tools/windowing/output/
+tools/X-AnyLabeling/
+
+# окружения
+.venv/
+.venv-label/
+
+# секреты
+.env
+
+# питон
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# веса, медиа, кеши датасетов
 *.pt
+*.onnx
+*.cache
 *.jpg
 *.jpeg
 *.png
 *.mp4
-.venv/
-.venv-label/
-.env
+*.mov
+*.avi
+*.webm
