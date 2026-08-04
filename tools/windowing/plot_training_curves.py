@@ -16,6 +16,7 @@ box_loss, cls_loss, dfl_loss, precision, recall, mAP50, mAP50-95.
 import argparse
 import csv
 import json
+import math
 import os
 
 METRICS = [
@@ -49,7 +50,19 @@ def load_results_csv(path):
     rows = list(csv.DictReader(open(path)))
     out = {"epoch": [int(r["epoch"]) for r in rows]}
     for m in METRICS:
-        out[m["key"]] = [float(r[m["key"]]) if r.get(m["key"]) not in (None, "") else None for r in rows]
+        vals = []
+        for r in rows:
+            raw = r.get(m["key"])
+            if raw in (None, ""):
+                vals.append(None)
+                continue
+            v = float(raw)
+            # ultralytics иногда пишет nan/inf в results.csv. В JS такое
+            # значение через Math.min/max отравляет ВЕСЬ график метрики
+            # (все точки становятся NaN и панель молча пустеет), поэтому
+            # приводим к null — его отрисовка уже умеет пропускать.
+            vals.append(v if math.isfinite(v) else None)
+        out[m["key"]] = vals
     return out
 
 
@@ -168,12 +181,10 @@ note.className = 'legend-note';
 note.textContent = 'наведите на график — точное значение по эпохам';
 legendEl.appendChild(note);
 
-function renderPanel(metric) {
+function renderPanel(metric, panel) {
   const key = metric.key;
   const n = Math.max(...RUNS.map(r => r.data.epoch.length));
 
-  const panel = document.createElement('div');
-  panel.className = 'panel';
   const head = document.createElement('div');
   head.className = 'panel-head';
   const title = document.createElement('div'); title.className = 'panel-title'; title.textContent = metric.title;
@@ -182,14 +193,14 @@ function renderPanel(metric) {
   head.appendChild(title); head.appendChild(hint);
   panel.appendChild(head);
 
-  // Пустой svg вставляем в живой DOM ПЕРЕД тем, как рисовать содержимое —
-  // иначе неизвестна реальная ширина панели (grid-колонка), и viewBox с
-  // preserveAspectRatio='none' на фиксированных 600 растягивает текст
-  // непропорционально при любой другой ширине рендера (сжатые подписи).
+  // Ширину меряем ТОЛЬКО когда в гриде уже стоят все панели (см. вызов
+  // ниже): grid-колонки перестраиваются по мере добавления элементов, и
+  // если мерить сразу после вставки, первые панели получают ширину ещё
+  // однколоночного грида — их viewBox оказывается втрое шире реального,
+  // и содержимое рендерится уменьшенным.
   const H = 150;
   const svg = el('svg', {class: 'chart'});
   panel.appendChild(svg);
-  grid.appendChild(panel);
 
   const W = svg.getBoundingClientRect().width || 600;  // 1 svg-юнит = 1 css-пиксель, без искажений
   svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
@@ -276,7 +287,18 @@ function renderPanel(metric) {
 
 }
 
-METRICS.forEach(m => renderPanel(m));
+// Два прохода: сначала в грид встают ВСЕ панели (грид принимает окончательное
+// число колонок), и только потом каждая меряет свою реальную ширину и рисует
+// содержимое. В один проход первые панели меряются, пока грид ещё в одну
+// колонку, и рендерятся в неверном масштабе.
+const panels = METRICS.map(m => {
+  const panel = document.createElement('div');
+  panel.className = 'panel';
+  grid.appendChild(panel);
+  return {metric: m, panel};
+});
+grid.getBoundingClientRect();  // форсируем layout до замеров
+panels.forEach(({metric, panel}) => renderPanel(metric, panel));
 
 function buildTable(run) {
   const wrap = document.createElement('div'); wrap.className = 'tablescroll';

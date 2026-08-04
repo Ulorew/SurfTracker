@@ -31,9 +31,15 @@ def frame_list_hash(data_yaml_path: str) -> "str | None":
     import yaml
     cfg = yaml.safe_load(open(data_yaml_path))
     base = cfg.get("path", ".")
+    # относительный path: в yaml задан ОТНОСИТЕЛЬНО САМОГО yaml, а не cwd.
+    # Пока резолвили от cwd, поле молча выходило null во всех манифестах —
+    # провенанс, ради которого патч и делался, не работал ни разу.
+    if not os.path.isabs(base):
+        base = os.path.join(os.path.dirname(os.path.abspath(data_yaml_path)), base)
     train_rel = cfg.get("train", "images/train")
     train_dir = train_rel if os.path.isabs(train_rel) else os.path.join(base, train_rel)
     if not os.path.isdir(train_dir):
+        print(f"WARNING: frame_list_hash: не нашёл train-каталог {train_dir} — поле останется null")
         return None
     names = sorted(os.listdir(train_dir))
     return hashlib.sha256("\n".join(names).encode()).hexdigest()[:16]
@@ -281,15 +287,31 @@ def main():
         baseline_meta_path = args.baseline_run
         if os.path.isdir(baseline_meta_path):
             baseline_meta_path = os.path.join(baseline_meta_path, "windowing_config.json")
+        # ultralytics кладёт прогон в runs/detect/<project>/<name>, а не в
+        # <project>/<name> — та же ловушка, что дважды ловила нас в v1/v2.
+        # Без этого fallback путь baseline просто не находился.
+        if not os.path.exists(baseline_meta_path) and not os.path.isabs(args.baseline_run):
+            alt = os.path.join("runs", "detect", args.baseline_run)
+            if os.path.isdir(alt):
+                alt = os.path.join(alt, "windowing_config.json")
+            if os.path.exists(alt):
+                baseline_meta_path = alt
+
         baseline_hash = None
         if os.path.exists(baseline_meta_path):
             baseline_meta = json.load(open(baseline_meta_path))
             baseline_hash = (baseline_meta.get("effective") or {}).get("epoch1_weight_hash")
         effective["baseline_run"] = os.path.abspath(baseline_meta_path)
         effective["baseline_epoch1_weight_hash"] = baseline_hash
+        # None, а НЕ False, когда сравнивать было не с чем: False читается как
+        # "проверили, всё в порядке" — то есть отчёт врал ровно в том случае,
+        # ради которого эта проверка и заводилась.
         effective["epoch1_hash_matches_baseline"] = (
-            baseline_hash is not None and baseline_hash == effective["epoch1_weight_hash"]
+            None if baseline_hash is None else baseline_hash == effective["epoch1_weight_hash"]
         )
+        if baseline_hash is None:
+            print(f"WARNING: baseline {args.baseline_run} не найден или без epoch1-хеша "
+                  f"({baseline_meta_path}) — сравнение НЕ выполнено")
         if effective["epoch1_hash_matches_baseline"]:
             print(f"WARNING: epoch1 weight hash matches baseline {args.baseline_run} — "
                   f"varied parameter likely had no effect")
