@@ -33,7 +33,7 @@ from crop import crop
 from dataset_gen import clip_box_to_window, load_frame_boxes, split_target_ignore, video_prefix
 from geometry import resolve_placement
 from negatives import sample_negatives
-from sample_window import sample_window
+from sample_window import reachable_bin_indices, sample_window, window_for_bin
 
 try:
     from ultralytics.data.dataset import YOLODataset
@@ -50,7 +50,8 @@ def _local_rng(base_seed: int, index: int, call_count: int) -> random.Random:
     return random.Random(int.from_bytes(h[:8], "big"))
 
 
-def build_frame_index(frames_dir, variants_dir, horizon_overrides, neg_ratio, enum_seed):
+def build_frame_index(frames_dir, variants_dir, horizon_overrides, neg_ratio, enum_seed,
+                       bin_first=True):
     """Перечисление кадров/боксов + слотов позитивов/негативов — тот же
     подсчёт, что в dataset_gen.py.process_frame, но без записи файлов:
     здесь только считаем, СКОЛЬКО слотов какого типа будет у эпохи, сама
@@ -58,6 +59,8 @@ def build_frame_index(frames_dir, variants_dir, horizon_overrides, neg_ratio, en
     """
     variants_manifest = json.load(open(os.path.join(variants_dir, "variants_manifest.json")))
     variant_names = variants_manifest["variant_names"]
+    by_bin = {}          # корзина -> [(кадр, индекс бокса)], кто её способен закрыть
+    total_pos = 0        # сколько позитивов дала бы прежняя схема — держим объём
 
     enum_rng = random.Random(enum_seed)
     frames = {}
@@ -93,14 +96,36 @@ def build_frame_index(frames_dir, variants_dir, horizon_overrides, neg_ratio, en
         n_pos = 0
         for bi, b in enumerate(targets):
             windows = sample_window(b, enum_rng)
-            for _ in windows:
-                slots.append((stem, "pos", bi))
             n_pos += len(windows)
+            if bin_first:
+                for i in reachable_bin_indices(max(b.w, b.h)):
+                    by_bin.setdefault(i, []).append((stem, bi))
+            else:
+                # прежняя схема: слот на каждое окно, разыгранное ОТ БОКСА.
+                # Оставлена, чтобы сравнение "доли против перекоса" гонялось
+                # одним кодом, а не сверкой с git-историей.
+                for _ in windows:
+                    slots.append((stem, "pos", bi))
 
+        total_pos += n_pos
         base = n_pos if n_pos > 0 else config.EMPTY_FRAME_NEGATIVE_COUNT
         neg_count = round(base * neg_ratio)
         for _ in range(neg_count):
             slots.append((stem, "neg", None))
+
+    # Позитивы разыгрываются ОТ КОРЗИНЫ К БОКСУ (тикет "ночь", п.1.1): сначала
+    # корзина по целевой доле SIZE_BINS, потом случайный бокс из тех, кто её
+    # способен закрыть. Прямой порядок целевые доли не воспроизводит — см.
+    # sample_window.reachable_bin_indices.
+    avail = [i for i in by_bin if by_bin[i]] if bin_first else []
+    if avail:
+        weights = [max(config.SIZE_BINS[i][2], 0.0) for i in avail]
+        if sum(weights) <= 0:
+            weights = [1.0] * len(avail)
+        for _ in range(total_pos):
+            bi = enum_rng.choices(avail, weights=weights, k=1)[0]
+            stem, box_idx = enum_rng.choice(by_bin[bi])
+            slots.append((stem, "pos", (box_idx, bi)))
 
     return frames, slots
 
@@ -116,7 +141,7 @@ class OnlineCropYOLODataset(YOLODataset):
 
     def __init__(self, frames_dir, variants_dir, data, imgsz, hyp, augment,
                  single_cls, seed, neg_ratio=1.0, horizon_overrides=None,
-                 stride=32, prefix=""):
+                 stride=32, prefix="", bin_first=True):
         self.data = data
         self.use_segments = False
         self.use_keypoints = False
@@ -144,11 +169,12 @@ class OnlineCropYOLODataset(YOLODataset):
         self.labels = [{"cls": np.zeros((2, 1), dtype=np.float32)}]
 
         self.frames, self.slots = build_frame_index(
-            frames_dir, variants_dir, horizon_overrides or {}, neg_ratio, enum_seed=seed)
+            frames_dir, variants_dir, horizon_overrides or {}, neg_ratio, enum_seed=seed,
+            bin_first=bin_first)
         if not self.slots:
             raise ValueError(f"online dataset: 0 слотов из {frames_dir} / {variants_dir}")
 
-        self.im_files = [f"{stem}::{kind}::{bi}" for stem, kind, bi in self.slots]  # для логов/прогресс-бара
+        self.im_files = [f"{stem}::{kind}::{bi}" for stem, kind, bi in self.slots]  # для логов  # для логов/прогресс-бара
         self.ni = len(self.slots)
         self._call_count = 0
 
@@ -157,9 +183,13 @@ class OnlineCropYOLODataset(YOLODataset):
     def __len__(self):
         return len(self.slots)
 
-    def _draw_positive(self, stem, box_idx, rng):
+    def _draw_positive(self, stem, box_idx, rng, bin_idx=None):
         f = self.frames[stem]
         box = f["targets"][box_idx]
+        if bin_idx is not None:
+            sq = window_for_bin(box, bin_idx, rng)
+            if sq is not None:
+                return sq, f
         windows = sample_window(box, rng)
         if not windows:
             # редкий случай (см. dataset_gen.py report boxes_zero_windows) —
@@ -187,13 +217,15 @@ class OnlineCropYOLODataset(YOLODataset):
         return Square(cx=cx, cy=cy, side=side), f
 
     def get_image_and_label(self, index):
-        stem, kind, box_idx = self.slots[index]
+        stem, kind, payload = self.slots[index]
+        box_idx = payload[0] if isinstance(payload, tuple) else payload
+        bin_idx = payload[1] if isinstance(payload, tuple) else None
         self._call_count += 1
         rng = _local_rng(self.base_seed, index, self._call_count)
 
         f = self.frames[stem]
         if kind == "pos":
-            square, f = self._draw_positive(stem, box_idx, rng)
+            square, f = self._draw_positive(stem, box_idx, rng, bin_idx)
         else:
             square, f = self._draw_negative(stem, rng)
 

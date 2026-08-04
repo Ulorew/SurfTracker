@@ -36,18 +36,25 @@ def _make_window(cx: float, cy: float, side: float, rng: random.Random) -> Squar
     return Square(cx=cx + jx, cy=cy + jy, side=side)
 
 
-def _reachable_sides(b_size: float, rng: random.Random) -> "list[float]":
-    """Стороны S окон, закрывающих хотя бы одну корзину, для бокса b_size."""
+def _reachable_sides(b_size: float, rng: random.Random) -> "list[tuple[float, float]]":
+    """-> [(сторона S, целевая доля корзины), ...] для корзин, которые бокс
+    b_size вообще способен закрыть.
+
+    Доля возвращается наружу, потому что раньше она здесь и терялась: тройка
+    распаковывалась как `lo, hi, _frac`, и целевое распределение SIZE_BINS не
+    влияло на нарезку позитивов ВООБЩЕ. Фактическое распределение получалось
+    из одной геометрии — 47% в нижней корзине при заданных 15%, и 12% в
+    корзине 120-200 при заданных 35%.
+    """
     bins = list(config.SIZE_BINS)
-    rng.shuffle(bins)  # иначе первые корзины в списке систематически
-                        # выигрывали бы при обрезке по cap
+    rng.shuffle(bins)  # порядок не должен систематически влиять на отбор
 
     sides = []
-    for lo, hi, _frac in bins:
+    for lo, hi, frac in bins:
         # путь 1: натура (без ресайза) — бокс уже в этой корзине
         if lo <= b_size < hi and config.K_MIN * b_size <= config.WINDOW_SIZE:
             k = min(config.K_MAX, config.WINDOW_SIZE / b_size)
-            sides.append(k * b_size)
+            sides.append((k * b_size, frac))
             continue
 
         # путь 2: ресайз — целимся в случайную точку корзины
@@ -58,7 +65,7 @@ def _reachable_sides(b_size: float, rng: random.Random) -> "list[float]":
         s = k * b_size
         if s <= config.WINDOW_SIZE:
             continue  # не настоящий ресайз — тот же случай, что путь 1, но не подошёл
-        sides.append(s)
+        sides.append((s, frac))
 
     return sides
 
@@ -81,13 +88,64 @@ def sample_window(box: IntBox, rng: random.Random) -> "list[Square]":
     if not reachable:
         return []
 
-    windows = [_make_window(cx, cy, s, rng) for s in reachable[:cap]]
+    # Взвешенный выбор корзины по целевым долям (тикет "ночь", п.1.1) вместо
+    # прежнего "берём все достижимые подряд". Доли нормируются по тем
+    # корзинам, которые ЭТОТ бокс реально может закрыть: недостижимая корзина
+    # не должна забирать себе вес, иначе бокс просто недоберёт окон.
+    weights = [max(f, 0.0) for _, f in reachable]
+    if sum(weights) <= 0:
+        weights = [1.0] * len(reachable)
 
-    if is_small:
-        i = 0
-        while len(windows) < cap:
-            s = reachable[i % len(reachable)]
-            windows.append(_make_window(cx, cy, s, rng))
-            i += 1
+    windows = []
+    for _ in range(cap):
+        side = rng.choices([s for s, _ in reachable], weights=weights, k=1)[0]
+        windows.append(_make_window(cx, cy, side, rng))
+        if not is_small and len(windows) >= len(reachable):
+            # у крупного бокса корзин много: не размножаем одну и ту же сверх
+            # числа доступных, иначе доли вырождаются в шум одного розыгрыша
+            break
 
     return windows
+
+
+def reachable_bin_indices(b_size: float) -> "list[int]":
+    """Индексы корзин config.SIZE_BINS, которые бокс b_size СПОСОБЕН закрыть.
+
+    Детерминированно, без rng — нужно для обратного порядка розыгрыша
+    (сначала корзина по целевой доле, потом бокс из способных её закрыть).
+    Прямой порядок "бокс -> корзина" целевые доли починить не может: бокс
+    можно только УМЕНЬШИТЬ, поэтому мелкая цель достижима лишь в своей
+    корзине, и доля крупных корзин определяется составом разметки, а не
+    заданием.
+    """
+    out = []
+    for i, (lo, hi, _frac) in enumerate(config.SIZE_BINS):
+        # путь 1: натура
+        if lo <= b_size < hi and config.K_MIN * b_size <= config.WINDOW_SIZE:
+            out.append(i)
+            continue
+        # путь 2: ресайз. k in [K_MIN,K_MAX] -> v in [WS/K_MAX, WS/K_MIN];
+        # настоящий ресайз (s > WS) -> v < b_size
+        v_lo = max(lo, config.WINDOW_SIZE / config.K_MAX)
+        v_hi = min(hi, config.WINDOW_SIZE / config.K_MIN, b_size)
+        if v_lo < v_hi:
+            out.append(i)
+    return out
+
+
+def window_for_bin(box: IntBox, bin_idx: int, rng: random.Random) -> "Square | None":
+    """Одно окно, целящееся именно в корзину bin_idx (None, если недостижима)."""
+    b_size = max(box.w, box.h)
+    cx, cy = box_center(box)
+    lo, hi, _frac = config.SIZE_BINS[bin_idx]
+
+    if lo <= b_size < hi and config.K_MIN * b_size <= config.WINDOW_SIZE:
+        k = min(config.K_MAX, config.WINDOW_SIZE / b_size)
+        return _make_window(cx, cy, k * b_size, rng)
+
+    v_lo = max(lo, config.WINDOW_SIZE / config.K_MAX)
+    v_hi = min(hi, config.WINDOW_SIZE / config.K_MIN, b_size)
+    if v_lo >= v_hi:
+        return None
+    v = rng.uniform(v_lo, v_hi)
+    return _make_window(cx, cy, (config.WINDOW_SIZE / v) * b_size, rng)

@@ -93,7 +93,8 @@ def param_counts(module):
     return trainable, total
 
 
-def make_online_trainer_class(frames_dir: str, variants_dir: str, neg_ratio: float):
+def make_online_trainer_class(frames_dir: str, variants_dir: str, neg_ratio: float,
+                               bin_first: bool = True):
     """Фабрика, а не готовый класс на модульном уровне: ultralytics строит
     trainer сам (model.train(trainer=Cls, ...) -> Cls(overrides=..)),
     поэтому параметры online-датасета (пути, neg_ratio) должны попасть внутрь
@@ -117,7 +118,7 @@ def make_online_trainer_class(frames_dir: str, variants_dir: str, neg_ratio: flo
                 frames_dir=frames_dir, variants_dir=variants_dir,
                 data=self.data, imgsz=self.args.imgsz, hyp=self.args,
                 augment=True, single_cls=self.args.single_cls,
-                seed=self.args.seed, neg_ratio=neg_ratio, stride=gs,
+                seed=self.args.seed, neg_ratio=neg_ratio, stride=gs, bin_first=bin_first,
                 prefix="online-train: ",
             )
 
@@ -189,12 +190,25 @@ def main():
                      help="папка с исходными кадрами (*.jpg/*.json) для --online-crop")
     ap.add_argument("--online-variants-dir", default=None,
                      help="папка с офлайн-версиями от online_variants.py (variants_manifest.json)")
+    ap.add_argument("--size-bins-floor", type=float, default=None,
+                     help="нижняя граница нижней корзины config.SIZE_BINS для ОНЛАЙН-семплера; "
+                          "без этого floor из --data yaml до него не доходит (yaml используется "
+                          "только для val), и прогон молча идёт с дефолтом config.py")
+    ap.add_argument("--legacy-sampler", action="store_true",
+                     help="прежний розыгрыш окон ОТ БОКСА (целевые доли SIZE_BINS не работают) — "
+                          "для честного сравнения со старой сборкой одним кодом")
     ap.add_argument("--online-neg-ratio", type=float, default=1.0,
                      help="тот же смысл, что --neg-ratio в dataset_gen.py, но для online-датасета")
     args, _ = ap.parse_known_args()
 
     if args.online_crop and not (args.online_frames_dir and args.online_variants_dir):
         raise SystemExit("--online-crop требует --online-frames-dir и --online-variants-dir")
+
+    if args.size_bins_floor is not None:
+        import config as _cfg
+        lo, hi, frac = _cfg.SIZE_BINS[0]
+        _cfg.SIZE_BINS[0] = (args.size_bins_floor, hi, frac)
+        print(f"SIZE_BINS[0] нижняя граница -> {args.size_bins_floor}")
 
     from ultralytics import YOLO
 
@@ -252,7 +266,8 @@ def main():
             train_kwargs["freeze"] = args.freeze
         if args.online_crop:
             trainer_cls = make_online_trainer_class(
-                args.online_frames_dir, args.online_variants_dir, args.online_neg_ratio)
+                args.online_frames_dir, args.online_variants_dir, args.online_neg_ratio,
+                bin_first=not args.legacy_sampler)
             model.train(trainer=trainer_cls, **train_kwargs)
         else:
             model.train(**train_kwargs)
@@ -342,6 +357,9 @@ def main():
         "online_frames_dir": os.path.abspath(args.online_frames_dir) if args.online_frames_dir else None,
         "online_variants_dir": os.path.abspath(args.online_variants_dir) if args.online_variants_dir else None,
         "online_neg_ratio": args.online_neg_ratio if args.online_crop else None,
+        "sampler": ("legacy_per_box" if args.legacy_sampler else "bin_first_weighted"),
+        "size_bins_floor": args.size_bins_floor,
+        "size_bins": [list(b) for b in __import__("config").SIZE_BINS],
         "ultralytics_args": ultralytics_args,
         "effective": effective,
     }
