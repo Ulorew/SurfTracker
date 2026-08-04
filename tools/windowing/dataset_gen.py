@@ -143,8 +143,22 @@ def stream_rng(seed: int, stem: str, stream: str) -> random.Random:
     return random.Random(int.from_bytes(h[:8], "big"))
 
 
+# Аугментация — свойство ОБУЧАЮЩЕЙ выборки, а не нарезчика: применять её к
+# измерительному сплиту значит мерить не то, чем модель будет пользоваться,
+# и сравнивать прогоны с разной случайной порчей вместо одной и той же
+# картинки. Раньше --augment применялся к любому сплиту без разбора; на
+# практике не выстрелило только потому, что все оконные датасеты состоят из
+# одного train, а val (dataset_v6) режется другим инструментом из целых
+# кадров. Тикет "ночь", п.1.4.
+AUGMENTED_SPLITS = ("train",)
+
+
 def process_frame(stem, jpg_path, json_path, out_dir, split, seed,
                    horizon_overrides, generate_negatives, do_augment, report, neg_ratio=1.0):
+    do_augment = do_augment and split in AUGMENTED_SPLITS
+    report.setdefault("augmented_splits", set())
+    if do_augment:
+        report["augmented_splits"].add(split)
     rng_pos = stream_rng(seed, stem, "positives")
     rng_neg = stream_rng(seed, stem, "negatives")
     rng_aug = stream_rng(seed, stem, "augment")
@@ -280,6 +294,9 @@ def main():
         process_frame(stem, jpg_path, os.path.join(args.frames_dir, jf), args.out_dir,
                       split, args.seed, horizon_overrides, generate_negatives, args.augment, report,
                       neg_ratio=args.neg_ratio)
+
+    # список, а не множество — для json; пусто == аугментации не было нигде
+    report["augmented_splits"] = sorted(report.get("augmented_splits", set()))
 
     sizes = report.pop("size_samples")
     hist = {}
