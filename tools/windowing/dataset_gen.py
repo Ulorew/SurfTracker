@@ -130,8 +130,25 @@ def clip_box_to_window(box_frame: IntBox, placement, window_size: int):
     return (cx, cy, w, h)
 
 
-def process_frame(stem, jpg_path, json_path, out_dir, split, rng,
+def stream_rng(seed: int, stem: str, stream: str) -> random.Random:
+    """Независимый поток случайности на (кадр, назначение).
+
+    Раньше позитивы, негативы и аугментации тянули из ОДНОГО rng, поэтому
+    изменение числа негативов сдвигало розыгрыш позитивов: при одинаковом
+    seed и разном --neg-ratio 324 из 327 позитивных меток отличались, то
+    есть сравнения "по доле негативов" меняли не только негативы.
+    Заодно поток больше не зависит от порядка обработки кадров.
+    """
+    h = hashlib.sha256(f"{seed}:{stem}:{stream}".encode()).digest()
+    return random.Random(int.from_bytes(h[:8], "big"))
+
+
+def process_frame(stem, jpg_path, json_path, out_dir, split, seed,
                    horizon_overrides, generate_negatives, do_augment, report, neg_ratio=1.0):
+    rng_pos = stream_rng(seed, stem, "positives")
+    rng_neg = stream_rng(seed, stem, "negatives")
+    rng_aug = stream_rng(seed, stem, "augment")
+
     boxes, img_w, img_h = load_frame_boxes(json_path)
     targets, ignore = split_target_ignore(boxes)
     frame = cv2.imread(jpg_path)
@@ -157,7 +174,7 @@ def process_frame(stem, jpg_path, json_path, out_dir, split, rng,
             if local is not None:
                 yolo_boxes.append(local)
         if do_augment:
-            img, yolo_boxes = augment_fn(img, yolo_boxes, rng)
+            img, yolo_boxes = augment_fn(img, yolo_boxes, rng_aug)
         name = f"{stem}_{tag}{idx:02d}"
         cv2.imwrite(os.path.join(images_dir, name + ".jpg"), img)
         with open(os.path.join(labels_dir, name + ".txt"), "w") as f:
@@ -187,7 +204,7 @@ def process_frame(stem, jpg_path, json_path, out_dir, split, rng,
 
     n_pos = 0
     for b in targets:
-        windows = sample_window(b, rng)
+        windows = sample_window(b, rng_pos)
         report["boxes_total"] += 1
         if not windows:
             report["boxes_zero_windows"] += 1
@@ -202,7 +219,7 @@ def process_frame(stem, jpg_path, json_path, out_dir, split, rng,
         neg_count = round(base * neg_ratio)
         # и target, и ignore блокируют место под негатив (тикет, патч 1) —
         # ignore-зона не подтверждённый фон, туда негатив ставить нельзя.
-        neg_squares = sample_negatives(img_w, img_h, targets + ignore, neg_count, rng,
+        neg_squares = sample_negatives(img_w, img_h, targets + ignore, neg_count, rng_neg,
                                        horizon_y=horizon_y)
         for i, sq in enumerate(neg_squares):
             write_window(sq, "neg", i)
@@ -235,7 +252,6 @@ def main():
         lo, hi, frac = config.SIZE_BINS[0]
         config.SIZE_BINS[0] = (args.size_bins_floor, hi, frac)
 
-    rng = random.Random(args.seed)
     split_map = load_split_map(args.split_file)
     incomplete = load_incomplete_set(args.incomplete_frames_file)
     horizon_overrides = load_horizon_overrides(args.horizon_overrides)
@@ -262,7 +278,7 @@ def main():
         split = split_map.get(stem, config.DEFAULT_SPLIT_NAME)
         generate_negatives = stem not in incomplete
         process_frame(stem, jpg_path, os.path.join(args.frames_dir, jf), args.out_dir,
-                      split, rng, horizon_overrides, generate_negatives, args.augment, report,
+                      split, args.seed, horizon_overrides, generate_negatives, args.augment, report,
                       neg_ratio=args.neg_ratio)
 
     sizes = report.pop("size_samples")
