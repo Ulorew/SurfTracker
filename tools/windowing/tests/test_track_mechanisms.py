@@ -220,3 +220,84 @@ class TestMechanismC_Velocity:
         behind, _ = score_candidate(box(pred - 80, 500, 100), pred, 500, 100,
                                      prev, 500, (v, 0.0), dt, 640, cfg)
         assert ahead == pytest.approx(behind)
+
+
+class TestVelocityDirection:
+    """В-направленный (тикет "ночь", п.2.1). В отличие от прежнего В, этот
+    механизм НЕ повторяет дистанционное слагаемое: он смотрит только на знак
+    движения, а расстояние о направлении ничего не знает."""
+
+    def _moving_right(self, cfg):
+        """Цель, устойчиво идущая вправо: 100 условных единиц за такт."""
+        ts = TrackState(cfg, 0.0, 0.0, 100.0, 640, 1080)
+        for i in range(1, 5):
+            c = 100.0 * i
+            ts.step(dt=1.0, detections=[(c - 50, -50, c + 50, 50, 0.9)])
+        return ts
+
+    def _cfg(self):
+        return make_cfg(ENABLE_VELOCITY_DIRECTION=True, VDIR_LAMBDA=0.5,
+                        VDIR_COS_VETO=0.0, VDIR_MIN_MOVE_SIZE_FRAC=0.3,
+                        TARGET_SELECT_MAX_DIST_FRAC=0.9)
+
+    def test_candidate_going_backwards_is_vetoed(self):
+        """"Назад" считается от ТЕКУЩЕЙ позиции, а не от предсказания: цель,
+        которая просто едет медленнее ожидаемого, отстаёт от предсказания, но
+        движется всё ещё вперёд, и вето её касаться не должно."""
+        cfg = self._cfg()
+        ts = self._moving_right(cfg)          # позиция 400, скорость 100/такт
+        back = (350 - 50, -50, 350 + 50, 50, 0.9)   # позади позиции 400
+        r = ts.step(dt=1.0, detections=[back])
+        assert r.chosen is None, "кандидат, требующий разворота, обязан быть отвергнут"
+        assert r.n_vetoed == 1
+
+    def test_candidate_merely_lagging_the_prediction_is_kept(self):
+        cfg = self._cfg()
+        ts = self._moving_right(cfg)          # позиция 400, предсказание 500
+        slow = (450 - 50, -50, 450 + 50, 50, 0.9)   # отстал от предсказания, но едет вперёд
+        r = ts.step(dt=1.0, detections=[slow])
+        assert r.chosen is not None, "замедлившаяся цель — не разворот"
+        assert r.n_vetoed == 0
+
+    def test_forward_candidate_beats_equidistant_backward_one(self):
+        """Тот самый случай, ради которого механизм и заводится: два соседа
+        РАВНОУДАЛЕНЫ от предсказания, и различить их можно только по
+        направлению. Дистанционное слагаемое здесь бессильно по построению."""
+        cfg = self._cfg()
+        cfg.VDIR_COS_VETO = -1.1  # вето выключено — проверяем именно СЧЁТ
+        ts = self._moving_right(cfg)
+        pred_cx, _, _ = ts.plan_window(dt=1.0)
+        # d больше, чем шаг цели за такт (100), иначе оба кандидата окажутся
+        # ВПЕРЕДИ текущей позиции и разворота ни у одного не будет
+        d = 150.0
+        fwd = (pred_cx + d - 50, -50, pred_cx + d + 50, 50, 0.5)
+        back = (pred_cx - d - 50, -50, pred_cx - d + 50, 50, 0.99)
+        r = ts.step(dt=1.0, detections=[back, fwd])
+        assert r.chosen == fwd, "выбран кандидат позади при равном расстоянии"
+
+    def test_silent_while_target_barely_moves(self):
+        """При смещении меньше сигмы измерения направление — шум детектора,
+        и механизм обязан молчать, а не резать по случайному знаку."""
+        cfg = self._cfg()
+        ts = TrackState(cfg, 0.0, 0.0, 100.0, 640, 1080)
+        for _ in range(4):
+            ts.step(dt=1.0, detections=[(-50, -50, 50, 50, 0.9)])  # стоит на месте
+        r = ts.step(dt=1.0, detections=[(-60, -50, 40, 50, 0.9)])  # чуть назад
+        assert r.chosen is not None, "стоячая цель не имеет направления — вето неуместно"
+        assert r.n_vetoed == 0
+
+    def test_is_not_algebraically_the_distance_term(self):
+        """Прямое отличие от прежнего В: у двух равноудалённых кандидатов
+        дистанционные слагаемые РАВНЫ, а счёт с направлением — нет."""
+        from track_logic import score_candidate
+        cfg = self._cfg()
+        vel = (100.0, 0.0)
+        fwd = (80 - 50, -50, 80 + 50, 50, 0.5)
+        back = (-80 - 50, -50, -80 + 50, 50, 0.5)
+        s_f, _ = score_candidate(fwd, 0.0, 0.0, 100.0, 0.0, 0.0, vel, 1.0, 640, cfg)
+        s_b, _ = score_candidate(back, 0.0, 0.0, 100.0, 0.0, 0.0, vel, 1.0, 640, cfg)
+        assert s_f < s_b
+        plain = make_cfg()  # тот же расчёт без механизма — слагаемые совпадут
+        p_f, _ = score_candidate(fwd, 0.0, 0.0, 100.0, 0.0, 0.0, vel, 1.0, 640, plain)
+        p_b, _ = score_candidate(back, 0.0, 0.0, 100.0, 0.0, 0.0, vel, 1.0, 640, plain)
+        assert p_f == pytest.approx(p_b), "тест бесполезен, если кандидаты не равноудалены"

@@ -95,6 +95,24 @@ def score_candidate(det, pred_cx, pred_cy, pred_size, prev_cx, prev_cy,
         # скорость * dt = угол, снова приводим к единицам расстояния
         score += cfg.VELOCITY_LAMBDA * excess * dt
 
+    # В-НАПРАВЛЕННЫЙ: смотрим только на НАПРАВЛЕНИЕ, не на модуль. Именно
+    # этим он не повторяет дистанционное слагаемое: расстояние ничего не
+    # знает о том, вперёд кандидат или назад, а разворот за один такт для
+    # сёрфера физически невозможен.
+    if getattr(cfg, "ENABLE_VELOCITY_DIRECTION", False) and vel is not None and dt > 0:
+        vmag = math.hypot(vel[0], vel[1])
+        ux, uy = dcx - prev_cx, dcy - prev_cy
+        umag = math.hypot(ux, uy)
+        # порог "движение вообще видно" — сигма измерения положения, а не
+        # подобранное число: ниже неё направление это шум детектора
+        min_move = cfg.VDIR_MIN_MOVE_SIZE_FRAC * pred_size
+        if vmag * dt > min_move and umag > min_move:
+            cos = (ux * vel[0] + uy * vel[1]) / (umag * vmag)
+            if cos < cfg.VDIR_COS_VETO:
+                vetoed = True
+            # (1-cos)/2 из [0,1] -> в стороны окна, как и слагаемое А
+            score += cfg.VDIR_LAMBDA * (1.0 - cos) / 2.0 * window_side
+
     return score, vetoed
 
 
@@ -309,8 +327,9 @@ class TrackState:
 
         if occluded:
             chosen, chosen_d = None, None
-        elif getattr(self.cfg, "ENABLE_SIZE_SCORING", False) or \
-                getattr(self.cfg, "ENABLE_VELOCITY_GATE", False):
+        elif (getattr(self.cfg, "ENABLE_SIZE_SCORING", False)
+                or getattr(self.cfg, "ENABLE_VELOCITY_GATE", False)
+                or getattr(self.cfg, "ENABLE_VELOCITY_DIRECTION", False)):
             pred_size = self.filtered_size
             vel = (self.filter.vx, self.filter.vy) if self.velocity_ready else None
             scored = []

@@ -200,6 +200,9 @@ def main():
                      help="механизм В: гейт по скорости. ВНИМАНИЕ: в текущей формулировке "
                           "алгебраически тождествен дистанционному слагаемому (см. коммент "
                           "в track_logic.score_candidate) — включать смысла нет")
+    ap.add_argument("--enable-vdir", action="store_true",
+                     help="механизм В-направленный: штраф и вето за РАЗВОРОТ движения "
+                          "(в отличие от --enable-v, не повторяет дистанционное слагаемое)")
     ap.add_argument("--filter-level", type=int, default=None, choices=[0, 1, 2],
                      help="0 = последняя детекция, 1 = alpha-beta (по умолчанию из конфига), "
                           "2 = Калман в углах (theta, theta', phi, phi', log h)")
@@ -219,6 +222,7 @@ def main():
     tcfg.ENABLE_SIZE_SCORING = args.enable_a
     tcfg.ENABLE_OCCLUSION_HOLD = args.enable_b
     tcfg.ENABLE_VELOCITY_GATE = args.enable_v
+    tcfg.ENABLE_VELOCITY_DIRECTION = args.enable_vdir
     if args.filter_level is not None:
         tcfg.FILTER_LEVEL = args.filter_level
     if args.enable_gate and tcfg.FILTER_LEVEL != 2:
@@ -240,6 +244,8 @@ def main():
         "mechanism_A_size": args.enable_a,
         "mechanism_B_occlusion": args.enable_b,
         "mechanism_V_velocity": args.enable_v,
+        "mechanism_Vdir_direction": args.enable_vdir,
+        "vdir_lambda": tcfg.VDIR_LAMBDA, "vdir_cos_veto": tcfg.VDIR_COS_VETO,
         "tick_hz": args.tick_hz,
         "size_lambda": tcfg.SIZE_LAMBDA, "size_veto_ratio": tcfg.SIZE_VETO_RATIO,
         "occlusion_proximity_frac": tcfg.OCCLUSION_PROXIMITY_FRAC,
