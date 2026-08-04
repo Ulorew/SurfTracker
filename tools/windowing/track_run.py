@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""Прогон петли слежения на одной "проездной" папке кадров (тикет "трекинг,
+офлайн на видео"). Такт симулируется прореживанием кадров ДО заданного Гц ПО
+ТАЙМСТАМПАМ (не константным шагом кадров) — см. manifest.json рядом с
+кадрами (пишет write_manifests.py/extract_val_ranges.py).
+
+    python track_run.py --frames-dir Data/frames/val_manual/<range>/ \
+        --weights best.pt --tick-hz 3.0 --out run.mp4 --log-out run.jsonl
+"""
+import argparse
+import json
+import os
+
+import cv2
+import numpy as np
+
+import config
+import tracking_config as tcfg
+from crop import crop
+from eval_track import local_to_frame, preds_to_frame
+from geometry import Square, resolve_placement
+from track_eval import gt_box_at, load_gt_track
+from track_logic import STATUS_LOST, STATUS_TRACKING, TrackState
+
+STATUS_COLOR = {
+    STATUS_TRACKING: (0, 200, 0),   # зелёный — ведём
+    "miss": (0, 165, 255),           # оранжевый — промах (ещё tracking, но пропуск в этом такте)
+    STATUS_LOST: (0, 0, 220),        # красный — потеря
+}
+
+
+def load_manifest(frames_dir):
+    with open(os.path.join(frames_dir, "manifest.json")) as f:
+        m = json.load(f)
+    m["frames"].sort(key=lambda r: r["timestamp_sec"])
+    return m
+
+
+def decimate_by_timestamp(frames, tick_hz):
+    """Ближайший доступный кадр к каждому целевому тактовому времени, шаг
+    1/tick_hz от таймстампа первого кадра. Не даёт задвоений подряд."""
+    if not frames:
+        return []
+    period = 1.0 / tick_hz
+    start, end = frames[0]["timestamp_sec"], frames[-1]["timestamp_sec"]
+    chosen = []
+    target = start
+    while target <= end + 1e-9:
+        best = min(frames, key=lambda r: abs(r["timestamp_sec"] - target))
+        if not chosen or chosen[-1]["name"] != best["name"]:
+            chosen.append(best)
+        target += period
+    return chosen
+
+
+def detect_in_window(model, frame, square, imgsz, low_conf):
+    """-> (detections_frame_coords [(x0,y0,x1,y1,conf),...], placement).
+
+    placement считается по config.WINDOW_SIZE, а НЕ по imgsz: холст рисует
+    crop(), и он всегда отдаёт config.WINDOW_SIZE (см. crop.py). imgsz — это
+    только то, к чему ultralytics приведёт уже готовый холст перед сетью;
+    если считать инверсию окно->кадр по imgsz, при imgsz != WINDOW_SIZE
+    координаты детекций поедут в масштабе.
+    """
+    placement = resolve_placement(square, frame.shape[1], frame.shape[0], config.WINDOW_SIZE)
+    window_img = crop(frame, square)
+    res = model.predict(window_img, imgsz=imgsz, conf=low_conf, verbose=False)[0]
+    preds_local = [tuple(float(v) for v in bb) for bb in res.boxes.xyxy.cpu().numpy()]
+    confs = [float(c) for c in res.boxes.conf.cpu().numpy()]
+    preds_frame = preds_to_frame(preds_local, placement)
+    dets = [(x0, y0, x1, y1, c) for (x0, y0, x1, y1), c in zip(preds_frame, confs)]
+    return dets, placement
+
+
+def bootstrap_seed_from_gt(gt_track, ticks):
+    """Первый такт, покрытый разметкой (через сплайн track_eval.gt_box_at)
+    — если истина есть, она надёжнее модельной затравки по уверенности:
+    среди нескольких похожих сёрферов "самая уверенная детекция" может
+    оказаться не той целью, что нужна (см. чат тикета — реальный случай)."""
+    for i, rec in enumerate(ticks):
+        box = gt_box_at(gt_track, rec["timestamp_sec"])
+        if box is not None:
+            cx, cy, w, h = box
+            return i, (cx, cy), max(w, h)
+    return None, None, None
+
+
+def bootstrap_seed(model, frames_dir, frames, imgsz, conf=0.25):
+    """Первая детекция на ПОЛНОМ кадре (единственное место в петле, где
+    решение принимается по уверенности — состояния/предсказания ещё нет,
+    select_target по расстоянию тут неприменим). Пробуем кадры по порядку,
+    пока не найдётся хоть одна детекция."""
+    for rec in frames:
+        frame = cv2.imread(os.path.join(frames_dir, rec["name"]))
+        res = model.predict(frame, imgsz=imgsz, conf=conf, verbose=False)[0]
+        if len(res.boxes) == 0:
+            continue
+        confs = [float(c) for c in res.boxes.conf.cpu().numpy()]
+        boxes = [tuple(float(v) for v in b) for b in res.boxes.xyxy.cpu().numpy()]
+        best_i = max(range(len(confs)), key=lambda i: confs[i])
+        x0, y0, x1, y1 = boxes[best_i]
+        size = max(x1 - x0, y1 - y0)
+        return rec, ((x0 + x1) / 2.0, (y0 + y1) / 2.0), size
+    return None, None, None
+
+
+def draw_overlay(frame, tick_idx, n_ticks, ts_sec, square, detections, chosen, status, miss_count):
+    color = STATUS_COLOR[STATUS_LOST] if status == STATUS_LOST else (
+        STATUS_COLOR["miss"] if miss_count > 0 else STATUS_COLOR[STATUS_TRACKING])
+    x0, y0 = int(square.cx - square.side / 2), int(square.cy - square.side / 2)
+    x1, y1 = int(square.cx + square.side / 2), int(square.cy + square.side / 2)
+    cv2.rectangle(frame, (x0, y0), (x1, y1), color, 2)
+    cv2.drawMarker(frame, (int(square.cx), int(square.cy)), color,
+                    markerType=cv2.MARKER_CROSS, markerSize=16, thickness=2)
+    for (dx0, dy0, dx1, dy1, dc) in detections:
+        is_chosen = chosen is not None and (dx0, dy0, dx1, dy1, dc) == chosen
+        c = (255, 255, 0) if is_chosen else (140, 140, 140)
+        cv2.rectangle(frame, (int(dx0), int(dy0)), (int(dx1), int(dy1)), c, 1)
+
+    label = {STATUS_TRACKING: "ВЕДУ", STATUS_LOST: "ПОТЕРЯ"}[status]
+    if status == STATUS_TRACKING and miss_count > 0:
+        label = f"ПРОПУСК ({miss_count})"
+    text = f"[{tick_idx+1}/{n_ticks}] t={ts_sec:.2f}s  {label}"
+    cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
+    return frame
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--frames-dir", required=True)
+    ap.add_argument("--weights", required=True)
+    ap.add_argument("--tick-hz", type=float, default=tcfg.TICK_HZ_BASE)
+    ap.add_argument("--imgsz", type=int, default=640)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--log-out", required=True)
+    ap.add_argument("--bootstrap-conf", type=float, default=0.25)
+    ap.add_argument("--gt-first-pick", type=int, default=None,
+                     help="индекс бокса трекуемой цели на ПЕРВОМ размеченном кадре — если цель "
+                          "не помечена group_id (или помечена не та). Дальше цель тянется "
+                          "цепочкой по ближайшему боксу с отсечкой по скачку размера")
+    args = ap.parse_args()
+
+    from ultralytics import YOLO
+    model = YOLO(args.weights)
+
+    manifest = load_manifest(args.frames_dir)
+    frame_w, frame_h = manifest["frame_w"], manifest["frame_h"]
+    ticks = decimate_by_timestamp(manifest["frames"], args.tick_hz)
+    assert ticks, f"нет кадров в {args.frames_dir}"
+
+    try:
+        gt_track = load_gt_track(args.frames_dir,
+                                  manual_first_pick_index=args.gt_first_pick)
+    except ValueError:
+        gt_track = []
+        print("GT неоднозначна (нет единого group_id) — затравка по уверенности модели")
+
+    start_i = None
+    if gt_track:
+        start_i, seed_center, seed_size = bootstrap_seed_from_gt(gt_track, ticks)
+        if start_i is not None:
+            print(f"затравка по разметке: такт {start_i} ({ticks[start_i]['name']})")
+
+    if start_i is None:
+        seed_rec, seed_center, seed_size = bootstrap_seed(
+            model, args.frames_dir, ticks, args.imgsz, conf=args.bootstrap_conf)
+        if seed_rec is None:
+            raise SystemExit(f"не нашли цель ни на одном такте для затравки: {args.frames_dir}")
+        start_i = next(i for i, r in enumerate(ticks) if r["name"] == seed_rec["name"])
+        print(f"затравка по уверенности модели: такт {start_i} ({seed_rec['name']})")
+
+    ticks = ticks[start_i:]
+
+    ts_state = TrackState(tcfg, seed_center[0], seed_center[1], seed_size, frame_w, frame_h)
+
+    writer = cv2.VideoWriter(args.out, cv2.VideoWriter_fourcc(*"mp4v"), max(args.tick_hz, 1.0),
+                              (frame_w, frame_h))
+    log_rows = []
+    prev_ts = ticks[0]["timestamp_sec"]
+
+    for i, rec in enumerate(ticks):
+        frame = cv2.imread(os.path.join(args.frames_dir, rec["name"]))
+        dt = rec["timestamp_sec"] - prev_ts if i > 0 else 0.0
+        prev_ts = rec["timestamp_sec"]
+
+        # ровно та же точка и сторона, от которых step() примет решение —
+        # иначе модель смотрит в одно окно, а цель выбирается относительно
+        # другого центра (см. plan_window в track_logic).
+        cx, cy, side = ts_state.plan_window(dt)
+        square = Square(cx=cx, cy=cy, side=side)
+
+        if i == 0:
+            # затравочный такт: состояние уже проинициализировано, детекцию не гоняем повторно
+            detections, chosen = [], None
+            result_status, miss_count = STATUS_TRACKING, 0
+        else:
+            detections, _ = detect_in_window(model, frame, square, args.imgsz, tcfg.DETECT_LOW_CONF)
+            r = ts_state.step(dt, detections)
+            chosen, result_status, miss_count = r.chosen, r.status, r.miss_count
+            log_rows.append({
+                "frame": rec["name"], "frame_index": rec["frame_index"],
+                "timestamp_sec": rec["timestamp_sec"], "dt": dt,
+                "status": r.status, "predicted_cx": r.predicted_cx, "predicted_cy": r.predicted_cy,
+                "window_side": r.window_side,
+                "chosen": list(r.chosen) if r.chosen is not None else None,
+                "chosen_dist": r.chosen_dist, "miss_count": r.miss_count,
+                "lost_transition": r.lost_transition, "reacquired": r.reacquired,
+                # ВСЕ кандидаты этого такта, а не только выбранный: без них по
+                # логу не видно, из чего трекер выбирал — а именно это
+                # объясняет подмены (сосед оказался ближе к предсказанию).
+                "detections": [[round(v, 2) for v in d] for d in detections],
+            })
+
+        vis = draw_overlay(frame.copy(), i, len(ticks), rec["timestamp_sec"], square,
+                            detections, chosen, result_status, miss_count)
+        writer.write(vis)
+
+    writer.release()
+    with open(args.log_out, "w") as f:
+        for row in log_rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    n_lost = sum(1 for r in log_rows if r["lost_transition"])
+    n_reacq = sum(1 for r in log_rows if r["reacquired"])
+    n_miss_ticks = sum(1 for r in log_rows if r["chosen"] is None)
+    print(f"готово: {args.out}  тактов={len(ticks)}  промахов={n_miss_ticks}  "
+          f"потерь={n_lost}  повторных_захватов={n_reacq}")
+    print(f"лог: {args.log_out}")
+
+
+if __name__ == "__main__":
+    main()
