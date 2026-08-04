@@ -1,2 +1,11 @@
-# Project exclude paths
-/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.pt
+*.jpg
+*.jpeg
+*.png
+*.mp4
+.venv/
+.venv-label/
+.env
