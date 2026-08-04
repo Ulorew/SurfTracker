@@ -8,12 +8,16 @@
         --weights best.pt --tick-hz 3.0 --out run.mp4 --log-out run.jsonl
 """
 import argparse
+import hashlib
 import json
 import os
+
+import math
 
 import cv2
 import numpy as np
 
+import angles as ang
 import config
 import tracking_config as tcfg
 from crop import crop
@@ -22,11 +26,65 @@ from geometry import Square, resolve_placement
 from track_eval import gt_box_at, load_gt_track
 from track_logic import STATUS_LOST, STATUS_TRACKING, TrackState
 
+# Петля живёт в углах (тикет "ночь", п.2.0): состояние TrackState — радианы,
+# пиксели остаются только на входе (детекции) и выходе (вырезка окна, оверлей,
+# лог). Здесь — ровно эти две границы перевода.
+MAX_ABS_ANGLE = math.pi / 2 - 1e-3  # tan() у пи/2 уходит в бесконечность
+
+
+def det_to_angles(det, intr, index):
+    """Пиксельная детекция (x0,y0,x1,y1,conf) -> угловая, с индексом исходной.
+
+    Углы считаются по УГЛАМ рамки, а не по её центру и размеру: тогда и
+    центр (среднее углов), и размер (разность углов) остаются согласованными
+    между собой, а обратный переход к пикселям вообще не нужен — исходная
+    рамка достаётся по индексу, без потери точности на round-trip.
+    """
+    x0, y0, x1, y1, conf = det[0], det[1], det[2], det[3], det[4]
+    th0, ph0 = ang.px_to_angle(x0, y0, intr)
+    th1, ph1 = ang.px_to_angle(x1, y1, intr)
+    return (th0, ph0, th1, ph1, conf, index)
+
+
+def angular_window_to_square(cx_ang, cy_ang, side_ang, intr):
+    """Угловое окно -> квадрат в пикселях для crop().
+
+    Сторона — БОЛЬШАЯ из двух пиксельных проекций угловой стороны: tan
+    нелинеен, поэтому одна и та же угловая ширина у края кадра занимает
+    больше пикселей, чем в центре, и по горизонтали с вертикалью числа
+    расходятся. Берём максимум — окно обязано ПОКРЫВАТЬ то, что запросила
+    петля; недобор означал бы, что цель, которую петля считает видимой, в
+    вырезку не попала.
+
+    Центр квадрата — СЕРЕДИНА пиксельного пролёта, а не пиксель углового
+    центра: вдали от оптической оси проекция несимметрична (дальняя от
+    центра половина окна растягивается сильнее), и квадрат вокруг углового
+    центра срезал бы дальний край. Из-за этого пиксельный центр вырезки
+    слегка смещён наружу относительно предсказания — для ЛОГА и метрик
+    берётся честный angle_to_px(предсказание), а не этот центр.
+    """
+    def clamp(a):
+        return max(-MAX_ABS_ANGLE, min(MAX_ABS_ANGLE, a))
+
+    u_lo, v_lo = ang.angle_to_px(clamp(cx_ang - side_ang / 2), clamp(cy_ang - side_ang / 2), intr)
+    u_hi, v_hi = ang.angle_to_px(clamp(cx_ang + side_ang / 2), clamp(cy_ang + side_ang / 2), intr)
+    return Square(cx=(u_lo + u_hi) / 2.0, cy=(v_lo + v_hi) / 2.0,
+                   side=max(u_hi - u_lo, v_hi - v_lo))
+
+
 STATUS_COLOR = {
     STATUS_TRACKING: (0, 200, 0),   # зелёный — ведём
     "miss": (0, 165, 255),           # оранжевый — промах (ещё tracking, но пропуск в этом такте)
     STATUS_LOST: (0, 0, 220),        # красный — потеря
 }
+
+
+def _file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def load_manifest(frames_dir):
@@ -156,6 +214,15 @@ def main():
     tcfg.ENABLE_OCCLUSION_HOLD = args.enable_b
     tcfg.ENABLE_VELOCITY_GATE = args.enable_v
     run_cfg = {
+        # Провенанс: без весов и папки кадров лог не воспроизводим — по
+        # прежним прогонам матрицы уже невозможно установить, какой моделью
+        # они сделаны (проверено перебором models/*.pt: точного совпадения
+        # детекций нет ни с одной).
+        "weights": os.path.abspath(args.weights),
+        "weights_sha256": _file_sha256(args.weights),
+        "frames_dir": os.path.abspath(args.frames_dir),
+        "imgsz": args.imgsz,
+        "detect_low_conf": tcfg.DETECT_LOW_CONF,
         "mechanism_A_size": args.enable_a,
         "mechanism_B_occlusion": args.enable_b,
         "mechanism_V_velocity": args.enable_v,
@@ -165,9 +232,6 @@ def main():
         "occlusion_hold_ticks": tcfg.OCCLUSION_HOLD_TICKS,
         "target_select_max_dist_frac": tcfg.TARGET_SELECT_MAX_DIST_FRAC,
     }
-    with open(os.path.splitext(args.log_out)[0] + ".runcfg.json", "w") as f:
-        json.dump(run_cfg, f, indent=2, ensure_ascii=False)
-
     from ultralytics import YOLO
     model = YOLO(args.weights)
 
@@ -199,7 +263,23 @@ def main():
 
     ticks = ticks[start_i:]
 
-    ts_state = TrackState(tcfg, seed_center[0], seed_center[1], seed_size, frame_w, frame_h)
+    intr = ang.intrinsics_for(os.path.basename(os.path.normpath(args.frames_dir)),
+                               frame_w, frame_h)
+    # Пол и потолок стороны окна — угловые эквиваленты прежних пиксельных:
+    # WINDOW_SIZE (столько crop() вырежет в любом случае) и короткая сторона
+    # кадра (за ней вырезка перестаёт быть квадратной).
+    min_window_ang = ang.px_size_to_angle(tcfg.DETECT_MIN_WINDOW_PX, intr)
+    max_window_ang = ang.px_size_to_angle(min(frame_w, frame_h), intr)
+    run_cfg["intrinsics"] = {"fx": intr.fx, "cx": intr.cx, "cy": intr.cy,
+                              "source": intr.source, "note": intr.note}
+    run_cfg["min_window_deg"] = math.degrees(min_window_ang)
+    run_cfg["max_window_deg"] = math.degrees(max_window_ang)
+    with open(os.path.splitext(args.log_out)[0] + ".runcfg.json", "w") as f:
+        json.dump(run_cfg, f, indent=2, ensure_ascii=False)
+
+    seed_th, seed_ph = ang.px_to_angle(seed_center[0], seed_center[1], intr)
+    ts_state = TrackState(tcfg, seed_th, seed_ph, ang.px_size_to_angle(seed_size, intr),
+                           min_window_ang, max_window_ang)
 
     writer = cv2.VideoWriter(args.out, cv2.VideoWriter_fourcc(*"mp4v"), max(args.tick_hz, 1.0),
                               (frame_w, frame_h))
@@ -214,8 +294,8 @@ def main():
         # ровно та же точка и сторона, от которых step() примет решение —
         # иначе модель смотрит в одно окно, а цель выбирается относительно
         # другого центра (см. plan_window в track_logic).
-        cx, cy, side = ts_state.plan_window(dt)
-        square = Square(cx=cx, cy=cy, side=side)
+        cx_ang, cy_ang, side_ang = ts_state.plan_window(dt)
+        square = angular_window_to_square(cx_ang, cy_ang, side_ang, intr)
 
         if i == 0:
             # затравочный такт: состояние уже проинициализировано, детекцию не гоняем повторно
@@ -223,15 +303,36 @@ def main():
             result_status, miss_count = STATUS_TRACKING, 0
         else:
             detections, _ = detect_in_window(model, frame, square, args.imgsz, tcfg.DETECT_LOW_CONF)
-            r = ts_state.step(dt, detections)
-            chosen, result_status, miss_count = r.chosen, r.status, r.miss_count
+            ang_dets = [det_to_angles(d, intr, k) for k, d in enumerate(detections)]
+            r = ts_state.step(dt, ang_dets)
+            # обратно в пиксели — исходная рамка по индексу, без round-trip
+            chosen = detections[r.chosen[5]] if r.chosen is not None else None
+            result_status, miss_count = r.status, r.miss_count
+            # Лог остаётся ПИКСЕЛЬНЫМ: его читают метрики (track_eval) и
+            # визуализация (track_viz), обе работают в координатах кадра, а
+            # истина размечена там же. Угловые величины пишутся рядом, с
+            # суффиксом _ang, чтобы можно было проверить саму петлю.
+            # положение предсказания в пикселях — честный перевод самого
+            # угла, а не центр вырезки (тот смещён наружу, см. докстринг
+            # angular_window_to_square); метрика сравнивает с истиной именно
+            # предсказание, и смещение вырезки в неё попадать не должно
+            pred_u, pred_v = ang.angle_to_px(r.predicted_cx, r.predicted_cy, intr)
+            win_px = angular_window_to_square(r.predicted_cx, r.predicted_cy,
+                                               r.window_side, intr)
+            chosen_dist_px = None
+            if chosen is not None:
+                ccx, ccy = (chosen[0] + chosen[2]) / 2.0, (chosen[1] + chosen[3]) / 2.0
+                chosen_dist_px = math.hypot(ccx - pred_u, ccy - pred_v)
             log_rows.append({
                 "frame": rec["name"], "frame_index": rec["frame_index"],
                 "timestamp_sec": rec["timestamp_sec"], "dt": dt,
-                "status": r.status, "predicted_cx": r.predicted_cx, "predicted_cy": r.predicted_cy,
-                "window_side": r.window_side,
-                "chosen": list(r.chosen) if r.chosen is not None else None,
-                "chosen_dist": r.chosen_dist, "miss_count": r.miss_count,
+                "status": r.status, "predicted_cx": pred_u, "predicted_cy": pred_v,
+                "window_side": win_px.side,
+                "predicted_theta": r.predicted_cx, "predicted_phi": r.predicted_cy,
+                "window_side_ang": r.window_side,
+                "chosen": list(chosen) if chosen is not None else None,
+                "chosen_dist": chosen_dist_px, "chosen_dist_ang": r.chosen_dist,
+                "miss_count": r.miss_count,
                 "lost_transition": r.lost_transition, "reacquired": r.reacquired,
                 "occluded": r.occluded, "n_candidates": r.n_candidates,
                 "n_vetoed": r.n_vetoed,

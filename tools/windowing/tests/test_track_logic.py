@@ -1,5 +1,15 @@
 """track_logic.py — тикет "трекинг", п.2-4: выбор цели, размер-фильтр,
-расширение окна на пропуск, состояние трека (miss/lost/reacquire)."""
+расширение окна на пропуск, состояние трека (miss/lost/reacquire).
+
+Единицы. После тикета "ночь" п.2.0 петля работает в радианах, но САМА
+геометрия здесь от единиц не зависит — тесты написаны в условных единицах,
+где min_window=640 играет роль прежнего пола "столько пикселей crop() всё
+равно вырежет", а max_window — прежней короткой стороны кадра. Числа взяты
+теми же, что и раньше, чтобы отличия от прежнего поведения были видны, а не
+спрятаны за сменой масштаба. Перевод пиксели<->углы проверяется отдельно:
+test_angles.py (сам перевод) и test_track_angular_boundary.py (границы, где
+петля встречается с пикселями).
+"""
 import types
 
 import pytest
@@ -22,7 +32,6 @@ def make_cfg(**overrides):
         FILTER_LEVEL=0,
         ALPHA_BETA_ALPHA=0.6,
         ALPHA_BETA_BETA=0.3,
-        DETECT_MIN_WINDOW_PX=640,
     )
     for k, v in overrides.items():
         setattr(cfg, k, v)
@@ -31,34 +40,28 @@ def make_cfg(**overrides):
 
 class TestWindowGeometryIsWhatModelActuallySees:
     """Сторона окна обязана совпадать с тем, что реально увидит модель.
-    crop() без паддинга не берёт меньше DETECT_MIN_WINDOW_PX, а сторона
-    больше короткой стороны кадра даёт неквадратную вырезку."""
+    Ниже min_window окно — фикция (crop() всё равно вырежет не меньше), выше
+    max_window вырезка перестаёт быть квадратной. Оба предела петля получает
+    снаружи уже в своих единицах."""
 
     def test_small_target_window_floored_to_detect_min(self):
-        cfg = make_cfg(TRACK_WINDOW_K=3.5, DETECT_MIN_WINDOW_PX=640)
-        ts = TrackState(cfg, 500, 500, 20, 1920, 1080)  # 3.5*20 = 70 номинально
+        cfg = make_cfg(TRACK_WINDOW_K=3.5)
+        ts = TrackState(cfg, 500, 500, 20, 640, 1080)  # 3.5*20 = 70 номинально
         assert ts.current_window_side() == pytest.approx(640)
 
     def test_large_target_window_capped_to_short_frame_side(self):
         """Потолок — КОРОТКАЯ сторона кадра: иначе src_box неквадратный и
         картинка приходит в сеть анизотропно сплющенной."""
         cfg = make_cfg(TRACK_WINDOW_K=3.5)
-        ts = TrackState(cfg, 960, 540, 400, 1920, 1080)  # 3.5*400 = 1400 > 1080
+        ts = TrackState(cfg, 960, 540, 400, 640, 1080)  # 3.5*400 = 1400 > 1080
         assert ts.current_window_side() == pytest.approx(1080)
 
-    def test_window_stays_square_within_frame(self):
-        from geometry import Square, resolve_placement
-        cfg = make_cfg()
-        ts = TrackState(cfg, 960, 540, 400, 1920, 1080)
-        side = ts.current_window_side()
-        pl = resolve_placement(Square(960, 540, side), 1920, 1080, 640)
-        assert pl.scale_x == pytest.approx(pl.scale_y), "анизотропное сжатие окна"
 
     def test_selection_threshold_uses_real_window_not_nominal(self):
         """Порог приёма считается от реальной стороны (640), а не от
         номинальных 70 — иначе он втрое строже задуманного."""
         cfg = make_cfg(TARGET_SELECT_MAX_DIST_FRAC=0.30)
-        ts = TrackState(cfg, 500, 500, 20, 1920, 1080)
+        ts = TrackState(cfg, 500, 500, 20, 640, 1080)
         # 150px от предсказания: внутри 0.3*640=192, но вне 0.3*70=21
         det = (640, 490, 660, 510, 0.5)
         r = ts.step(dt=0.33, detections=[det])
@@ -70,7 +73,7 @@ class TestExtrapolationIsApplied:
     такт, а не вокруг позиции с прошлого обновления."""
 
     def _moving(self, cfg):
-        ts = TrackState(cfg, 100, 500, 200, 1920, 1080)
+        ts = TrackState(cfg, 100, 500, 200, 640, 1080)
         ts.step(dt=1.0, detections=[(200 - 100, 400, 200 + 100, 600, 0.9)])  # центр 200
         return ts
 
@@ -153,7 +156,7 @@ class TestExpandWindowSide:
 class TestTrackStateHappyPath:
     def test_stays_tracking_with_detections_near_prediction(self):
         cfg = make_cfg()
-        ts = TrackState(cfg, init_cx=100, init_cy=100, init_size=20, frame_w=1000, frame_h=800)
+        ts = TrackState(cfg, init_cx=100, init_cy=100, init_size=20, min_window=640, max_window=800)
         for _ in range(5):
             det = (95, 95, 105, 105, 0.8)
             r = ts.step(dt=0.33, detections=[det])
@@ -162,16 +165,16 @@ class TestTrackStateHappyPath:
             assert r.miss_count == 0
 
     def test_window_side_is_k_times_size_when_above_detect_floor(self):
-        cfg = make_cfg(TRACK_WINDOW_K=3.5, DETECT_MIN_WINDOW_PX=640)
+        cfg = make_cfg(TRACK_WINDOW_K=3.5)
         ts = TrackState(cfg, init_cx=500, init_cy=400, init_size=200,
-                         frame_w=1920, frame_h=1080)
+                         min_window=640, max_window=1080)
         assert ts.current_window_side() == pytest.approx(3.5 * 200)  # 700 > пола 640
 
 
 class TestTrackStateMissesAndLoss:
     def test_miss_extrapolates_and_expands_window(self):
         cfg = make_cfg(WINDOW_EXPAND_PER_MISS=1.2)
-        ts = TrackState(cfg, init_cx=100, init_cy=100, init_size=20, frame_w=1000, frame_h=800)
+        ts = TrackState(cfg, init_cx=100, init_cy=100, init_size=20, min_window=640, max_window=800)
         side0 = ts.current_window_side()
         r = ts.step(dt=0.33, detections=[])  # промах
         assert r.status == STATUS_TRACKING
@@ -181,7 +184,7 @@ class TestTrackStateMissesAndLoss:
 
     def test_n_consecutive_misses_transitions_to_lost_exactly_on_nth(self):
         cfg = make_cfg(MISS_TO_LOST_N=5)
-        ts = TrackState(cfg, init_cx=100, init_cy=100, init_size=20, frame_w=1000, frame_h=800)
+        ts = TrackState(cfg, init_cx=100, init_cy=100, init_size=20, min_window=640, max_window=800)
         for i in range(1, 5):
             r = ts.step(dt=0.33, detections=[])
             assert r.status == STATUS_TRACKING, f"не должен был потеряться на промахе {i}"
@@ -192,7 +195,7 @@ class TestTrackStateMissesAndLoss:
 
     def test_lost_window_frozen_at_last_known_position(self):
         cfg = make_cfg(MISS_TO_LOST_N=2)
-        ts = TrackState(cfg, init_cx=100, init_cy=100, init_size=20, frame_w=1000, frame_h=800)
+        ts = TrackState(cfg, init_cx=100, init_cy=100, init_size=20, min_window=640, max_window=800)
         ts.step(dt=0.33, detections=[])
         ts.step(dt=0.33, detections=[])  # теперь LOST
         r1 = ts.step(dt=0.33, detections=[])
@@ -205,7 +208,7 @@ class TestTrackStateMissesAndLoss:
         остаться квадратным, иначе вырезка неквадратная и картинка приходит
         в сеть сплющенной."""
         cfg = make_cfg(MISS_TO_LOST_N=1, WINDOW_EXPAND_PER_MISS=1.5)
-        ts = TrackState(cfg, init_cx=100, init_cy=100, init_size=20, frame_w=300, frame_h=200)
+        ts = TrackState(cfg, init_cx=100, init_cy=100, init_size=20, min_window=640, max_window=200)
         ts.step(dt=0.33, detections=[])  # -> LOST сразу (N=1)
         prev = ts.current_window_side()
         for _ in range(30):  # много промахов, должно упереться в потолок
@@ -219,7 +222,7 @@ class TestTrackStateMissesAndLoss:
         """Затяжная потеря (сотни тактов) не должна переполнять возведение
         в степень до того, как сработает ограничение кадром."""
         cfg = make_cfg(MISS_TO_LOST_N=1, WINDOW_EXPAND_PER_MISS=1.15)
-        ts = TrackState(cfg, init_cx=100, init_cy=100, init_size=20, frame_w=1920, frame_h=1080)
+        ts = TrackState(cfg, init_cx=100, init_cy=100, init_size=20, min_window=640, max_window=1080)
         for _ in range(2000):
             ts.step(dt=0.33, detections=[])
         assert ts.current_window_side() == pytest.approx(1080)
@@ -227,7 +230,7 @@ class TestTrackStateMissesAndLoss:
     def test_far_detection_during_tracking_is_rejected_not_a_swap(self):
         """Чужой сёрфер рядом не должен подменить цель — просто промах."""
         cfg = make_cfg(TARGET_SELECT_MAX_DIST_FRAC=0.3, TRACK_WINDOW_K=3.5)
-        ts = TrackState(cfg, init_cx=100, init_cy=100, init_size=20, frame_w=1000, frame_h=800)
+        ts = TrackState(cfg, init_cx=100, init_cy=100, init_size=20, min_window=640, max_window=800)
         other_surfer = (400, 400, 420, 420, 0.9)  # далеко за порогом
         r = ts.step(dt=0.33, detections=[other_surfer])
         assert r.chosen is None
@@ -237,7 +240,7 @@ class TestTrackStateMissesAndLoss:
 class TestReacquisition:
     def test_detection_near_last_known_during_lost_reacquires(self):
         cfg = make_cfg(MISS_TO_LOST_N=1)
-        ts = TrackState(cfg, init_cx=100, init_cy=100, init_size=20, frame_w=1000, frame_h=800)
+        ts = TrackState(cfg, init_cx=100, init_cy=100, init_size=20, min_window=640, max_window=800)
         ts.step(dt=0.33, detections=[])  # -> LOST
         assert ts.status == STATUS_LOST
         det_near = (95, 95, 105, 105, 0.7)
@@ -248,7 +251,7 @@ class TestReacquisition:
 
     def test_reacquire_resets_velocity(self):
         cfg = make_cfg(MISS_TO_LOST_N=1, FILTER_LEVEL=0)
-        ts = TrackState(cfg, init_cx=0, init_cy=0, init_size=20, frame_w=1000, frame_h=800)
+        ts = TrackState(cfg, init_cx=0, init_cy=0, init_size=20, min_window=640, max_window=800)
         ts.step(dt=1.0, detections=[])  # miss -> LOST (заморожено на 0,0)
         ts.step(dt=1.0, detections=[(95, -5, 105, 5, 0.7)])  # реакквизиция на (100,0)
         assert ts.filter.vx == 0.0, "скорость после реакквизиции должна быть с нуля, не унаследована"
@@ -259,8 +262,8 @@ class TestReacquisition:
         радиус приёма (0.3*S) всегда лежал внутри полуширины (0.5*S)
         НЕрасширенного окна, и рост окна не мог принять ничего нового."""
         cfg = make_cfg(MISS_TO_LOST_N=1, WINDOW_EXPAND_PER_MISS=1.15,
-                        REACQUIRE_MAX_DIST_FRAC=0.30, DETECT_MIN_WINDOW_PX=640)
-        ts = TrackState(cfg, 500, 500, 20, 1920, 1080)
+                        REACQUIRE_MAX_DIST_FRAC=0.30)
+        ts = TrackState(cfg, 500, 500, 20, 640, 1080)
         ts.step(dt=0.33, detections=[])  # -> LOST, окно 640*1.15
         far = (500 + 300 - 10, 490, 500 + 300 + 10, 510, 0.5)  # 300px от точки заморозки
 
@@ -278,7 +281,7 @@ class TestReacquisition:
         За N промахов до потери фильтр экстраполирует цель — выбрасывать это
         движение значит искать там, где цели заведомо уже нет."""
         cfg = make_cfg(MISS_TO_LOST_N=3, FILTER_LEVEL=0)
-        ts = TrackState(cfg, 100, 500, 200, 1920, 1080)
+        ts = TrackState(cfg, 100, 500, 200, 640, 1080)
         ts.step(dt=1.0, detections=[(100, 400, 300, 600, 0.9)])  # центр 200, vx=100
         for _ in range(3):
             ts.step(dt=1.0, detections=[])                       # промахи -> LOST
@@ -287,7 +290,7 @@ class TestReacquisition:
 
     def test_detection_far_from_last_known_during_lost_not_reacquired(self):
         cfg = make_cfg(MISS_TO_LOST_N=1, WINDOW_EXPAND_PER_MISS=1.0)
-        ts = TrackState(cfg, init_cx=100, init_cy=100, init_size=20, frame_w=2000, frame_h=2000)
+        ts = TrackState(cfg, init_cx=100, init_cy=100, init_size=20, min_window=640, max_window=2000)
         ts.step(dt=0.33, detections=[])  # -> LOST, last_known_window_side = 3.5*20=70
         far = (900, 900, 920, 920, 0.9)  # далеко от (100,100), порог 0.3*70=21
         r = ts.step(dt=0.33, detections=[far])

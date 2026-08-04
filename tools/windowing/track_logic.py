@@ -46,11 +46,11 @@ def occlusion_triggered(candidates: list, window_side: float, proximity_frac: fl
 
 def score_candidate(det, pred_cx, pred_cy, pred_size, prev_cx, prev_cy,
                      vel, dt, window_side, cfg):
-    """-> (счёт в пикселях, вето: bool). Меньший счёт лучше.
+    """-> (счёт в угловых единицах, вето: bool). Меньший счёт лучше.
 
-    Базовый счёт — расстояние до предсказания (правило тикета п.2: НЕ по
-    уверенности). Механизмы А и В добавляют слагаемые, приведённые к тем же
-    пикселям, иначе складывать их с расстоянием нельзя.
+    Базовый счёт — угловое расстояние до предсказания (правило тикета п.2: НЕ
+    по уверенности). Механизмы А и В добавляют слагаемые, приведённые к тем
+    же радианам, иначе складывать их с расстоянием нельзя.
     """
     dcx, dcy = _det_center(det)
     score = dist(pred_cx, pred_cy, dcx, dcy)
@@ -63,7 +63,7 @@ def score_candidate(det, pred_cx, pred_cy, pred_size, prev_cx, prev_cy,
             if ratio > r_veto or ratio < 1.0 / r_veto:
                 vetoed = True
             # безразмерный |log(отношение)| домножается на сторону окна,
-            # чтобы слагаемое было в пикселях, как и расстояние
+            # чтобы слагаемое было в радианах, как и расстояние
             score += cfg.SIZE_LAMBDA * abs(math.log(ratio)) * window_side
 
     # ВНИМАНИЕ: механизм В в формулировке тикета ИЗБЫТОЧЕН. Предсказание
@@ -88,11 +88,11 @@ def score_candidate(det, pred_cx, pred_cy, pred_size, prev_cx, prev_cy,
         implied_vy = (dcy - prev_cy) / dt
         delta = dist(implied_vx, implied_vy, vel[0], vel[1])
         allowed = (cfg.VELOCITY_GATE_FACTOR * math.hypot(vel[0], vel[1])
-                   + cfg.VELOCITY_GATE_NOISE_PX_PER_SEC)
+                   + cfg.VELOCITY_GATE_NOISE_ANG_PER_SEC)
         if delta > cfg.VELOCITY_VETO_MULT * allowed:
             vetoed = True
         excess = max(0.0, delta - allowed)
-        # скорость * dt = пиксели, снова приводим к единицам расстояния
+        # скорость * dt = угол, снова приводим к единицам расстояния
         score += cfg.VELOCITY_LAMBDA * excess * dt
 
     return score, vetoed
@@ -100,7 +100,7 @@ def score_candidate(det, pred_cx, pred_cy, pred_size, prev_cx, prev_cy,
 
 def select_target(pred_cx: float, pred_cy: float, detections: list, window_side: float,
                    max_dist_frac: float):
-    """detections: список (x0,y0,x1,y1,conf) в координатах КАДРА.
+    """detections: список (theta0,phi0,theta1,phi1,conf,...) в УГЛАХ.
 
     Ближайшая к предсказанию по центру, среди тех, что не дальше
     max_dist_frac*window_side. НЕ по уверенности (тикет п.2) — уверенность
@@ -144,8 +144,8 @@ class TickResult(NamedTuple):
     predicted_cx: float
     predicted_cy: float
     window_side: float
-    chosen: "Optional[tuple]"      # (x0,y0,x1,y1,conf) выбранной детекции, или None (промах)
-    chosen_dist: "Optional[float]"  # расстояние предсказание<->выбранная детекция, px
+    chosen: "Optional[tuple]"      # выбранная угловая детекция, или None (промах)
+    chosen_dist: "Optional[float]"  # угловое расстояние предсказание<->выбранная детекция
     miss_count: int
     lost_transition: bool   # True на такте, где произошёл переход tracking->lost
     reacquired: bool        # True на такте повторного захвата (lost->tracking)
@@ -155,16 +155,27 @@ class TickResult(NamedTuple):
 
 
 class TrackState:
+    """Состояние трека ЦЕЛИКОМ в угловых единицах (тикет "ночь", п.2.0).
+
+    Позиция, скорость, размер цели, сторона окна и все гейты — радианы.
+    Пиксели остаются снаружи: track_run переводит детекции в углы на входе и
+    угол окна обратно в пиксели на выходе (вырезка и оверлей).
+
+    min_window/max_window тоже угловые: прежние DETECT_MIN_WINDOW_PX и
+    размеры кадра — величины пиксельные, и оставить их здесь значило бы
+    протащить пиксели внутрь.
+    """
+
     def __init__(self, cfg, init_cx: float, init_cy: float, init_size: float,
-                 frame_w: int, frame_h: int):
+                 min_window: float, max_window: float):
         self.cfg = cfg
         self.filter = make_filter(cfg.FILTER_LEVEL, cfg.ALPHA_BETA_ALPHA, cfg.ALPHA_BETA_BETA)
         self.filter.seed(init_cx, init_cy)
         self.filtered_size = init_size
         self.miss_count = 0
         self.status = STATUS_TRACKING
-        self.frame_w = frame_w
-        self.frame_h = frame_h
+        self.min_window = min_window
+        self.max_window = max_window
         self.last_known_cx = init_cx
         self.last_known_cy = init_cy
         self.last_known_window_side = cfg.TRACK_WINDOW_K * init_size
@@ -185,22 +196,20 @@ class TrackState:
         self.velocity_ready = False
 
     def current_window_side(self) -> float:
-        """Сторона окна, которую РЕАЛЬНО увидит модель.
+        """Угловая сторона окна, которую РЕАЛЬНО увидит модель.
 
-        Пол DETECT_MIN_WINDOW_PX — не косметика: crop() без паддинга всё
-        равно вырежет столько реальных пикселей (см. tracking_config).
-        Потолок — min(frame_w, frame_h), а не max: при стороне больше
-        короткой стороны кадра resolve_placement выдаёт неквадратный src_box,
-        и картинка приходит в модель анизотропно сплющенной — то есть в
-        масштабе, которого не было в обучении.
+        Пол min_window — угловой эквивалент того, что crop() без паддинга
+        всё равно вырежет не меньше WINDOW_SIZE пикселей. Потолок
+        max_window — угловой эквивалент КОРОТКОЙ стороны кадра: при большей
+        стороне вырезка становится неквадратной и картинка приходит в
+        модель анизотропно сплющенной.
         """
         if self.status == STATUS_TRACKING:
-            base = max(self.cfg.TRACK_WINDOW_K * self.filtered_size,
-                       self.cfg.DETECT_MIN_WINDOW_PX)
+            base = max(self.cfg.TRACK_WINDOW_K * self.filtered_size, self.min_window)
         else:
-            base = max(self.last_known_window_side, self.cfg.DETECT_MIN_WINDOW_PX)
+            base = max(self.last_known_window_side, self.min_window)
         grown = expand_window_side(base, self.miss_count, self.cfg.WINDOW_EXPAND_PER_MISS)
-        return min(grown, min(self.frame_w, self.frame_h))
+        return min(grown, self.max_window)
 
     def plan_window(self, dt: float) -> "tuple[float, float, float]":
         """Куда смотреть на ЭТОМ такте -> (cx, cy, сторона).
@@ -219,7 +228,7 @@ class TrackState:
         return cx, cy, side
 
     def step(self, dt: float, detections: list) -> TickResult:
-        """detections уже в координатах кадра (низкий conf, см. tracking_config).
+        """detections уже переведены в углы (низкий conf, см. tracking_config).
 
         dt тот же, что был передан в plan_window для этого такта — окно и
         решение о цели обязаны считаться от одной и той же точки.

@@ -20,12 +20,12 @@ def make_cfg(**overrides):
         REACQUIRE_MAX_DIST_FRAC=0.30, MISS_TO_LOST_N=5,
         WINDOW_EXPAND_PER_MISS=1.15, SIZE_FILTER_GROW_RATE=0.5,
         SIZE_FILTER_SHRINK_RATE=0.1, FILTER_LEVEL=0,
-        ALPHA_BETA_ALPHA=0.6, ALPHA_BETA_BETA=0.3, DETECT_MIN_WINDOW_PX=640,
+        ALPHA_BETA_ALPHA=0.6, ALPHA_BETA_BETA=0.3,
         ENABLE_SIZE_SCORING=False, SIZE_LAMBDA=0.5, SIZE_VETO_RATIO=1.8,
         ENABLE_OCCLUSION_HOLD=False, OCCLUSION_PROXIMITY_FRAC=0.25,
         OCCLUSION_HOLD_TICKS=4,
         ENABLE_VELOCITY_GATE=False, VELOCITY_GATE_FACTOR=2.0,
-        VELOCITY_GATE_NOISE_PX_PER_SEC=60.0, VELOCITY_LAMBDA=0.5,
+        VELOCITY_GATE_NOISE_ANG_PER_SEC=60.0, VELOCITY_LAMBDA=0.5,
         VELOCITY_VETO_MULT=3.0,
     )
     for k, v in overrides.items():
@@ -43,7 +43,7 @@ class TestMechanismA_Size:
 
     def test_disabled_picks_nearest_regardless_of_size(self):
         cfg = make_cfg(ENABLE_SIZE_SCORING=False)
-        ts = TrackState(cfg, 500, 500, 100, 1920, 1080)
+        ts = TrackState(cfg, 500, 500, 100, 640, 1080)
         near_wrong_size = box(540, 500, 400)   # ближе, но вчетверо крупнее
         far_right_size = box(650, 500, 100)
         r = ts.step(0.33, [near_wrong_size, far_right_size])
@@ -56,7 +56,7 @@ class TestMechanismA_Size:
         отношением 4.0, который отсекался вето, и снятие слагаемого из
         счёта тест не ловил вовсе."""
         cfg = make_cfg(ENABLE_SIZE_SCORING=True, SIZE_LAMBDA=0.5, SIZE_VETO_RATIO=1.8)
-        ts = TrackState(cfg, 500, 500, 100, 1920, 1080)
+        ts = TrackState(cfg, 500, 500, 100, 640, 1080)
         near_wrong_size = box(540, 500, 150)   # 40px, но в 1.5 раза крупнее
         far_right_size = box(650, 500, 100)    # 150px, размер точный
         r = ts.step(0.33, [near_wrong_size, far_right_size])
@@ -65,14 +65,14 @@ class TestMechanismA_Size:
 
     def test_veto_rejects_candidate_outside_ratio_band(self):
         cfg = make_cfg(ENABLE_SIZE_SCORING=True, SIZE_VETO_RATIO=1.8)
-        ts = TrackState(cfg, 500, 500, 100, 1920, 1080)
+        ts = TrackState(cfg, 500, 500, 100, 640, 1080)
         r = ts.step(0.33, [box(505, 500, 400)])  # отношение 4.0 > 1.8
         assert r.chosen is None
         assert r.n_vetoed == 1
 
     def test_veto_keeps_candidate_inside_band(self):
         cfg = make_cfg(ENABLE_SIZE_SCORING=True, SIZE_VETO_RATIO=1.8)
-        ts = TrackState(cfg, 500, 500, 100, 1920, 1080)
+        ts = TrackState(cfg, 500, 500, 100, 640, 1080)
         r = ts.step(0.33, [box(505, 500, 150)])  # отношение 1.5 < 1.8
         assert r.chosen is not None
 
@@ -101,14 +101,14 @@ class TestMechanismB_Occlusion:
 
     def test_disabled_picks_one_of_the_two(self):
         cfg = make_cfg(ENABLE_OCCLUSION_HOLD=False)
-        ts = TrackState(cfg, 500, 500, 100, 1920, 1080)
+        ts = TrackState(cfg, 500, 500, 100, 640, 1080)
         r = ts.step(0.33, [box(505, 500, 100), box(525, 500, 100)])
         assert r.chosen is not None
         assert r.occluded is False
 
     def test_enabled_holds_and_picks_nobody(self):
         cfg = make_cfg(ENABLE_OCCLUSION_HOLD=True)
-        ts = TrackState(cfg, 500, 500, 100, 1920, 1080)
+        ts = TrackState(cfg, 500, 500, 100, 640, 1080)
         r = ts.step(0.33, [box(505, 500, 100), box(525, 500, 100)])
         assert r.occluded is True
         assert r.chosen is None
@@ -117,7 +117,7 @@ class TestMechanismB_Occlusion:
         """Пауза — не пропуск: иначе M тактов окклюзии уводят в потерю и
         раздувают окно ровно там, где нужно сидеть тихо."""
         cfg = make_cfg(ENABLE_OCCLUSION_HOLD=True, MISS_TO_LOST_N=3)
-        ts = TrackState(cfg, 500, 500, 100, 1920, 1080)
+        ts = TrackState(cfg, 500, 500, 100, 640, 1080)
         side0 = ts.current_window_side()
         pair = [box(505, 500, 100), box(525, 500, 100)]
         for _ in range(4):
@@ -128,7 +128,7 @@ class TestMechanismB_Occlusion:
 
     def test_hold_expires_after_m_ticks(self):
         cfg = make_cfg(ENABLE_OCCLUSION_HOLD=True, OCCLUSION_HOLD_TICKS=2)
-        ts = TrackState(cfg, 500, 500, 100, 1920, 1080)
+        ts = TrackState(cfg, 500, 500, 100, 640, 1080)
         pair = [box(505, 500, 100), box(525, 500, 100)]
         assert ts.step(0.33, pair).occluded is True
         assert ts.step(0.33, pair).occluded is True
@@ -138,7 +138,7 @@ class TestMechanismB_Occlusion:
 
     def test_hold_exits_early_when_candidates_diverge(self):
         cfg = make_cfg(ENABLE_OCCLUSION_HOLD=True, OCCLUSION_HOLD_TICKS=4)
-        ts = TrackState(cfg, 500, 500, 100, 1920, 1080)
+        ts = TrackState(cfg, 500, 500, 100, 640, 1080)
         assert ts.step(0.33, [box(505, 500, 100), box(525, 500, 100)]).occluded is True
         r = ts.step(0.33, [box(505, 500, 100)])  # сосед ушёл
         assert r.occluded is False
@@ -149,7 +149,7 @@ class TestMechanismB_Occlusion:
         съедает второго кандидата и пересечение становится невидимым."""
         cfg = make_cfg(ENABLE_OCCLUSION_HOLD=True, ENABLE_SIZE_SCORING=True,
                         SIZE_VETO_RATIO=1.8)
-        ts = TrackState(cfg, 500, 500, 100, 1920, 1080)
+        ts = TrackState(cfg, 500, 500, 100, 640, 1080)
         # сосед вчетверо крупнее — вето А его бы отбросило
         r = ts.step(0.33, [box(505, 500, 100), box(525, 500, 400)])
         assert r.occluded is True
@@ -159,7 +159,7 @@ class TestMechanismC_Velocity:
     """В: кандидат, требующий скачка скорости, штрафуется и вето."""
 
     def _moving(self, cfg):
-        ts = TrackState(cfg, 100, 500, 100, 1920, 1080)
+        ts = TrackState(cfg, 100, 500, 100, 640, 1080)
         ts.step(1.0, [box(200, 500, 100)])   # vx = +100 px/сек
         return ts
 
@@ -175,7 +175,7 @@ class TestMechanismC_Velocity:
         подмены: отстающий сосед рядом с предсказанием, но движется не так."""
         cfg = make_cfg(ENABLE_VELOCITY_GATE=True, ENABLE_SIZE_SCORING=True,
                         VELOCITY_VETO_MULT=1.0, VELOCITY_GATE_FACTOR=0.5,
-                        VELOCITY_GATE_NOISE_PX_PER_SEC=10.0)
+                        VELOCITY_GATE_NOISE_ANG_PER_SEC=10.0)
         ts = self._moving(cfg)          # позиция 200, скорость +100 px/сек
         # предсказание 300; кандидат на 150 — в 150px от него (гейт 0.3*640=192
         # пропускает), но требует -50 px/сек вместо +100, скачок 150 при
@@ -212,7 +212,7 @@ class TestMechanismC_Velocity:
         штрафуются одинаково, хотя подмену отстающим соседом выдаёт именно
         разворот. Настоящий механизм В должен быть направленным."""
         cfg = make_cfg(ENABLE_VELOCITY_GATE=True, VELOCITY_GATE_FACTOR=0.5,
-                        VELOCITY_GATE_NOISE_PX_PER_SEC=10.0)
+                        VELOCITY_GATE_NOISE_ANG_PER_SEC=10.0)
         prev, v, dt = 200.0, 100.0, 1.0
         pred = prev + v * dt
         ahead, _ = score_candidate(box(pred + 80, 500, 100), pred, 500, 100,
