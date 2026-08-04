@@ -120,11 +120,22 @@ class TestAlphaBetaFilter:
         assert f.vx == v_before
 
 
+def _cfg(level):
+    import types
+
+    import tracking_config as tcfg
+    d = {k: getattr(tcfg, k) for k in dir(tcfg) if k.isupper()}
+    d["FILTER_LEVEL"] = level
+    return types.SimpleNamespace(**d)
+
+
 def test_make_filter_dispatch():
-    assert isinstance(make_filter(0, 0.5, 0.5), Level0Filter)
-    assert isinstance(make_filter(1, 0.5, 0.5), AlphaBetaFilter)
+    from track_kalman import KalmanAngularFilter
+    assert isinstance(make_filter(_cfg(0)), Level0Filter)
+    assert isinstance(make_filter(_cfg(1)), AlphaBetaFilter)
+    assert isinstance(make_filter(_cfg(2)), KalmanAngularFilter)
     with pytest.raises(ValueError):
-        make_filter(2, 0.5, 0.5)
+        make_filter(_cfg(3))
 
 
 def test_dist():

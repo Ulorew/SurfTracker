@@ -1,9 +1,14 @@
 """Фильтры положения/скорости (тикет "трекинг", п.3).
 
-Оба уровня используют один и тот же шаг экстраполяции на пропуск
+Уровни 0 и 1 используют один и тот же шаг экстраполяции на пропуск
 (predict(dt) = позиция + скорость*dt) — разница только в том, КАК
-обновляется состояние при получении измерения (update). Уровень выше
-(Калман) сюда сознательно не добавлен: "отдельное решение, не по умолчанию".
+обновляется состояние при получении измерения (update). Уровень 2 — Калман
+(track_kalman.py, тикет "ночь", п.2.2), у него та же четвёрка методов, но
+он дополнительно ведёт размер цели (log h) и умеет считать махаланобисов
+гейт; здесь эти два метода — заглушки, чтобы петля не разбиралась, какой
+фильтр ей достался.
+
+Все величины — УГЛОВЫЕ (радианы): петля переведена в углы, см. angles.py.
 """
 
 import math
@@ -19,9 +24,16 @@ class PositionFilter:
         self.vy = 0.0
         self.initialized = False
 
-    def seed(self, mx: float, my: float) -> None:
+    # размер цели этот фильтр не ведёт — им занимается медленная EMA в
+    # TrackState (тикет: log h только в Калман-ветке)
+    size = None
+    # ковариации нет — значит нет и махаланобисова гейта
+    HAS_GATE = False
+
+    def seed(self, mx: float, my: float, m_size: float = None) -> None:
         """Первое измерение — нет ни предыдущей позиции, ни скорости, чтобы
-        строить невязку. Просто якоримся, скорость 0."""
+        строить невязку. Просто якоримся, скорость 0. m_size принимается для
+        единого интерфейса с Калманом и не используется."""
         self.cx, self.cy = mx, my
         self.vx, self.vy = 0.0, 0.0
         self.initialized = True
@@ -31,7 +43,18 @@ class PositionFilter:
         assert self.initialized, "predict() до первого seed()/update()"
         return (self.cx + self.vx * dt, self.cy + self.vy * dt)
 
-    def update(self, mx: float, my: float, dt: float) -> "tuple[float, float]":
+    def advance(self, dt: float) -> None:
+        """Такт без измерения: предсказание становится состоянием. Скорость
+        не трогаем — она и есть то, чем экстраполируем."""
+        self.cx, self.cy = self.predict(dt)
+
+    def gate_distance2(self, mx, my, m_size, dt):
+        """У безковариационных фильтров махаланобисова гейта нет — петля
+        падает обратно на фиксированный радиус."""
+        return None
+
+    def update(self, mx: float, my: float, dt: float,
+                m_size: float = None) -> "tuple[float, float]":
         raise NotImplementedError
 
 
@@ -39,7 +62,8 @@ class Level0Filter(PositionFilter):
     """Тикет, уровень 0: позиция = последняя детекция как есть, скорость =
     разность двух последних детекций / dt. Никакого сглаживания."""
 
-    def update(self, mx: float, my: float, dt: float) -> "tuple[float, float]":
+    def update(self, mx: float, my: float, dt: float,
+                m_size: float = None) -> "tuple[float, float]":
         if not self.initialized:
             self.seed(mx, my)
             return (self.cx, self.cy)
@@ -59,7 +83,8 @@ class AlphaBetaFilter(PositionFilter):
         self.alpha = alpha
         self.beta = beta
 
-    def update(self, mx: float, my: float, dt: float) -> "tuple[float, float]":
+    def update(self, mx: float, my: float, dt: float,
+                m_size: float = None) -> "tuple[float, float]":
         if not self.initialized:
             self.seed(mx, my)
             return (self.cx, self.cy)
@@ -75,12 +100,21 @@ class AlphaBetaFilter(PositionFilter):
         return (self.cx, self.cy)
 
 
-def make_filter(level: int, alpha: float, beta: float) -> PositionFilter:
+def make_filter(cfg):
+    """cfg — модуль/объект с FILTER_LEVEL и параметрами выбранного уровня.
+
+    Принимаем cfg целиком, а не тройку чисел: у Калмана параметров десяток,
+    и перечислять их в сигнатуре значит менять её при каждой правке модели.
+    """
+    level = cfg.FILTER_LEVEL
     if level == 0:
         return Level0Filter()
     if level == 1:
-        return AlphaBetaFilter(alpha, beta)
-    raise ValueError(f"неизвестный уровень фильтра: {level} (0 или 1; Kalman — отдельное решение)")
+        return AlphaBetaFilter(cfg.ALPHA_BETA_ALPHA, cfg.ALPHA_BETA_BETA)
+    if level == 2:
+        from track_kalman import KalmanAngularFilter
+        return KalmanAngularFilter(cfg)
+    raise ValueError(f"неизвестный уровень фильтра: {level} (0, 1 или 2)")
 
 
 def dist(ax: float, ay: float, bx: float, by: float) -> float:

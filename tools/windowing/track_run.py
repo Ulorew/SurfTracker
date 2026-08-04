@@ -200,6 +200,12 @@ def main():
                      help="механизм В: гейт по скорости. ВНИМАНИЕ: в текущей формулировке "
                           "алгебраически тождествен дистанционному слагаемому (см. коммент "
                           "в track_logic.score_candidate) — включать смысла нет")
+    ap.add_argument("--filter-level", type=int, default=None, choices=[0, 1, 2],
+                     help="0 = последняя детекция, 1 = alpha-beta (по умолчанию из конфига), "
+                          "2 = Калман в углах (theta, theta', phi, phi', log h)")
+    ap.add_argument("--enable-gate", action="store_true",
+                     help="махаланобисов гейт вместо фиксированного радиуса отбора "
+                          "(требует --filter-level 2: у alpha-beta нет ковариации)")
     ap.add_argument("--gt-first-pick", type=int, default=None,
                      help="индекс бокса трекуемой цели на ПЕРВОМ размеченном кадре — если цель "
                           "не помечена group_id (или помечена не та). Дальше цель тянется "
@@ -213,6 +219,14 @@ def main():
     tcfg.ENABLE_SIZE_SCORING = args.enable_a
     tcfg.ENABLE_OCCLUSION_HOLD = args.enable_b
     tcfg.ENABLE_VELOCITY_GATE = args.enable_v
+    if args.filter_level is not None:
+        tcfg.FILTER_LEVEL = args.filter_level
+    if args.enable_gate and tcfg.FILTER_LEVEL != 2:
+        raise SystemExit("--enable-gate без --filter-level 2: гейту нужна ковариация Калмана")
+    tcfg.ENABLE_MAHALANOBIS_GATE = args.enable_gate
+    if args.enable_b and tcfg.FILTER_LEVEL == 2:
+        # в Калман-ветке пауза короче: неопределённость и так растёт по Q
+        tcfg.OCCLUSION_HOLD_TICKS = tcfg.KALMAN_OCCLUSION_HOLD_TICKS
     run_cfg = {
         # Провенанс: без весов и папки кадров лог не воспроизводим — по
         # прежним прогонам матрицы уже невозможно установить, какой моделью
@@ -231,6 +245,18 @@ def main():
         "occlusion_proximity_frac": tcfg.OCCLUSION_PROXIMITY_FRAC,
         "occlusion_hold_ticks": tcfg.OCCLUSION_HOLD_TICKS,
         "target_select_max_dist_frac": tcfg.TARGET_SELECT_MAX_DIST_FRAC,
+        "filter_level": tcfg.FILTER_LEVEL,
+        "mahalanobis_gate": tcfg.ENABLE_MAHALANOBIS_GATE,
+        "kalman": {
+            "sigma_accel_mps2": tcfg.KALMAN_SIGMA_ACCEL_MPS2,
+            "ref_distance_m": tcfg.KALMAN_REF_DISTANCE_M,
+            "max_speed_mps": tcfg.KALMAN_MAX_SPEED_MPS,
+            "min_distance_m": tcfg.KALMAN_MIN_DISTANCE_M,
+            "r_pos_size_frac": tcfg.KALMAN_R_POS_SIZE_FRAC,
+            "r_logh": tcfg.KALMAN_R_LOGH,
+            "logh_radial_frac": tcfg.KALMAN_LOGH_RADIAL_FRAC,
+            "gate_chi2": tcfg.KALMAN_GATE_CHI2,
+        } if tcfg.FILTER_LEVEL == 2 else None,
     }
     from ultralytics import YOLO
     model = YOLO(args.weights)
@@ -336,6 +362,12 @@ def main():
                 "lost_transition": r.lost_transition, "reacquired": r.reacquired,
                 "occluded": r.occluded, "n_candidates": r.n_candidates,
                 "n_vetoed": r.n_vetoed,
+                # сколько кандидатов оставил бы каждый способ отбора — тикет
+                # требует сравнить гейт с фиксированным радиусом, а задним
+                # числом по логу это не восстановить
+                "n_candidates_radius": r.n_candidates_radius,
+                "n_candidates_gate": r.n_candidates_gate,
+                "target_size_ang": ts_state.filtered_size,
                 # ВСЕ кандидаты этого такта, а не только выбранный: без них по
                 # логу не видно, из чего трекер выбирал — а именно это
                 # объясняет подмены (сосед оказался ближе к предсказанию).
@@ -356,6 +388,12 @@ def main():
     n_miss_ticks = sum(1 for r in log_rows if r["chosen"] is None)
     print(f"готово: {args.out}  тактов={len(ticks)}  промахов={n_miss_ticks}  "
           f"потерь={n_lost}  повторных_захватов={n_reacq}")
+    gate_rows = [r for r in log_rows if r["n_candidates_gate"] is not None]
+    if gate_rows:
+        by_rad = sum(r["n_candidates_radius"] for r in gate_rows)
+        by_gate = sum(r["n_candidates_gate"] for r in gate_rows)
+        print(f"отбор кандидатов: радиусом {by_rad}, гейтом {by_gate} "
+              f"(за {len(gate_rows)} тактов)")
     print(f"лог: {args.log_out}")
 
 

@@ -150,8 +150,10 @@ class TickResult(NamedTuple):
     lost_transition: bool   # True на такте, где произошёл переход tracking->lost
     reacquired: bool        # True на такте повторного захвата (lost->tracking)
     occluded: bool = False  # такт прошёл в режиме окклюзии (механизм Б)
-    n_candidates: int = 0   # кандидатов, прошедших дистанционный отбор
+    n_candidates: int = 0   # кандидатов, прошедших отбор (радиус ИЛИ гейт)
     n_vetoed: int = 0       # из них отвергнуто вето механизмов А/В
+    n_candidates_radius: int = 0        # сколько прошло бы фиксированный радиус
+    n_candidates_gate: "Optional[int]" = None  # сколько прошло гейт (None = гейт не работал)
 
 
 class TrackState:
@@ -169,9 +171,13 @@ class TrackState:
     def __init__(self, cfg, init_cx: float, init_cy: float, init_size: float,
                  min_window: float, max_window: float):
         self.cfg = cfg
-        self.filter = make_filter(cfg.FILTER_LEVEL, cfg.ALPHA_BETA_ALPHA, cfg.ALPHA_BETA_BETA)
-        self.filter.seed(init_cx, init_cy)
-        self.filtered_size = init_size
+        self.filter = make_filter(cfg)
+        self.filter.seed(init_cx, init_cy, init_size)
+        # Медленная EMA размера — только для фильтров, которые сами размер не
+        # ведут (уровни 0/1). У Калмана размер живёт в состоянии (log h), и
+        # дублирующая EMA поверх него была бы вторым, несогласованным
+        # источником той же величины.
+        self._ema_size = init_size
         self.miss_count = 0
         self.status = STATUS_TRACKING
         self.min_window = min_window
@@ -194,6 +200,21 @@ class TrackState:
         # оценка скорости появляется только после ПРИНЯТОГО измерения; до
         # этого механизм В обязан молчать (см. score_candidate)
         self.velocity_ready = False
+
+    @property
+    def filtered_size(self) -> float:
+        """Угловой размер цели: из состояния фильтра, если он его ведёт
+        (Калман, log h), иначе из медленной EMA."""
+        own = self.filter.size
+        return self._ema_size if own is None else own
+
+    def uses_mahalanobis_gate(self) -> bool:
+        """Гейт — инструмент режима ВЕДЕНИЯ. В потере (п.4 тикета) окно
+        заморожено и растёт по явному правилу, а ковариация фильтра не
+        обновляется; отбор там идёт по радиусу окна, как и раньше."""
+        return (self.status == STATUS_TRACKING
+                and getattr(self.cfg, "ENABLE_MAHALANOBIS_GATE", False)
+                and getattr(self.filter, "HAS_GATE", False))
 
     def current_window_side(self) -> float:
         """Угловая сторона окна, которую РЕАЛЬНО увидит модель.
@@ -245,10 +266,22 @@ class TrackState:
         # LOST не может принять ничего нового — весь механизм п.4 мёртв.
         ref_side = side
 
-        # --- отбор кандидатов: дистанция -> окклюзия -> счёт с вето ---------
+        # --- отбор кандидатов: дистанция/гейт -> окклюзия -> счёт с вето ----
         max_dist = max_frac * ref_side
-        candidates = [d for d in detections
-                      if dist(pred_cx, pred_cy, *_det_center(d)) <= max_dist]
+        by_radius = [d for d in detections
+                     if dist(pred_cx, pred_cy, *_det_center(d)) <= max_dist]
+        gated = None
+        if self.uses_mahalanobis_gate():
+            gated = []
+            for d in detections:
+                dcx, dcy = _det_center(d)
+                d2 = self.filter.gate_distance2(dcx, dcy, _det_size(d), dt)
+                if d2 <= self.cfg.KALMAN_GATE_CHI2:
+                    gated.append(d)
+        # Оба списка считаются ВСЕГДА, когда гейт включён: тикет требует
+        # показать, сколько кандидатов режет гейт против фиксированного
+        # радиуса, а задним числом по логу это не восстановить.
+        candidates = by_radius if gated is None else gated
 
         occluded = False
         n_vetoed = 0
@@ -296,7 +329,14 @@ class TrackState:
             else:
                 chosen, chosen_d = None, None
         else:
-            chosen, chosen_d = select_target(pred_cx, pred_cy, detections, ref_side, max_frac)
+            # Ближайший к предсказанию из УЖЕ отобранных (радиусом или
+            # гейтом). Для радиуса это ровно select_target; отдельным вызовом
+            # по всем детекциям он был бы обходом гейта.
+            chosen, chosen_d = None, None
+            for d in candidates:
+                dd = dist(pred_cx, pred_cy, *_det_center(d))
+                if chosen_d is None or dd < chosen_d:
+                    chosen, chosen_d = d, dd
 
         lost_transition = False
         reacquired = False
@@ -309,15 +349,16 @@ class TrackState:
             if self.status == STATUS_LOST:
                 # повторный захват — скорость/размер с нуля, старые не
                 # отражают то, что было ВНЕ окна наблюдения всё это время.
-                self.filter.seed(mx, my)
-                self.filtered_size = m_size
+                self.filter.seed(mx, my, m_size)
+                self._ema_size = m_size
                 self.status = STATUS_TRACKING
                 reacquired = True
             else:
-                self.filter.update(mx, my, dt)
-                self.filtered_size = update_size_filter(
-                    self.filtered_size, m_size,
-                    self.cfg.SIZE_FILTER_GROW_RATE, self.cfg.SIZE_FILTER_SHRINK_RATE)
+                self.filter.update(mx, my, dt, m_size)
+                if self.filter.size is None:
+                    self._ema_size = update_size_filter(
+                        self._ema_size, m_size,
+                        self.cfg.SIZE_FILTER_GROW_RATE, self.cfg.SIZE_FILTER_SHRINK_RATE)
 
             self.miss_count = 0
             self.velocity_ready = self.status == STATUS_TRACKING and not reacquired
@@ -329,14 +370,17 @@ class TrackState:
             # от соседа. Счётчик промахов не трогаем (иначе пауза уводит в
             # потерю), окно не расширяем (тикет п.3) — только экстраполируем.
             if self.status == STATUS_TRACKING:
-                self.filter.cx, self.filter.cy = pred_cx, pred_cy
+                self.filter.advance(dt)
                 self.last_pred_cx, self.last_pred_cy = pred_cx, pred_cy
         else:
             self.miss_count += 1
             if self.status == STATUS_TRACKING:
                 # экстраполяция по скорости (тикет п.3); в LOST — НЕ двигаем
                 # (окно заморожено, п.4), только считаем пропуски дальше.
-                self.filter.cx, self.filter.cy = pred_cx, pred_cy
+                # advance, а не присваивание координат: у Калмана такт без
+                # измерения обязан ещё и нарастить ковариацию на Q, иначе
+                # гейт остаётся узким там, где фильтр уже ничего не знает.
+                self.filter.advance(dt)
                 self.last_pred_cx, self.last_pred_cy = pred_cx, pred_cy
                 if self.miss_count >= self.cfg.MISS_TO_LOST_N:
                     self.status = STATUS_LOST
@@ -348,4 +392,6 @@ class TrackState:
             chosen=chosen, chosen_dist=chosen_d, miss_count=self.miss_count,
             lost_transition=lost_transition, reacquired=reacquired,
             occluded=occluded, n_candidates=len(candidates), n_vetoed=n_vetoed,
+            n_candidates_radius=len(by_radius),
+            n_candidates_gate=None if gated is None else len(gated),
         )
