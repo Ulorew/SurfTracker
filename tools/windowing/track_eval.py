@@ -177,6 +177,8 @@ def gt_box_at(gt_track, t):
         t2, *p2 = gt_track[i + 1]
         if not (t1 <= t <= t2):
             continue
+        if t2 - t1 > tcfg.GT_MAX_GAP_SEC:
+            return None  # дыра в разметке: истины здесь нет, а не «плавно между»
         t0, p0 = (gt_track[i - 1][0], gt_track[i - 1][1:]) if i - 1 >= 0 else (None, None)
         t3, p3 = (gt_track[i + 2][0], gt_track[i + 2][1:]) if i + 2 < n else (None, None)
         out = []
