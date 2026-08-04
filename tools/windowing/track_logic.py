@@ -6,12 +6,96 @@ track_run.py; здесь только геометрия/состояние, б�
 легко тестировать и потенциально переносить.
 """
 
+import math
 from typing import NamedTuple, Optional
 
 from track_filters import dist, make_filter
 
 STATUS_TRACKING = "tracking"
 STATUS_LOST = "lost"
+
+
+def _det_center(det):
+    return ((det[0] + det[2]) / 2.0, (det[1] + det[3]) / 2.0)
+
+
+def _det_size(det):
+    return max(det[2] - det[0], det[3] - det[1])
+
+
+def occlusion_triggered(candidates: list, window_side: float, proximity_frac: float) -> bool:
+    """Механизм Б (тикет "подмены v2", п.3): два и более кандидата сошлись
+    ближе proximity_frac стороны окна друг к другу.
+
+    Проверяется по кандидатам, прошедшим ТОЛЬКО дистанционный отбор, ДО вето
+    механизма А — иначе вето по размеру съедает второго кандидата, и само
+    пересечение, ради обнаружения которого правило и заведено, становится
+    невидимым (явное требование тикета).
+    """
+    if len(candidates) < 2:
+        return False
+    thr = proximity_frac * window_side
+    for i in range(len(candidates)):
+        cxi, cyi = _det_center(candidates[i])
+        for j in range(i + 1, len(candidates)):
+            cxj, cyj = _det_center(candidates[j])
+            if dist(cxi, cyi, cxj, cyj) <= thr:
+                return True
+    return False
+
+
+def score_candidate(det, pred_cx, pred_cy, pred_size, prev_cx, prev_cy,
+                     vel, dt, window_side, cfg):
+    """-> (счёт в пикселях, вето: bool). Меньший счёт лучше.
+
+    Базовый счёт — расстояние до предсказания (правило тикета п.2: НЕ по
+    уверенности). Механизмы А и В добавляют слагаемые, приведённые к тем же
+    пикселям, иначе складывать их с расстоянием нельзя.
+    """
+    dcx, dcy = _det_center(det)
+    score = dist(pred_cx, pred_cy, dcx, dcy)
+    vetoed = False
+
+    if getattr(cfg, "ENABLE_SIZE_SCORING", False) and pred_size > 0:
+        ratio = _det_size(det) / pred_size
+        if ratio > 0:
+            r_veto = cfg.SIZE_VETO_RATIO
+            if ratio > r_veto or ratio < 1.0 / r_veto:
+                vetoed = True
+            # безразмерный |log(отношение)| домножается на сторону окна,
+            # чтобы слагаемое было в пикселях, как и расстояние
+            score += cfg.SIZE_LAMBDA * abs(math.log(ratio)) * window_side
+
+    # ВНИМАНИЕ: механизм В в формулировке тикета ИЗБЫТОЧЕН. Предсказание
+    # строится как pred = prev + v*dt, поэтому
+    #   |implied_v - v| = |cand - prev - v*dt| / dt = |cand - pred| / dt,
+    # то есть "отклонение подразумеваемой скорости" тождественно равно
+    # расстоянию до предсказания с точностью до множителя 1/dt (проверено
+    # численно, расхождение ~1e-12). Слагаемое и вето механизма В повторяют
+    # базовое слагаемое счёта и дистанционный гейт, новой информации не
+    # добавляя — поэтому по умолчанию он выключен, а решение о его настоящей
+    # форме (например, штраф именно за РАЗВОРОТ движения, а не за модуль
+    # отклонения) оставлено человеку.
+    #
+    # vel=None означает "оценки скорости ещё нет" (первый такт после захвата
+    # или реакквизиции). Гейт в этот момент СЛЕП: допуск вырождается в один
+    # шум, и первая же честно сдвинувшаяся детекция получает вето — цель
+    # теряется на ровном месте. Поэтому механизм включается только с такта,
+    # когда скорость уже оценена по принятому измерению.
+    if getattr(cfg, "ENABLE_VELOCITY_GATE", False) and dt > 0 and vel is not None:
+        # какая мгновенная скорость потребовалась бы, прими мы этого кандидата
+        implied_vx = (dcx - prev_cx) / dt
+        implied_vy = (dcy - prev_cy) / dt
+        delta = dist(implied_vx, implied_vy, vel[0], vel[1])
+        allowed = (cfg.VELOCITY_GATE_FACTOR * math.hypot(vel[0], vel[1])
+                   + cfg.VELOCITY_GATE_NOISE_PX_PER_SEC)
+        if delta > cfg.VELOCITY_VETO_MULT * allowed:
+            vetoed = True
+        excess = max(0.0, delta - allowed)
+        # скорость * dt = пиксели, снова приводим к единицам расстояния
+        score += cfg.VELOCITY_LAMBDA * excess * dt
+
+    return score, vetoed
 
 
 def select_target(pred_cx: float, pred_cy: float, detections: list, window_side: float,
@@ -65,6 +149,9 @@ class TickResult(NamedTuple):
     miss_count: int
     lost_transition: bool   # True на такте, где произошёл переход tracking->lost
     reacquired: bool        # True на такте повторного захвата (lost->tracking)
+    occluded: bool = False  # такт прошёл в режиме окклюзии (механизм Б)
+    n_candidates: int = 0   # кандидатов, прошедших дистанционный отбор
+    n_vetoed: int = 0       # из них отвергнуто вето механизмов А/В
 
 
 class TrackState:
@@ -87,6 +174,15 @@ class TrackState:
         # там, где цель заведомо уже не находится.
         self.last_pred_cx = init_cx
         self.last_pred_cy = init_cy
+        # сколько тактов ещё держать окклюзионную паузу (механизм Б)
+        self.occlusion_hold = 0
+        # пауза истекла, а кандидаты всё ещё вместе: не даём ей перезапуститься
+        # немедленно, иначе трекер зависает в паузе навсегда, пока сёрферы
+        # идут рядом. Снимается, как только кандидаты разошлись хоть раз.
+        self.occlusion_latched = False
+        # оценка скорости появляется только после ПРИНЯТОГО измерения; до
+        # этого механизм В обязан молчать (см. score_candidate)
+        self.velocity_ready = False
 
     def current_window_side(self) -> float:
         """Сторона окна, которую РЕАЛЬНО увидит модель.
@@ -140,7 +236,59 @@ class TrackState:
         # LOST не может принять ничего нового — весь механизм п.4 мёртв.
         ref_side = side
 
-        chosen, chosen_d = select_target(pred_cx, pred_cy, detections, ref_side, max_frac)
+        # --- отбор кандидатов: дистанция -> окклюзия -> счёт с вето ---------
+        max_dist = max_frac * ref_side
+        candidates = [d for d in detections
+                      if dist(pred_cx, pred_cy, *_det_center(d)) <= max_dist]
+
+        occluded = False
+        n_vetoed = 0
+        if getattr(self.cfg, "ENABLE_OCCLUSION_HOLD", False):
+            triggered = occlusion_triggered(candidates, ref_side,
+                                             self.cfg.OCCLUSION_PROXIMITY_FRAC)
+            if not triggered:
+                # кандидаты разошлись — и пауза, и запрет на неё сняты
+                self.occlusion_hold = 0
+                self.occlusion_latched = False
+            elif self.occlusion_hold > 0:
+                occluded = True
+                self.occlusion_hold -= 1
+                if self.occlusion_hold == 0:
+                    # пауза истекла, а они всё ещё вместе: дальше выбираем,
+                    # иначе зависнем в паузе на весь совместный проход
+                    self.occlusion_latched = True
+            elif not self.occlusion_latched:
+                # вход в паузу: на пересечении любой выбор — монетка, а
+                # ошибка необратима, поэтому M тактов идём экстраполяцией
+                occluded = True
+                self.occlusion_hold = self.cfg.OCCLUSION_HOLD_TICKS - 1
+                if self.occlusion_hold == 0:
+                    self.occlusion_latched = True
+
+        if occluded:
+            chosen, chosen_d = None, None
+        elif getattr(self.cfg, "ENABLE_SIZE_SCORING", False) or \
+                getattr(self.cfg, "ENABLE_VELOCITY_GATE", False):
+            pred_size = self.filtered_size
+            vel = (self.filter.vx, self.filter.vy) if self.velocity_ready else None
+            scored = []
+            for d in candidates:
+                sc, veto = score_candidate(d, pred_cx, pred_cy, pred_size,
+                                            self.filter.cx, self.filter.cy,
+                                            vel, dt, ref_side, self.cfg)
+                if veto:
+                    n_vetoed += 1
+                else:
+                    scored.append((sc, d))
+            if scored:
+                scored.sort(key=lambda x: x[0])
+                chosen = scored[0][1]
+                chosen_d = dist(pred_cx, pred_cy, *_det_center(chosen))
+            else:
+                chosen, chosen_d = None, None
+        else:
+            chosen, chosen_d = select_target(pred_cx, pred_cy, detections, ref_side, max_frac)
+
         lost_transition = False
         reacquired = False
 
@@ -163,9 +311,17 @@ class TrackState:
                     self.cfg.SIZE_FILTER_GROW_RATE, self.cfg.SIZE_FILTER_SHRINK_RATE)
 
             self.miss_count = 0
+            self.velocity_ready = self.status == STATUS_TRACKING and not reacquired
             self.last_known_cx, self.last_known_cy = self.filter.cx, self.filter.cy
             self.last_known_window_side = self.cfg.TRACK_WINDOW_K * self.filtered_size
             self.last_pred_cx, self.last_pred_cy = self.filter.cx, self.filter.cy
+        elif occluded:
+            # Пауза окклюзии — это НЕ пропуск: цель видна, просто неотличима
+            # от соседа. Счётчик промахов не трогаем (иначе пауза уводит в
+            # потерю), окно не расширяем (тикет п.3) — только экстраполируем.
+            if self.status == STATUS_TRACKING:
+                self.filter.cx, self.filter.cy = pred_cx, pred_cy
+                self.last_pred_cx, self.last_pred_cy = pred_cx, pred_cy
         else:
             self.miss_count += 1
             if self.status == STATUS_TRACKING:
@@ -182,4 +338,5 @@ class TrackState:
             predicted_cx=pred_cx, predicted_cy=pred_cy, window_side=side,
             chosen=chosen, chosen_dist=chosen_d, miss_count=self.miss_count,
             lost_transition=lost_transition, reacquired=reacquired,
+            occluded=occluded, n_candidates=len(candidates), n_vetoed=n_vetoed,
         )

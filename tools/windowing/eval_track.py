@@ -74,9 +74,17 @@ def split_target_ignore(boxes):
 
 
 def build_track_square(gt_box, k, jitter_frac, rng):
+    """Окно оценки вокруг известной цели.
+
+    Сторона берётся с полом config.EVAL_WINDOW_MIN_PX: crop() без паддинга
+    всё равно вырежет столько реальных пикселей, поэтому меньшая сторона —
+    фикция. Джиттер тоже считается от РЕАЛЬНОЙ стороны, иначе для мелких
+    целей смещение окна оказывается втрое-вчетверо меньше заявленных
+    jitter_frac и оценка выходит мягче задуманной.
+    """
     size = box_size(gt_box)
     cx, cy = box_center(gt_box)
-    side = k * size
+    side = max(k * size, config.EVAL_WINDOW_MIN_PX)
     jitter = jitter_frac * side
     jx = rng.uniform(-jitter, jitter)
     jy = rng.uniform(-jitter, jitter)

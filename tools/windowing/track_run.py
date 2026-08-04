@@ -134,11 +134,39 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--log-out", required=True)
     ap.add_argument("--bootstrap-conf", type=float, default=0.25)
+    ap.add_argument("--enable-a", action="store_true",
+                     help="механизм А: размер кандидата в счёте + вето по отношению размеров")
+    ap.add_argument("--enable-b", action="store_true",
+                     help="механизм Б: пауза на окклюзии (кандидаты сошлись — не выбирать)")
+    ap.add_argument("--enable-v", action="store_true",
+                     help="механизм В: гейт по скорости. ВНИМАНИЕ: в текущей формулировке "
+                          "алгебраически тождествен дистанционному слагаемому (см. коммент "
+                          "в track_logic.score_candidate) — включать смысла нет")
     ap.add_argument("--gt-first-pick", type=int, default=None,
                      help="индекс бокса трекуемой цели на ПЕРВОМ размеченном кадре — если цель "
                           "не помечена group_id (или помечена не та). Дальше цель тянется "
                           "цепочкой по ближайшему боксу с отсечкой по скачку размера")
     args = ap.parse_args()
+
+    # Механизмы включаются на модуле-конфиге до создания TrackState: сам
+    # TrackState читает cfg по ссылке, поэтому переключение обязано произойти
+    # раньше. Состав пишется рядом с логом — без этого по логу не восстановить,
+    # какая конфигурация его породила.
+    tcfg.ENABLE_SIZE_SCORING = args.enable_a
+    tcfg.ENABLE_OCCLUSION_HOLD = args.enable_b
+    tcfg.ENABLE_VELOCITY_GATE = args.enable_v
+    run_cfg = {
+        "mechanism_A_size": args.enable_a,
+        "mechanism_B_occlusion": args.enable_b,
+        "mechanism_V_velocity": args.enable_v,
+        "tick_hz": args.tick_hz,
+        "size_lambda": tcfg.SIZE_LAMBDA, "size_veto_ratio": tcfg.SIZE_VETO_RATIO,
+        "occlusion_proximity_frac": tcfg.OCCLUSION_PROXIMITY_FRAC,
+        "occlusion_hold_ticks": tcfg.OCCLUSION_HOLD_TICKS,
+        "target_select_max_dist_frac": tcfg.TARGET_SELECT_MAX_DIST_FRAC,
+    }
+    with open(os.path.splitext(args.log_out)[0] + ".runcfg.json", "w") as f:
+        json.dump(run_cfg, f, indent=2, ensure_ascii=False)
 
     from ultralytics import YOLO
     model = YOLO(args.weights)
@@ -205,6 +233,8 @@ def main():
                 "chosen": list(r.chosen) if r.chosen is not None else None,
                 "chosen_dist": r.chosen_dist, "miss_count": r.miss_count,
                 "lost_transition": r.lost_transition, "reacquired": r.reacquired,
+                "occluded": r.occluded, "n_candidates": r.n_candidates,
+                "n_vetoed": r.n_vetoed,
                 # ВСЕ кандидаты этого такта, а не только выбранный: без них по
                 # логу не видно, из чего трекер выбирал — а именно это
                 # объясняет подмены (сосед оказался ближе к предсказанию).

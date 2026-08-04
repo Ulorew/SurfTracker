@@ -247,6 +247,64 @@ def count_swap_runs(on_target_flags, min_run=2):
     return runs
 
 
+OUTCOME_CLEAN = "чисто"
+OUTCOME_SWAP = "подмена"
+OUTCOME_LOST = "потеря"
+
+# Допуск на выпадение из критерия с возвратом к ИСХОДНОЙ цели (тикет "подмены
+# v2", п.1). Одиночное-двойное выпадение — дрожание рамки, а не уехавший
+# захват.
+CLEAN_TOLERANCE_TICKS = 2
+# Сколько подряд тактов стабильного ВЕДЕНИЯ мимо цели считать подменой.
+SWAP_MIN_RUN = 3
+
+
+def classify_episode(rows, gt_track):
+    """Исход эпизода по клипу (тикет "подмены v2", п.1).
+
+    -> (исход, такт первого расхождения | None, флаги по тактам)
+
+    Такты без истины (дыра в разметке) в классификации не участвуют: по ним
+    нельзя сказать, ту цель ведём или нет.
+    """
+    flags = []          # (индекс такта, on_target|None) — None = промах
+    for i, r in enumerate(rows):
+        gt = gt_box_at(gt_track, r["timestamp_sec"]) if gt_track else None
+        if gt is None:
+            continue
+        if r["chosen"] is None:
+            flags.append((i, None))
+        else:
+            ccx, ccy = _chosen_center(r["chosen"])
+            flags.append((i, is_hit_radial(ccx, ccy, gt)))
+
+    first_div = next((i for i, ok in flags if ok is False), None)
+
+    # потеря: был переход в lost и после него ни разу не вернулись на цель
+    lost_idx = next((i for i, r in enumerate(rows) if r["lost_transition"]), None)
+    if lost_idx is not None:
+        recovered = any(ok for i, ok in flags if i > lost_idx and ok)
+        if not recovered:
+            return OUTCOME_LOST, first_div, flags
+
+    # подмена: SWAP_MIN_RUN подряд тактов ВЕДЕНИЯ (chosen != None) мимо цели.
+    # Обратный перескок исход не улучшает — поэтому просто ищем такой прогон
+    # где угодно по клипу.
+    run = 0
+    for _, ok in flags:
+        if ok is False:
+            run += 1
+            if run >= SWAP_MIN_RUN:
+                return OUTCOME_SWAP, first_div, flags
+        elif ok is True:
+            run = 0
+        # ok is None (промах) прогон не удлиняет, но и не сбрасывает: цель
+        # просто не видна, ведение чужой цели этим тактом не подтверждается
+
+    # чисто: выпадения не длиннее допуска и с возвратом на исходную цель
+    return OUTCOME_CLEAN, first_div, flags
+
+
 def miss_streaks(rows):
     """Длины серий подряд идущих тактов с chosen=None (промах, включая
     такты уже в lost, пока не случится повторный захват)."""
