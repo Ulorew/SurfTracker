@@ -205,6 +205,9 @@ def main():
                           "(см. track_score.py); махаланобисовы требуют --filter-level 2")
     ap.add_argument("--shadows", action="store_true",
                      help="теневые треки: чужие детекции заняты и не притягивают цель")
+    ap.add_argument("--size-lambda", type=float, default=None,
+                     help="вес размерного слагаемого механизма А; 0 оставляет только вето "
+                          "(на стенде вето несёт всю пользу, а слагаемое шумит)")
     ap.add_argument("--enable-vdir", action="store_true",
                      help="механизм В-направленный: штраф и вето за РАЗВОРОТ движения "
                           "(в отличие от --enable-v, не повторяет дистанционное слагаемое)")
@@ -228,6 +231,8 @@ def main():
     tcfg.ENABLE_OCCLUSION_HOLD = args.enable_b
     tcfg.ENABLE_VELOCITY_GATE = args.enable_v
     tcfg.ENABLE_VELOCITY_DIRECTION = args.enable_vdir
+    if args.size_lambda is not None:
+        tcfg.SIZE_LAMBDA = args.size_lambda
     tcfg.ENABLE_SHADOW_TRACKS = args.shadows
     if args.score_form:
         from track_score import ALL_FORMS, FORM_DISTANCE
