@@ -10,6 +10,8 @@ import math
 from typing import NamedTuple, Optional
 
 from track_filters import dist, make_filter
+from track_score import FORM_DISTANCE, candidate_score
+from track_shadows import ShadowSet
 
 STATUS_TRACKING = "tracking"
 STATUS_LOST = "lost"
@@ -172,6 +174,8 @@ class TickResult(NamedTuple):
     n_vetoed: int = 0       # из них отвергнуто вето механизмов А/В
     n_candidates_radius: int = 0        # сколько прошло бы фиксированный радиус
     n_candidates_gate: "Optional[int]" = None  # сколько прошло гейт (None = гейт не работал)
+    n_taken_by_shadows: int = 0         # кандидатов отброшено как занятые чужим треком
+    n_shadows: int = 0                  # теневых треков живо после такта
 
 
 class TrackState:
@@ -218,6 +222,8 @@ class TrackState:
         # оценка скорости появляется только после ПРИНЯТОГО измерения; до
         # этого механизм В обязан молчать (см. score_candidate)
         self.velocity_ready = False
+        # теневые треки: заняты соседями, чтобы те не притягивали цель
+        self.shadows = ShadowSet(cfg) if getattr(cfg, "ENABLE_SHADOW_TRACKS", False) else None
 
     @property
     def filtered_size(self) -> float:
@@ -301,6 +307,20 @@ class TrackState:
         # радиуса, а задним числом по логу это не восстановить.
         candidates = by_radius if gated is None else gated
 
+        # Теневые: кандидат, до которого чужому треку ближе, чем 0.7 от
+        # расстояния до цели, выбывает — он уже занят (тикет п.2). Считается
+        # ДО окклюзии и вето: занятый кандидат не должен ни выбираться, ни
+        # создавать видимость пересечения.
+        n_taken = 0
+        if self.shadows is not None and self.shadows.tracks:
+            kept = []
+            for d in candidates:
+                if self.shadows.is_taken(d, pred_cx, pred_cy, dt):
+                    n_taken += 1
+                else:
+                    kept.append(d)
+            candidates = kept
+
         occluded = False
         n_vetoed = 0
         if getattr(self.cfg, "ENABLE_OCCLUSION_HOLD", False):
@@ -327,6 +347,20 @@ class TrackState:
 
         if occluded:
             chosen, chosen_d = None, None
+        elif getattr(self.cfg, "SCORE_FORM", FORM_DISTANCE) != FORM_DISTANCE:
+            # Махаланобисовы формы (тикет "счёт кандидата", п.4): выбор по
+            # МИНИМУМУ счёта, а не по минимуму расстояния. Механизмы А/В сюда
+            # не подмешиваются — их роль в этих формах играют ковариация
+            # (размер как третья координата) и направленный член формы 3.
+            best, best_score = None, None
+            for d in candidates:
+                sc = candidate_score(d, self.filter, pred_cx, pred_cy,
+                                      self.filtered_size, dt, self.cfg,
+                                      velocity_ready=self.velocity_ready)
+                if best_score is None or sc < best_score:
+                    best, best_score = d, sc
+            chosen = best
+            chosen_d = None if best is None else dist(pred_cx, pred_cy, *_det_center(best))
         elif (getattr(self.cfg, "ENABLE_SIZE_SCORING", False)
                 or getattr(self.cfg, "ENABLE_VELOCITY_GATE", False)
                 or getattr(self.cfg, "ENABLE_VELOCITY_DIRECTION", False)):
@@ -405,6 +439,13 @@ class TrackState:
                     self.status = STATUS_LOST
                     lost_transition = True
 
+        if self.shadows is not None:
+            # Питание и рождение — ПОСЛЕ выбора цели: иначе теневой
+            # сопоставился бы с той самой детекцией, которую цель только
+            # собирается взять, и тут же её у себя занял.
+            vel = (self.filter.vx, self.filter.vy) if self.velocity_ready else None
+            self.shadows.step(dt, detections, chosen, target_vel=vel)
+
         return TickResult(
             status=self.status if not lost_transition else STATUS_LOST,
             predicted_cx=pred_cx, predicted_cy=pred_cy, window_side=side,
@@ -413,4 +454,6 @@ class TrackState:
             occluded=occluded, n_candidates=len(candidates), n_vetoed=n_vetoed,
             n_candidates_radius=len(by_radius),
             n_candidates_gate=None if gated is None else len(gated),
+            n_taken_by_shadows=n_taken,
+            n_shadows=0 if self.shadows is None else len(self.shadows),
         )

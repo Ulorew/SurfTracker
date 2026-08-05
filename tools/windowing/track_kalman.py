@@ -55,15 +55,54 @@ class KalmanAngularFilter:
         F[IDX_PH, IDX_DPH] = dt
         return F
 
+    def accel_covariance(self):
+        """2x2 ковариация углового УСКОРЕНИЯ в мировых осях.
+
+        Изотропная (форма 1) или вытянутая вдоль вектора скорости (форма 2,
+        тикет п.4: "дисперсия манёвра вдоль вектора скорости в K раз больше,
+        чем поперёк"). След сохраняется: иначе форма 2 отличалась бы от формы
+        1 не только анизотропией, но и общим уровнем шума, и сравнение
+        показывало бы неизвестно что.
+
+        ВАЖНОЕ ограничение модели: гауссова Q симметрична, поэтому "назад"
+        получает ту же увеличенную дисперсию, что и "вперёд". Отличить разворот
+        от ускорения анизотропией НЕЛЬЗЯ в принципе — это умеет только
+        направленный член (форма 3). Отсюда и содержательный смысл сравнения
+        форм 2 и 3.
+        """
+        s2 = self.sigma_alpha ** 2
+        if not getattr(self.cfg, "KALMAN_ANISOTROPIC_Q", False):
+            return np.eye(2) * s2
+        vx, vy = self.x[IDX_DTH], self.x[IDX_DPH]
+        n = math.hypot(vx, vy)
+        if n < 1e-12:
+            return np.eye(2) * s2   # направления нет — анизотропии тоже
+        K = float(self.cfg.KALMAN_ANISO_K)
+        along = 2.0 * K / (K + 1.0) * s2
+        across = 2.0 / (K + 1.0) * s2
+        u = np.array([vx / n, vy / n])
+        w = np.array([-u[1], u[0]])
+        return along * np.outer(u, u) + across * np.outer(w, w)
+
     def _Q(self, dt):
-        """Дискретный белый шум по ускорению (CWNA) на каждую ось + случайное
-        блуждание по log h."""
-        q = self.sigma_alpha ** 2
-        blk = np.array([[dt ** 4 / 4.0, dt ** 3 / 2.0],
-                        [dt ** 3 / 2.0, dt ** 2]]) * q
+        """Дискретный белый шум по ускорению (CWNA) по двум углам сразу +
+        случайное блуждание по log h.
+
+        Пишется через полную 2x2 ковариацию ускорения, а не двумя
+        независимыми блоками: при анизотропии оси theta и phi связаны, и
+        поблочная запись их связь потеряла бы. При изотропной Sigma формула
+        сводится ровно к прежней поблочной (закреплено тестом).
+        """
+        S = self.accel_covariance()
         Q = np.zeros((5, 5))
-        Q[0:2, 0:2] = blk
-        Q[2:4, 2:4] = blk
+        pos = (IDX_TH, IDX_PH)
+        vel = (IDX_DTH, IDX_DPH)
+        for i in range(2):
+            for j in range(2):
+                Q[pos[i], pos[j]] = dt ** 4 / 4.0 * S[i, j]
+                Q[pos[i], vel[j]] = dt ** 3 / 2.0 * S[i, j]
+                Q[vel[i], pos[j]] = dt ** 3 / 2.0 * S[i, j]
+                Q[vel[i], vel[j]] = dt ** 2 * S[i, j]
         Q[IDX_LOGH, IDX_LOGH] = (self.sigma_logh_rate ** 2) * dt
         return Q
 
@@ -100,9 +139,20 @@ class KalmanAngularFilter:
 
     def advance(self, dt):
         """Такт без измерения (пропуск/окклюзия): предсказание становится
-        состоянием, неопределённость растёт на Q."""
+        состоянием, неопределённость растёт на Q, модуль скорости затухает
+        (тикет "счёт кандидата", п.1).
+
+        Затухание — домножение состояния ПОСЛЕ predict, матрицу F не трогаем:
+        иначе оно попало бы и в ковариацию, а тикет требует обратного —
+        неопределённость должна расти, сжимается только скорость.
+        """
         assert self.initialized, "advance() до первого seed()"
         self.x, self.P = self._predict_moments(dt)
+        tau = getattr(self.cfg, "EXTRAPOLATION_TAU_SEC", None)
+        if tau and tau > 0 and dt > 0:
+            k = math.exp(-dt / tau)
+            self.x[IDX_DTH] *= k
+            self.x[IDX_DPH] *= k
 
     def gate_distance2(self, mx, my, m_size, dt):
         """Квадрат махаланобисова расстояния кандидата до предсказания, 2 dof.
@@ -115,6 +165,29 @@ class KalmanAngularFilter:
         xp, Pp = self._predict_moments(dt)
         y = np.array([mx - xp[IDX_TH], my - xp[IDX_PH]])
         S = Pp[np.ix_(POS_IDX, POS_IDX)] + self._R_pos(m_size)
+        return float(y @ np.linalg.solve(S, y))
+
+    def score_distance2(self, mx, my, m_size, dt):
+        """Махаланобис по ТРЁМ координатам (theta, phi, log h) — форма 1 счёта
+        кандидата (тикет п.4).
+
+        Отличие от gate_distance2 не только в размерности: там 2 степени
+        свободы и порог chi2, здесь величина используется для УПОРЯДОЧИВАНИЯ
+        кандидатов. Размер входит третьей координатой, а не отдельным
+        слагаемым с подобранным весом: вес ему даёт ковариация, то есть та же
+        физика, что и положению.
+        """
+        xp, Pp = self._predict_moments(dt)
+        H = np.zeros((3, 5))
+        H[0, IDX_TH] = 1.0
+        H[1, IDX_PH] = 1.0
+        H[2, IDX_LOGH] = 1.0
+        size = max(m_size, 1e-12)
+        z = np.array([mx, my, math.log(size)])
+        y = z - H @ xp
+        R = np.diag([self._R_pos(size)[0, 0], self._R_pos(size)[1, 1],
+                     self.cfg.KALMAN_R_LOGH ** 2])
+        S = H @ Pp @ H.T + R
         return float(y @ np.linalg.solve(S, y))
 
     def update(self, mx, my, dt, m_size=None):

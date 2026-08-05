@@ -17,7 +17,8 @@ import math
 class PositionFilter:
     """Общий интерфейс. Не инстанцировать напрямую — Level0Filter/AlphaBetaFilter."""
 
-    def __init__(self):
+    def __init__(self, cfg=None):
+        self.cfg = cfg
         self.cx = None
         self.cy = None
         self.vx = 0.0
@@ -44,9 +45,23 @@ class PositionFilter:
         return (self.cx + self.vx * dt, self.cy + self.vy * dt)
 
     def advance(self, dt: float) -> None:
-        """Такт без измерения: предсказание становится состоянием. Скорость
-        не трогаем — она и есть то, чем экстраполируем."""
+        """Такт без измерения: предсказание становится состоянием, после чего
+        модуль скорости затухает (тикет "счёт кандидата", п.1).
+
+        Порядок именно такой — сначала шаг полной скоростью, потом затухание:
+        так предписано тикетом ("домножение после predict"). Направление
+        скорости не меняется, меняется только модуль.
+        """
         self.cx, self.cy = self.predict(dt)
+        self.decay_velocity(dt)
+
+    def decay_velocity(self, dt: float) -> None:
+        tau = getattr(self.cfg, "EXTRAPOLATION_TAU_SEC", None) if self.cfg else None
+        if not tau or tau <= 0 or dt <= 0:
+            return
+        k = math.exp(-dt / tau)
+        self.vx *= k
+        self.vy *= k
 
     def gate_distance2(self, mx, my, m_size, dt):
         """У безковариационных фильтров махаланобисова гейта нет — петля
@@ -78,8 +93,8 @@ class AlphaBetaFilter(PositionFilter):
     """Тикет, уровень 1: alpha по позиции, beta по скорости, поверх
     предсказанной (не последней) позиции — классический alpha-beta."""
 
-    def __init__(self, alpha: float, beta: float):
-        super().__init__()
+    def __init__(self, alpha: float, beta: float, cfg=None):
+        super().__init__(cfg)
         self.alpha = alpha
         self.beta = beta
 
@@ -108,9 +123,9 @@ def make_filter(cfg):
     """
     level = cfg.FILTER_LEVEL
     if level == 0:
-        return Level0Filter()
+        return Level0Filter(cfg)
     if level == 1:
-        return AlphaBetaFilter(cfg.ALPHA_BETA_ALPHA, cfg.ALPHA_BETA_BETA)
+        return AlphaBetaFilter(cfg.ALPHA_BETA_ALPHA, cfg.ALPHA_BETA_BETA, cfg)
     if level == 2:
         from track_kalman import KalmanAngularFilter
         return KalmanAngularFilter(cfg)
