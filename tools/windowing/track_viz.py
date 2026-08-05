@@ -28,7 +28,34 @@ C_LOST = (0, 0, 220)        # потеря — красный
 C_SWAP = (255, 0, 255)      # взяли ЧУЖУЮ цель — пурпурный
 C_CHOSEN = (255, 255, 0)    # взятая детекция, она же цель — голубой
 C_CAND = (150, 150, 150)    # прочие найденные паруса — серый
+C_UNKNOWN = (230, 230, 230)  # цель взята, но проверить нечем — истины на этот такт нет
 C_INK = (255, 255, 255)
+
+
+def status_colour(status, miss_count, on_target):
+    """Цвет состояния петли. -> (цвет окна, цвет выбранной рамки, приписка).
+
+    Три состояния истины, а не два: цель подтверждена (on_target True),
+    цель опровергнута (False) и ПРОВЕРИТЬ НЕЧЕМ (None — разметка на этот такт
+    кончилась или в ней дыра). Третье нельзя красить ни как подтверждение, ни
+    как подмену: и то и другое — утверждение, которого мы не делали.
+    """
+    if status == "lost":
+        win = C_LOST
+    elif on_target is False:
+        win = C_SWAP
+    elif miss_count > 0:
+        win = C_MISS
+    else:
+        win = C_TRACK
+
+    if on_target is None:
+        chosen, note = C_UNKNOWN, "  (истины нет)"
+    elif on_target:
+        chosen, note = C_CHOSEN, ""
+    else:
+        chosen, note = C_SWAP, "  — ЧУЖАЯ ЦЕЛЬ"
+    return win, chosen, note
 
 
 def draw(frame, row, gt_box, on_target):
@@ -36,14 +63,7 @@ def draw(frame, row, gt_box, on_target):
     status = row["status"]
     miss = row["miss_count"]
 
-    if status == "lost":
-        col = C_LOST
-    elif on_target is False:
-        col = C_SWAP
-    elif miss > 0:
-        col = C_MISS
-    else:
-        col = C_TRACK
+    col, cc, note = status_colour(status, miss, on_target)
 
     # окно слежения — ровно то, что видела модель
     side = row["window_side"]
@@ -70,9 +90,9 @@ def draw(frame, row, gt_box, on_target):
             cv2.putText(frame, f"{d[4]:.2f}", (int(d[0]), int(d[1]) - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, C_CAND, 1, cv2.LINE_AA)
 
-    # выбранная детекция: голубая, если это и есть цель, пурпурная — если чужая
+    # выбранная детекция: голубая — подтверждённая цель, пурпурная — чужая,
+    # белая — проверить нечем (истины на этот такт нет)
     if ch is not None:
-        cc = C_CHOSEN if on_target else C_SWAP
         cv2.rectangle(frame, (int(ch[0]), int(ch[1])), (int(ch[2]), int(ch[3])), cc, 2)
         if len(ch) > 4:
             cv2.putText(frame, f"{ch[4]:.2f}", (int(ch[0]), int(ch[1]) - 5),
@@ -84,14 +104,13 @@ def draw(frame, row, gt_box, on_target):
     label = {"tracking": "ВЕДУ", "lost": "ПОТЕРЯ"}[status]
     if status == "tracking" and miss > 0:
         label = f"ПРОПУСК ({miss})"
-    if on_target is False:
-        label += "  — ЧУЖАЯ ЦЕЛЬ"
+    label += note
     txt = f"t={row['timestamp_sec']:.2f}s  {label}  окно={side:.0f}px"
     cv2.rectangle(frame, (0, 0), (w, 40), (0, 0, 0), -1)
     cv2.putText(frame, txt, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, col, 2, cv2.LINE_AA)
 
-    legend = ("жёлтый = истина | голубой = взятая цель | пурпур = чужая цель | "
-              "серый = прочие найденные паруса")
+    legend = ("жёлтый = истина | голубой = цель подтверждена | пурпур = чужая цель | "
+              "белый = истины на этот такт нет | серый = прочие найденные паруса")
     cv2.rectangle(frame, (0, h - 30), (w, h), (0, 0, 0), -1)
     cv2.putText(frame, legend, (10, h - 9), cv2.FONT_HERSHEY_SIMPLEX, 0.55, C_INK, 1, cv2.LINE_AA)
     return frame
