@@ -33,6 +33,17 @@ CELLS = ((0.5, 10.0, 0.08), (1.0, 20.0, 0.15), (2.0, 40.0, 0.22))
 SEEDS = 25
 
 
+def tolerance(n):
+    """Допуск сравнения долей на выборке n прогонов.
+
+    Два прогона, а не три. Три — это ровно эффект мутации
+    SHADOW_MAX_MISSES=1 (0.0400 при n=75), то есть допуск накрывал бы саму
+    проверяемую поломку. Держится тестом test_this_test_can_actually_see_a_
+    broken_death_rule: при изменении SEEDS он и покажет, если запас пропал.
+    """
+    return 2.0 / n
+
+
 def measure(over, k_list=(5, 15)):
     cfg = cfg_with(**over)
     n = trapped = 0
@@ -100,6 +111,22 @@ class TestDeathRuleGivesNoEscape:
         разница абсолютная).
         """
         a, b = measure(PROD), measure(IMMORTAL)
-        tol = 3.0 / a["n"]      # три прогона из выборки — заведомо шум
-        assert a["P15"] == pytest.approx(b["P15"], abs=tol)
-        assert a["trapped"] == pytest.approx(b["trapped"], abs=tol)
+        assert a["P15"] == pytest.approx(b["P15"], abs=tolerance(a["n"]))
+        assert a["trapped"] == pytest.approx(b["trapped"], abs=tolerance(a["n"]))
+
+    def test_this_test_can_actually_see_a_broken_death_rule(self):
+        """Страховка от того, что допуск выше проверяемого эффекта.
+
+        Так уже случилось: допуск 3/n давал ровно 0.0400, а мутация
+        SHADOW_MAX_MISSES=1 сдвигает P15 ровно на 0.0400 — мутант проходил, и
+        соседний тест был декоративен. Здесь это проверяется ЯВНО, а не
+        подразумевается: если различающая способность пропадёт, упадёт этот
+        тест, а не молча пройдёт тот.
+        """
+        base = measure(IMMORTAL)
+        broken = measure(dict(PROD, SHADOW_MAX_MISSES=1))
+        gap = abs(broken["P15"] - base["P15"])
+        tol = tolerance(base["n"])
+        assert gap > tol, (
+            f"сломанное правило смерти сдвигает P15 на {gap:.4f} при допуске {tol:.4f} — "
+            "соседний тест такую мутацию не увидит")
