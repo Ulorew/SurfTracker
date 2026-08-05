@@ -147,8 +147,16 @@ class BenchResult:
         return sum(1 for r in graded if r["chosen_tid"] == 0) / len(graded)
 
 
-def run_scenario(targets, cfg, seed, tick_hz=3.0, n_ticks=24, junk_per_tick=0):
-    """Прогон одного сценария. targets[0] — ЦЕЛЬ, остальные — соседи."""
+def run_scenario(targets, cfg, seed, tick_hz=3.0, n_ticks=24, junk_per_tick=0,
+                  force_wrong_at=None):
+    """Прогон одного сценария. targets[0] — ЦЕЛЬ, остальные — соседи.
+
+    force_wrong_at — время (сек), на такте которого петле НЕ показывают
+    истинную детекцию, так что единственный кандидат в окне — чужой. Это
+    принудительная инжекция шага (1) механизма закрепления: мы проверяем не
+    "как часто петля ошибается", а "обратима ли ошибка". Случайное
+    возникновение сделало бы тест мигающим.
+    """
     rng = random.Random(seed)
     dt = 1.0 / tick_hz
     tgt = targets[0]
@@ -159,7 +167,10 @@ def run_scenario(targets, cfg, seed, tick_hz=3.0, n_ticks=24, junk_per_tick=0):
     for i in range(1, n_ticks + 1):
         t = i * dt
         cx, cy, side = state.plan_window(dt)
-        dets = [detect(tg, t, rng, cfg) for tg in targets if tg.visible(t)]
+        forced = (force_wrong_at is not None
+                  and abs(t - force_wrong_at) < 0.5 / tick_hz)
+        dets = [detect(tg, t, rng, cfg) for tg in targets
+                if tg.visible(t) and not (forced and tg.tid == 0)]
         if junk_per_tick:
             dets += junk_detections(rng, cfg, junk_per_tick, cx, cy, side, tgt.size)
         # петля видит только то, что попало в ОКНО — как и на видео
@@ -172,6 +183,7 @@ def run_scenario(targets, cfg, seed, tick_hz=3.0, n_ticks=24, junk_per_tick=0):
             "t": t, "status": r.status,
             "chosen_tid": None if r.chosen is None else r.chosen[5],
             "n_dets": len(dets), "n_shadows": r.n_shadows,
+            "forced": forced,
             "n_taken": r.n_taken_by_shadows,
             "pred": (r.predicted_cx, r.predicted_cy),
             # оценка скорости фильтра — предел улёта считается от НЕЁ, а не от
@@ -268,6 +280,95 @@ def scen_head_on(rng):
     return [tgt, other]
 
 
+def scen_error_lockin(rng, d_min=None, alpha_deg=None, speed=None, tick_hz=3.0):
+    """ЗАКРЕПЛЕНИЕ ОШИБКИ (error_lockin) — главный известный риск конструкции.
+
+    Механизм, вскрытый замером и задокументированный потактово на racing t415:
+      (1) петля на такте T берёт чужую детекцию — по любой причине;
+      (2) на такте T+1 истинная детекция не выбрана и, проходя порог
+          рождения, заводит СВОЙ теневой;
+      (3) дальше истинная всегда "лучше объясняется" своим теневым, и правило
+          исключения 0.7 запирает её.
+    Ловушка абсорбирующая: выйти можно, только если теневой истинной умрёт
+    (а он сыт — истинная детектится каждый такт) или если чужая цель покинет
+    окно. Гейт и механизм А снижают вероятность шага (1), но против (2)-(3)
+    защиты нет, а шаг (1) неустраним в принципе.
+
+    Геометрия: истинная идёт прямо со скоростью speed; чужая сближается до
+    d_min (в угловых размерах цели) к моменту t_cross и расходится под углом
+    alpha. Шаг (1) инжектируется принудительно (см. run_scenario).
+    """
+    size = rng.uniform(0.02, 0.05)
+    speed = speed if speed is not None else rng.uniform(0.08, 0.20)
+    d_min = d_min if d_min is not None else rng.uniform(0.5, 2.0)
+    a = math.radians(alpha_deg if alpha_deg is not None else rng.uniform(12, 40))
+    t_cross = 2.5
+    tgt = Target(0, 0.0, 0.0, speed, 0.0, size)
+    mx, my = tgt.position(t_cross)
+    vx, vy = speed * math.cos(a), speed * math.sin(a)
+    other = Target(1, mx - vx * t_cross, my - vy * t_cross + d_min * size,
+                   vx, vy, size * rng.uniform(0.9, 1.1))
+    return [tgt, other]
+
+
+def lockin_probe(targets, cfg, seed, k_ticks=15, tick_hz=3.0, n_ticks=40,
+                  sep_sizes=2.0, k_list=None):
+    """Один прогон error_lockin -> что случилось после инжекции.
+
+    -> dict: инжекция удалась, вернулась ли петля за k_ticks после
+    РАСХОЖДЕНИЯ на sep_sizes угловых размеров, была ли истинная детекция
+    заперта теневым, дошла ли петля до режима потери.
+    """
+    tgt, other = targets[0], targets[1]
+    t_cross = 2.5
+    res = run_scenario(targets, cfg, seed, tick_hz=tick_hz, n_ticks=n_ticks,
+                        force_wrong_at=t_cross)
+    # момент расхождения: первый такт после инжекции, где цели разошлись
+    dt = 1.0 / tick_hz
+    t_sep = None
+    for i in range(1, n_ticks + 1):
+        t = i * dt
+        if t <= t_cross:
+            continue
+        if math.dist(tgt.position(t), other.position(t)) >= sep_sizes * tgt.size:
+            t_sep = t
+            break
+    injected = any(r["forced"] and r["chosen_tid"] not in (None, 0) for r in res.ticks)
+    # ловушка могла захлопнуться и БЕЗ инжекции: любой такт без принятого
+    # кандидата отдаёт истинную детекцию в свободные, и она заводит свой
+    # теневой. Считаем это отдельно, иначе измерение молча обусловливается
+    # на событие, которое сам механизм и предотвращает.
+    pre = [r for r in res.ticks if r["t"] < t_cross]
+    trapped_before = any(r["chosen_tid"] is None and r["n_taken"] > 0 for r in pre)
+    ks = k_list or (k_ticks,)
+    windows = {k: [r for r in res.ticks
+                   if t_sep is not None and t_sep < r["t"] <= t_sep + k * dt]
+               for k in ks}
+    window = windows[ks[-1]]
+    picks = [r["chosen_tid"] for r in window if r["chosen_tid"] is not None]
+    returned_by = {}
+    for k in ks:
+        pk = [r["chosen_tid"] for r in windows[k] if r["chosen_tid"] is not None]
+        returned_by[k] = bool(pk) and pk[-1] == 0
+    # истинная цель в пределах окна слежения — без этого возврат невозможен по
+    # геометрии, а не из-за запирания
+    in_window = [r for r in window
+                 if math.dist(tgt.position(r["t"]), r["pred"]) <= r.get("side", 1e9) / 2
+                 or math.dist(tgt.position(r["t"]), r["pred"]) <= 4 * tgt.size]
+    return {
+        "injected": injected,
+        "trapped_before": trapped_before,
+        "separated": t_sep is not None,
+        "returned": bool(picks) and picks[-1] == 0,
+        "returned_by": returned_by,
+        "ever_saw_target": any(p == 0 for p in picks),
+        "target_reachable": bool(in_window),
+        "went_lost": any(r["status"] == "lost" for r in window),
+        "taken_ticks": sum(r["n_taken"] for r in window),
+        "no_pick_ticks": sum(1 for r in window if r["chosen_tid"] is None),
+    }
+
+
 def scen_third_born(rng):
     """Рождение третьего: посреди прогона появляется ещё один сосед."""
     tgt, other = scen_crossing(rng)
@@ -291,6 +392,10 @@ SCENARIOS = {
     "рождение третьего": (scen_third_born, {}),
     "мусор": (scen_junk, {"junk_per_tick": 3}),
 }
+# scen_error_lockin в SCENARIOS намеренно НЕ входит: он осмыслен только с
+# принудительной инжекцией ошибки (lockin_probe), а через общий evaluate()
+# мерил бы обычное пересечение и давал бы строку, которая выглядит как
+# измерение закрепления, но им не является.
 
 
 def evaluate(form, runs, seed0=0, shadows=True, taken_ratio=None, scenarios=None,
@@ -315,20 +420,103 @@ def evaluate(form, runs, seed0=0, shadows=True, taken_ratio=None, scenarios=None
     return out
 
 
+LOCKIN_CONFIGS = {
+    "прод (А+Калман+гейт+теневые)": dict(ENABLE_SIZE_SCORING=True, FILTER_LEVEL=2,
+                                          ENABLE_MAHALANOBIS_GATE=True,
+                                          ENABLE_SHADOW_TRACKS=True),
+    "голая база + теневые": dict(ENABLE_SIZE_SCORING=False, FILTER_LEVEL=1,
+                                  ENABLE_MAHALANOBIS_GATE=False,
+                                  ENABLE_SHADOW_TRACKS=True),
+    "прод без теневых": dict(ENABLE_SIZE_SCORING=True, FILTER_LEVEL=2,
+                              ENABLE_MAHALANOBIS_GATE=True,
+                              ENABLE_SHADOW_TRACKS=False),
+    "теневые бессмертны (мутация)": dict(ENABLE_SIZE_SCORING=True, FILTER_LEVEL=2,
+                                          ENABLE_MAHALANOBIS_GATE=True,
+                                          ENABLE_SHADOW_TRACKS=True,
+                                          SHADOW_MAX_MISSES=10 ** 6),
+}
+
+LOCKIN_GRID = {
+    "d_min": (0.5, 1.0, 2.0),        # в угловых размерах цели
+    "alpha_deg": (10.0, 20.0, 40.0),  # угол расхождения
+    "speed": (0.08, 0.15, 0.22),      # рад/с
+}
+
+
+def run_lockin_grid(seeds=50, k_list=(5, 15)):
+    """Сетка d_min x alpha x скорость. -> {конфигурация: {...}}"""
+    out = {}
+    for name, over in LOCKIN_CONFIGS.items():
+        cfg = cfg_with(**over)
+        agg = {k: {"returned": 0, "n": 0} for k in k_list}
+        cells = []
+        n_inj = n_tot = trapped_before = 0
+        lost_no_return = taken_no_return = 0
+        for d_min in LOCKIN_GRID["d_min"]:
+            for alpha in LOCKIN_GRID["alpha_deg"]:
+                for speed in LOCKIN_GRID["speed"]:
+                    cell = {k: [0, 0] for k in k_list}
+                    for i in range(seeds):
+                        targets = scen_error_lockin(random.Random(i), d_min=d_min,
+                                                     alpha_deg=alpha, speed=speed)
+                        n_tot += 1
+                        p = lockin_probe(targets, cfg, seed=i, k_list=k_list)
+                        if not p["separated"]:
+                            continue
+                        n_inj += p["injected"]
+                        trapped_before += p["trapped_before"]
+                        for k in k_list:
+                            cell[k][1] += 1
+                            agg[k]["n"] += 1
+                            if p["returned_by"][k]:
+                                cell[k][0] += 1
+                                agg[k]["returned"] += 1
+                        if not p["returned_by"][k_list[-1]]:
+                            lost_no_return += p["went_lost"]
+                            taken_no_return += p["taken_ticks"] > 0
+                    cells.append({"d_min": d_min, "alpha_deg": alpha, "speed": speed,
+                                   **{f"P{k}": (cell[k][0] / cell[k][1] if cell[k][1] else None)
+                                      for k in k_list}})
+        out[name] = {
+            "P": {str(k): (agg[k]["returned"] / agg[k]["n"] if agg[k]["n"] else None)
+                  for k in k_list},
+            "инжекций": n_inj, "прогонов": n_tot,
+            "ловушка захлопнулась ДО инжекции": trapped_before,
+            "не вернулись: доходили до потери": lost_no_return,
+            "не вернулись: были заперты теневым": taken_no_return,
+            "ячейки": cells,
+        }
+        p = out[name]["P"]
+        print(f"{name:34s} P(K=5)={p['5']:.3f}  P(K=15)={p['15']:.3f}  "
+              f"инжекций {n_inj}/{n_tot}  ловушка до инжекции {trapped_before}/{n_tot}")
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--forms", nargs="+", default=list(ALL_FORMS))
     ap.add_argument("--runs", type=int, default=500)
     ap.add_argument("--seed0", type=int, default=0)
     ap.add_argument("--no-shadows", action="store_true")
+    ap.add_argument("--lockin", action="store_true",
+                     help="сетка сценария закрепления ошибки (error_lockin): "
+                          "P(возврат) по d_min x alpha x скорость")
+    ap.add_argument("--lockin-seeds", type=int, default=50)
     ap.add_argument("--sensitivity", type=float, nargs="+", default=None,
                      help="прогнать чувствительность к SHADOW_TAKEN_RATIO (напр. 0.6 0.7 0.85)")
     ap.add_argument("--filter-level", type=int, default=2)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
-    report = {"runs": args.runs, "forms": {}, "sensitivity": {}}
+    report = {"runs": args.runs, "forms": {}, "sensitivity": {}, "lockin": {}}
     names = list(SCENARIOS)
+
+    if args.lockin:
+        report["lockin"] = run_lockin_grid(args.lockin_seeds)
+        if args.out:
+            json.dump(report, open(args.out, "w"), indent=2, ensure_ascii=False)
+            print("\nподробности:", args.out)
+        return 0
 
     if args.sensitivity:
         form = args.forms[0]

@@ -52,6 +52,11 @@ CONFIGS = {
     "finalist_no_shadows": ["--enable-a", "--filter-level", "2", "--enable-gate",
                              "--score-form", "maha_aniso"],
     "shadows_only": ["--enable-a", "--filter-level", "2", "--enable-gate", "--shadows"],
+    # ЗАМОРОЖЕННЫЙ прод-состав. Флаги перечислены полностью, хотя часть из них
+    # теперь и так умолчания: строка матрицы обязана задавать конфигурацию
+    # целиком, иначе смена умолчаний молча меняет смысл прежних строк.
+    "prod_frozen": ["--enable-a", "--filter-level", "2", "--enable-gate", "--shadows",
+                     "--score-form", "distance"],
 }
 
 # Метрики, попадающие в таблицу. Радиальный критерий — основной (тикет:
