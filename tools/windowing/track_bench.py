@@ -104,6 +104,20 @@ JUNK_TID = -1
 # координату счёта: стенд мерил бы не свойство формы, а свойство генератора.
 JUNK_SIZE_RANGE = (0.15, 3.0)
 
+# Разброс размеров СОСЕДА (не мусора), в долях размера цели. Та же ошибка, что
+# была с мусором, и найдена тем же способом: сосед генерировался как
+# 0.8-1.25 размера цели, то есть почти неотличимый по размеру. На реальных
+# клипах невыбранные детекции идут от 0.14 до 2.34 размера цели (p05-p95 по
+# 11313 детекциям), и опаснее всего именно КРУПНЫЙ передний сёрфер — на нём
+# теряется racing t159 и t322. Узкий диапазон делал вето механизма А
+# бесполезным по построению: отсекать было нечего.
+NEIGHBOUR_SIZE_RANGE = (0.3, 2.5)
+
+
+def neighbour_size(rng, size):
+    lo, hi = (math.log(v) for v in NEIGHBOUR_SIZE_RANGE)
+    return size * math.exp(rng.uniform(lo, hi))
+
 
 def junk_detections(rng, cfg, n, cx, cy, side, size):
     """Мусор детектора: низкая уверенность, случайное место в окне. Должен
@@ -221,7 +235,7 @@ def scen_crossing(rng, angle_deg=None, size=None):
     mx, my = tgt.position(t_cross)
     vx, vy = speed * math.cos(a), speed * math.sin(a)
     other = Target(1, mx - vx * t_cross, my - vy * t_cross, vx, vy,
-                   size * rng.uniform(0.8, 1.25))
+                   neighbour_size(rng, size))
     return [tgt, other]
 
 
@@ -232,7 +246,7 @@ def scen_overtake(rng):
     lateral = size * rng.uniform(0.6, 1.5)
     tgt = Target(0, 0.0, 0.0, speed, 0.0, size)
     other = Target(1, -speed * 2.0, lateral, speed * rng.uniform(1.3, 1.8), 0.0,
-                   size * rng.uniform(0.9, 1.1))
+                   neighbour_size(rng, size))
     return [tgt, other]
 
 
@@ -286,7 +300,7 @@ def scen_head_on(rng):
     t_meet = rng.uniform(2.0, 4.0)
     mx, _ = tgt.position(t_meet)
     other = Target(1, mx + speed * t_meet, lateral, -speed, 0.0,
-                   size * rng.uniform(0.9, 1.1))
+                   neighbour_size(rng, size))
     return [tgt, other]
 
 
@@ -317,7 +331,7 @@ def scen_error_lockin(rng, d_min=None, alpha_deg=None, speed=None, tick_hz=3.0):
     mx, my = tgt.position(t_cross)
     vx, vy = speed * math.cos(a), speed * math.sin(a)
     other = Target(1, mx - vx * t_cross, my - vy * t_cross + d_min * size,
-                   vx, vy, size * rng.uniform(0.9, 1.1))
+                   vx, vy, neighbour_size(rng, size))
     return [tgt, other]
 
 
