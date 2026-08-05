@@ -36,6 +36,32 @@ def _make_window(cx: float, cy: float, side: float, rng: random.Random) -> Squar
     return Square(cx=cx + jx, cy=cy + jy, side=side)
 
 
+def _natural_side(b_size: float, lo: float, hi: float) -> "float | None":
+    """Путь 1 (натура, без ресайза): бокс уже в корзине и помещается в холст
+    при k >= K_MIN. -> сторона окна или None."""
+    if lo <= b_size < hi and config.K_MIN * b_size <= config.WINDOW_SIZE:
+        return min(config.K_MAX, config.WINDOW_SIZE / b_size) * b_size
+    return None
+
+
+def _resize_visible_range(b_size: float, lo: float, hi: float) -> "tuple[float, float] | None":
+    """Путь 2 (ресайз): диапазон ВИДИМЫХ размеров v, при которых окно
+    попадает в корзину [lo,hi) и k = WINDOW_SIZE/v остаётся в [K_MIN, K_MAX],
+    а вырезка действительно уменьшается (s > WINDOW_SIZE, т.е. v < b_size).
+
+    Диапазон считается ТОЧНО, а не проверяется случайной пробой. Раньше здесь
+    бросали v равномерно по всей корзине и отбрасывали неудачные броски —
+    из-за этого корзина считалась достижимой лишь с некоторой вероятностью, и
+    верхняя корзина систематически недобирала окна: при боксе 400px и корзине
+    200-320 годится только v <= 256, то есть примерно половина бросков.
+    Хуже того, ответ расходился с reachable_bin_indices, который те же
+    корзины считает достижимыми детерминированно.
+    """
+    v_lo = max(lo, config.WINDOW_SIZE / config.K_MAX)
+    v_hi = min(hi, config.WINDOW_SIZE / config.K_MIN, b_size)
+    return (v_lo, v_hi) if v_lo < v_hi else None
+
+
 def _reachable_sides(b_size: float, rng: random.Random) -> "list[tuple[float, float]]":
     """-> [(сторона S, целевая доля корзины), ...] для корзин, которые бокс
     b_size вообще способен закрыть.
@@ -51,21 +77,15 @@ def _reachable_sides(b_size: float, rng: random.Random) -> "list[tuple[float, fl
 
     sides = []
     for lo, hi, frac in bins:
-        # путь 1: натура (без ресайза) — бокс уже в этой корзине
-        if lo <= b_size < hi and config.K_MIN * b_size <= config.WINDOW_SIZE:
-            k = min(config.K_MAX, config.WINDOW_SIZE / b_size)
-            sides.append((k * b_size, frac))
+        nat = _natural_side(b_size, lo, hi)
+        if nat is not None:
+            sides.append((nat, frac))
             continue
-
-        # путь 2: ресайз — целимся в случайную точку корзины
-        v = rng.uniform(lo, hi)
-        k = config.WINDOW_SIZE / v
-        if not (config.K_MIN <= k <= config.K_MAX):
+        rng_v = _resize_visible_range(b_size, lo, hi)
+        if rng_v is None:
             continue
-        s = k * b_size
-        if s <= config.WINDOW_SIZE:
-            continue  # не настоящий ресайз — тот же случай, что путь 1, но не подошёл
-        sides.append((s, frac))
+        v = rng.uniform(*rng_v)
+        sides.append(((config.WINDOW_SIZE / v) * b_size, frac))
 
     return sides
 
@@ -120,15 +140,8 @@ def reachable_bin_indices(b_size: float) -> "list[int]":
     """
     out = []
     for i, (lo, hi, _frac) in enumerate(config.SIZE_BINS):
-        # путь 1: натура
-        if lo <= b_size < hi and config.K_MIN * b_size <= config.WINDOW_SIZE:
-            out.append(i)
-            continue
-        # путь 2: ресайз. k in [K_MIN,K_MAX] -> v in [WS/K_MAX, WS/K_MIN];
-        # настоящий ресайз (s > WS) -> v < b_size
-        v_lo = max(lo, config.WINDOW_SIZE / config.K_MAX)
-        v_hi = min(hi, config.WINDOW_SIZE / config.K_MIN, b_size)
-        if v_lo < v_hi:
+        if _natural_side(b_size, lo, hi) is not None \
+                or _resize_visible_range(b_size, lo, hi) is not None:
             out.append(i)
     return out
 
@@ -139,13 +152,12 @@ def window_for_bin(box: IntBox, bin_idx: int, rng: random.Random) -> "Square | N
     cx, cy = box_center(box)
     lo, hi, _frac = config.SIZE_BINS[bin_idx]
 
-    if lo <= b_size < hi and config.K_MIN * b_size <= config.WINDOW_SIZE:
-        k = min(config.K_MAX, config.WINDOW_SIZE / b_size)
-        return _make_window(cx, cy, k * b_size, rng)
+    nat = _natural_side(b_size, lo, hi)
+    if nat is not None:
+        return _make_window(cx, cy, nat, rng)
 
-    v_lo = max(lo, config.WINDOW_SIZE / config.K_MAX)
-    v_hi = min(hi, config.WINDOW_SIZE / config.K_MIN, b_size)
-    if v_lo >= v_hi:
+    rng_v = _resize_visible_range(b_size, lo, hi)
+    if rng_v is None:
         return None
-    v = rng.uniform(v_lo, v_hi)
+    v = rng.uniform(*rng_v)
     return _make_window(cx, cy, (config.WINDOW_SIZE / v) * b_size, rng)

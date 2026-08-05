@@ -17,6 +17,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 
 DEF_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.py")
 
@@ -70,6 +71,34 @@ def describe_optimizer(optimizer) -> str:
     else:
         momentum = None
     return f"{type(optimizer).__name__}(lr={lr}, momentum={momentum})"
+
+
+def effective_mismatches(desc: str, want_optimizer: str, want_lr0: float,
+                          lr_tol: float = 1e-9) -> "list[str]":
+    """Расхождения между тем, что попросили, и тем, что реально построилось.
+
+    Регламент (тикет "ночь", блок 3): прогон, у которого effective расходится
+    с заявкой, обязан падать НА СТАРТЕ, а не давать через час результат, из
+    которого потом делают выводы. Так уже случилось: с optimizer='auto'
+    ultralytics молча игнорировал переданный lr0 ("ignoring lr0=..." в логе),
+    и целая серия сравнений по lr оказалась сравнением одинаковых прогонов.
+
+    want_optimizer='auto' проверку имени и lr снимает: там пересчёт —
+    заявленное поведение ultralytics, а не расхождение. Но такой прогон и
+    нельзя сравнивать по lr, поэтому 'auto' в этом проекте не используется.
+    """
+    out = []
+    if want_optimizer and want_optimizer.lower() == "auto":
+        return out
+    m = re.match(r"^([A-Za-z]+)\(lr=([^,]+)", desc or "")
+    if not m:
+        return [f"не удалось разобрать строку оптимизатора: {desc!r}"]
+    got_name, got_lr = m.group(1), float(m.group(2))
+    if want_optimizer and got_name.lower() != want_optimizer.lower():
+        out.append(f"оптимизатор: просили {want_optimizer}, построился {got_name}")
+    if want_lr0 is not None and abs(got_lr - want_lr0) > lr_tol:
+        out.append(f"lr0: просили {want_lr0}, построился {got_lr}")
+    return out
 
 
 def weight_hash(module) -> str:
@@ -147,6 +176,9 @@ def absolutize(yaml_path: str) -> str:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True, help="yaml нарезанного датасета (dataset_gen.py)")
+    ap.add_argument("--allow-effective-mismatch", action="store_true",
+                     help="не падать, если реально построенный оптимизатор/lr расходятся "
+                          "с заявленными (по умолчанию прогон останавливается на старте)")
     ap.add_argument("--model", default="yolo11s.pt")
     ap.add_argument("--project", default="runs/surf_640")
     ap.add_argument("--name", default="v1")
@@ -238,6 +270,13 @@ def main():
         # чем "подтверждается в логе старта" (тикет "патч v2", п.1).
         if "start" not in epoch1_state:
             epoch1_state["start"] = describe_optimizer(trainer.optimizer)
+            bad = effective_mismatches(epoch1_state["start"], args.optimizer, args.lr0)
+            if bad and not args.allow_effective_mismatch:
+                raise SystemExit(
+                    "ПРОГОН ОСТАНОВЛЕН НА СТАРТЕ: обучение построилось не тем, что попросили.\n  "
+                    + "\n  ".join(bad)
+                    + f"\n  (строка оптимизатора: {epoch1_state['start']})"
+                    + "\n  Если расхождение осознанное — --allow-effective-mismatch.")
 
     if args.resume and os.path.exists(last):
         # см. dataset_v1/train.py: save_dir и data — явно, иначе resume

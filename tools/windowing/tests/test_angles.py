@@ -82,10 +82,54 @@ class TestIntrinsicsTable:
 
     def test_frame_size_override_moves_center_but_not_focal(self):
         base = intrinsics_for("YT_Primbee_Speed_Windsurfing_8bYtDBZkrpM")
-        moved = intrinsics_for("YT_Primbee_Speed_Windsurfing_8bYtDBZkrpM", 1920, 1012)
+        moved = intrinsics_for("YT_Primbee_Speed_Windsurfing_8bYtDBZkrpM", 1600, 1012)
         assert moved.fx == base.fx
+        assert moved.cx == pytest.approx(800.0)
         assert moved.cy == pytest.approx(506.0)
+
+    def test_partial_frame_size_is_refused(self):
+        """Половина размера кадра — не размер кадра: центр по одной оси
+        остался бы от другого разрешения, и это проявилось бы только
+        смещением углов."""
+        with pytest.raises(ValueError):
+            intrinsics_for("VID_20230624_145515", 1920, None)
+        with pytest.raises(ValueError):
+            intrinsics_for("VID_20230624_145515", None, 1080)
 
     def test_fov_to_focal_matches_formula(self):
         intr = from_fov(1920, 1080, 90.0, "тест")
         assert intr.fx == pytest.approx(960.0)  # tan(45°)=1
+
+    def test_principal_point_is_the_frame_centre(self):
+        """Отдельно от fx: главная точка — середина кадра. Ошибка здесь не
+        видна в тождестве пиксель->угол->пиксель (она сокращается), зато
+        сдвигает ВСЕ абсолютные углы."""
+        intr = from_fov(1600, 900, 70.0, "тест")
+        assert intr.cx == pytest.approx(800.0)
+        assert intr.cy == pytest.approx(450.0)
+
+    def test_table_resolution_matches_the_actual_frames(self):
+        """Разрешение в таблице обязано совпадать с реальными кадрами клипа:
+        опечатка в нём сдвигает главную точку и все углы, а по картинке это
+        никак не заметно."""
+        import glob
+        import os
+
+        import cv2
+        root = "/home/ulorew/Projects/SurfTracker/Data/frames/val_manual"
+        if not os.path.isdir(root):
+            pytest.skip("нет папки клипов")
+        seen = set()
+        for name in sorted(os.listdir(root)):
+            d = os.path.join(root, name)
+            if not os.path.isdir(d):
+                continue
+            jpgs = sorted(glob.glob(os.path.join(d, "*.jpg")))
+            if not jpgs:
+                continue
+            h, w = cv2.imread(jpgs[0]).shape[:2]
+            intr = intrinsics_for(name)
+            assert intr.cx == pytest.approx(w / 2.0), f"{name}: ширина в таблице не та"
+            assert intr.cy == pytest.approx(h / 2.0), f"{name}: высота в таблице не та"
+            seen.add(name)
+        assert seen, "тест бесполезен, если ни один клип не проверен"

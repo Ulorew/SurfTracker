@@ -103,6 +103,11 @@ def intrinsics_for(clip_or_stem: str, frame_w: int = None, frame_h: int = None) 
         if clip_or_stem.startswith(key):
             intr = value
             break
+    if (frame_w is None) != (frame_h is None):
+        # половина размера кадра — не размер кадра: молча оставить старый
+        # центр по одной оси значит выдать intrinsics, которых нет ни у
+        # одной камеры, и обнаружится это только смещением углов
+        raise ValueError("frame_w и frame_h задаются только вместе")
     if frame_w and frame_h:
         intr = intr._replace(cx=frame_w / 2.0, cy=frame_h / 2.0)
     return intr
