@@ -42,6 +42,12 @@ CONFIGS = {
     # клипами: восемь исходов переобучаются мгновенно.
     "finalist": ["--enable-a", "--filter-level", "2", "--enable-gate",
                   "--score-form", "maha_aniso", "--shadows"],
+    # ПРОД-конфигурация (мини-тикет "заморозка"): выбор цели базовый,
+    # демпфирование, теневые треки. Механизм А и Калман сюда не входят —
+    # тикет их не называет; строки ниже показывают, что они добавляют.
+    "prod": ["--shadows"],
+    "prod_A": ["--shadows", "--enable-a"],
+    "prod_kalman": ["--shadows", "--filter-level", "2", "--enable-gate"],
     # Разложение финалиста: что даёт каждая часть по отдельности.
     "finalist_no_shadows": ["--enable-a", "--filter-level", "2", "--enable-gate",
                              "--score-form", "maha_aniso"],

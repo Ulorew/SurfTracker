@@ -85,14 +85,41 @@ class TestLifeAndDeath:
             s.step(DT, [], chosen=None)
         assert len(s) == 1
 
-    def test_low_confidence_detection_can_still_FEED(self):
-        """Порог питания ниже порога рождения: раз уж сосед занят, слабая
-        детекция на его месте — это он же, а не новый объект."""
+    def test_feed_threshold_equals_birth_threshold(self):
+        """Мини-тикет "заморозка": порог питания поднят до порога рождения.
+        Прежний низкий порог (0.2) давал измеренную утечку — мусор кормил
+        существующие тени и утаскивал их на цель (-0.210 на стенде)."""
+        assert base_cfg.SHADOW_FEED_CONF == base_cfg.SHADOW_BIRTH_CONF
+
+    def test_detection_at_the_feed_threshold_still_feeds(self):
         s = ShadowSet(cfg())
         s.step(DT, [det(0.1, 0.0, conf=0.9)], chosen=None)
         for _ in range(base_cfg.SHADOW_MAX_MISSES + 2):
             s.step(DT, [det(0.1, 0.0, conf=base_cfg.SHADOW_FEED_CONF)], chosen=None)
         assert len(s) == 1
+
+    def test_junk_below_the_threshold_cannot_keep_a_shadow_alive(self):
+        """Та самая утечка, ради закрытия которой порог и поднят: слабые
+        детекции больше не продлевают жизнь теневому. Тест падает при любом
+        понижении порога питания."""
+        s = ShadowSet(cfg())
+        s.step(DT, [det(0.1, 0.0, conf=0.9)], chosen=None)
+        weak = base_cfg.SHADOW_FEED_CONF - 0.01
+        for _ in range(base_cfg.SHADOW_MAX_MISSES):
+            s.step(DT, [det(0.1, 0.0, conf=weak)], chosen=None)
+        assert len(s) == 0, f"детекция с conf={weak} продлила жизнь теневому"
+
+    def test_junk_cannot_drag_a_shadow_onto_the_target(self):
+        """Полная форма утечки: слабые детекции не только не продлевают жизнь,
+        но и не двигают теневой. Именно сдвиг на цель делал её "занятой"."""
+        s = ShadowSet(cfg())
+        s.step(DT, [det(0.5, 0.0, conf=0.9)], chosen=None, target_vel=(0.0, 0.0))
+        before = s.debug_state()[0]["cx"]
+        for _ in range(base_cfg.SHADOW_MAX_MISSES - 1):
+            s.step(DT, [det(0.05, 0.0, conf=base_cfg.SHADOW_FEED_CONF - 0.05)],
+                   chosen=None, target_vel=(0.0, 0.0))
+        assert s.debug_state()[0]["cx"] == pytest.approx(before, abs=1e-9), \
+            "слабая детекция сдвинула теневой к цели"
 
     def test_cap_is_respected(self):
         s = ShadowSet(cfg())
