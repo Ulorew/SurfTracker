@@ -1,22 +1,22 @@
 {
   "версия": "tracking-v1",
-  "коммит": "ba20c34da89e8fbc94b9b9047478efecfcc4360e",
+  "коммит": "2872ec0ca0a85aa430cecc17c44286bef82162d8",
   "ветка": "master",
   "дерево_чистое": true,
-  "примечание": "мини-тикет заморозки; подтверждение НЕ пройдено, тег не поставлен",
+  "примечание": "заморожен тегом tracking-v1-frozen",
   "значения": {
     "ALPHA_BETA_ALPHA": 0.6,
     "ALPHA_BETA_BETA": 0.3,
     "DETECT_LOW_CONF": 0.08,
     "DETECT_MIN_WINDOW_PX": 640,
-    "ENABLE_MAHALANOBIS_GATE": false,
+    "ENABLE_MAHALANOBIS_GATE": true,
     "ENABLE_OCCLUSION_HOLD": false,
     "ENABLE_SHADOW_TRACKS": true,
-    "ENABLE_SIZE_SCORING": false,
+    "ENABLE_SIZE_SCORING": true,
     "ENABLE_VELOCITY_DIRECTION": false,
     "ENABLE_VELOCITY_GATE": false,
     "EXTRAPOLATION_TAU_SEC": 1.5,
-    "FILTER_LEVEL": 1,
+    "FILTER_LEVEL": 2,
     "GT_HIT_BOX_SCALE": 1.2,
     "GT_HIT_RADIAL_FRAC": 0.6,
     "GT_LABEL_FPS": 2.0,
@@ -106,6 +106,30 @@
       ],
       "описание": "прежняя база без теневых",
       "клипы_доля_на_цели": 0.734
+    },
+    "prod_frozen": {
+      "флаги": [
+        "--enable-a",
+        "--filter-level",
+        "2",
+        "--enable-gate",
+        "--shadows",
+        "--score-form",
+        "distance"
+      ],
+      "описание": "ЗАМОРОЖЕННЫЙ прод-состав (тег tracking-v1-frozen). Флаги перечислены полностью, хотя часть уже умолчания: строка обязана задавать конфигурацию целиком",
+      "клипы_доля_на_цели": 0.841,
+      "клипы_оговорка": "8 стресс-проездов, счёт на худшем случае, не ожидание для поля",
+      "стенд_доля_без_подмены": 0.857,
+      "известный_риск": {
+        "имя": "закрепление ошибки (error_lockin)",
+        "P_возврата_после_одной_ошибки": 0.496,
+        "ожидалось": 0.8,
+        "растёт_ли_со_временем": false,
+        "ловушка_захлопывается_без_ошибки_доля_прогонов": 0.404,
+        "сценарий": "track_bench.scen_error_lockin",
+        "тесты": "tests/test_error_lockin.py"
+      }
     }
   },
   "клипы": "Data/frames/val_manual, 8 проездов, такт 3 Гц, веса models/night_legacy_s3_best.pt",
