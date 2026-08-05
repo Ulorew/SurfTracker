@@ -200,6 +200,11 @@ def main():
                      help="механизм В: гейт по скорости. ВНИМАНИЕ: в текущей формулировке "
                           "алгебраически тождествен дистанционному слагаемому (см. коммент "
                           "в track_logic.score_candidate) — включать смысла нет")
+    ap.add_argument("--score-form", default=None,
+                     help="форма счёта кандидата: distance | maha | maha_aniso | maha_vdir "
+                          "(см. track_score.py); махаланобисовы требуют --filter-level 2")
+    ap.add_argument("--shadows", action="store_true",
+                     help="теневые треки: чужие детекции заняты и не притягивают цель")
     ap.add_argument("--enable-vdir", action="store_true",
                      help="механизм В-направленный: штраф и вето за РАЗВОРОТ движения "
                           "(в отличие от --enable-v, не повторяет дистанционное слагаемое)")
@@ -223,6 +228,15 @@ def main():
     tcfg.ENABLE_OCCLUSION_HOLD = args.enable_b
     tcfg.ENABLE_VELOCITY_GATE = args.enable_v
     tcfg.ENABLE_VELOCITY_DIRECTION = args.enable_vdir
+    tcfg.ENABLE_SHADOW_TRACKS = args.shadows
+    if args.score_form:
+        from track_score import ALL_FORMS, FORM_DISTANCE
+        if args.score_form not in ALL_FORMS:
+            raise SystemExit(f"--score-form: {args.score_form!r} не из {ALL_FORMS}")
+        tcfg.SCORE_FORM = args.score_form
+        tcfg.KALMAN_ANISOTROPIC_Q = args.score_form == "maha_aniso"
+        if args.score_form != FORM_DISTANCE and (args.filter_level or tcfg.FILTER_LEVEL) != 2:
+            raise SystemExit("махаланобисова форма счёта требует --filter-level 2")
     if args.filter_level is not None:
         tcfg.FILTER_LEVEL = args.filter_level
     if args.enable_gate and tcfg.FILTER_LEVEL != 2:
@@ -245,6 +259,9 @@ def main():
         "mechanism_B_occlusion": args.enable_b,
         "mechanism_V_velocity": args.enable_v,
         "mechanism_Vdir_direction": args.enable_vdir,
+        "shadow_tracks": tcfg.ENABLE_SHADOW_TRACKS,
+        "score_form": tcfg.SCORE_FORM,
+        "extrapolation_tau_sec": tcfg.EXTRAPOLATION_TAU_SEC,
         "vdir_lambda": tcfg.VDIR_LAMBDA, "vdir_cos_veto": tcfg.VDIR_COS_VETO,
         "tick_hz": args.tick_hz,
         "size_lambda": tcfg.SIZE_LAMBDA, "size_veto_ratio": tcfg.SIZE_VETO_RATIO,
@@ -373,6 +390,8 @@ def main():
                 # числом по логу это не восстановить
                 "n_candidates_radius": r.n_candidates_radius,
                 "n_candidates_gate": r.n_candidates_gate,
+                "n_taken_by_shadows": r.n_taken_by_shadows,
+                "n_shadows": r.n_shadows,
                 "target_size_ang": ts_state.filtered_size,
                 # ВСЕ кандидаты этого такта, а не только выбранный: без них по
                 # логу не видно, из чего трекер выбирал — а именно это

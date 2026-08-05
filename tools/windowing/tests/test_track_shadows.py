@@ -201,3 +201,72 @@ class TestOrderIndependence:
         a = sorted((round(t["cx"], 6), round(t["cy"], 6)) for t in base.debug_state())
         b = sorted((round(t["cx"], 6), round(t["cy"], 6)) for t in rev.debug_state())
         assert a == b
+
+
+class TestExactRules:
+    """Мутационный прогон показал, что часть правил держалась только на знаках
+    неравенств: замена <= на < ничего не роняла. Здесь — точные значения."""
+
+    def test_det_helpers_on_an_asymmetric_box(self):
+        from track_shadows import _det_center, _det_conf, _det_size
+        box = (1.0, 2.0, 4.0, 10.0, 0.42)
+        assert _det_center(box) == (2.5, 6.0)
+        assert _det_size(box) == 8.0
+        assert _det_conf(box) == 0.42
+        assert _det_conf((1.0, 2.0, 4.0, 10.0)) == 1.0, "без conf детекция считается достоверной"
+
+    def test_taking_is_strict_at_the_exact_ratio(self):
+        """Правило тикета — СТРОГОЕ неравенство: ровно на пороге кандидат
+        остаётся у цели. Иначе граничный случай отдаётся соседу."""
+        s = ShadowSet(cfg())
+        s.step(DT, [det(1.0, 0.0)], chosen=None)
+        x = 1.0 / (1.0 + base_cfg.SHADOW_TAKEN_RATIO)   # ровно на пороге
+        assert not s.is_taken(det(x, 0.0), 0.0, 0.0, DT)
+
+    def test_match_limit_exact_value(self):
+        """Радиус = доля размера + путь теневого за такт. Обе части нужны:
+        без первой не переживается шум, без второй — движение соседа."""
+        c = cfg()
+        s = ShadowSet(c)
+        s.step(DT, [det(0.5, 0.0)], chosen=None, target_vel=(0.3, 0.4))
+        t = s.tracks[0]
+        got = s.match_limit(t, SIZE, DT)
+        want = c.SHADOW_MATCH_SIZE_FRAC * SIZE + 0.5 * DT   # |v| = 0.5
+        assert got == pytest.approx(want, rel=1e-12)
+
+    def test_bigger_of_the_two_sizes_is_used(self):
+        c = cfg()
+        s = ShadowSet(c)
+        s.step(DT, [det(0.5, 0.0, size=SIZE)], chosen=None)
+        t = s.tracks[0]
+        assert s.match_limit(t, 4 * SIZE, DT) > s.match_limit(t, SIZE, DT)
+
+    def test_nearest_detection_feeds_the_shadow_not_the_first_one(self):
+        """При двух детекциях в радиусе кормит БЛИЖАЙШАЯ. Иначе теневой
+        уползает на случайного соседа и перестаёт занимать того, кого должен."""
+        s = ShadowSet(cfg())
+        s.step(DT, [det(0.5, 0.0)], chosen=None)
+        near, far = det(0.51, 0.0), det(0.5 + 1.4 * SIZE, 0.0)
+        s.step(DT, [far, near], chosen=None, target_vel=(0.0, 0.0))
+        assert len(s) == 2, "вторая детекция обязана была родить свой теневой"
+        fed = min(s.tracks, key=lambda t: t.born_at)
+        assert abs(fed.filter.cx - 0.51) < abs(fed.filter.cx - (0.5 + 1.4 * SIZE))
+
+    def test_detection_exactly_at_the_limit_still_feeds(self):
+        """Граница включительная: ровно на радиусе — это ещё он же. Иначе
+        детекция на самом краю допуска рождает дубль того же соседа."""
+        c = cfg()
+        s = ShadowSet(c)
+        s.step(DT, [det(0.5, 0.0)], chosen=None, target_vel=(0.0, 0.0))
+        t = s.tracks[0]
+        limit = s.match_limit(t, SIZE, DT)
+        s.step(DT, [det(0.5 + limit, 0.0)], chosen=None, target_vel=(0.0, 0.0))
+        assert len(s) == 1, "детекция ровно на радиусе не накормила теневой"
+
+    def test_detection_outside_the_limit_does_not_feed(self):
+        c = cfg()
+        s = ShadowSet(c)
+        s.step(DT, [det(0.5, 0.0)], chosen=None)
+        far = 0.5 + 5 * c.SHADOW_MATCH_SIZE_FRAC * SIZE
+        s.step(DT, [det(far, 0.0)], chosen=None, target_vel=(0.0, 0.0))
+        assert len(s) == 2, "далёкая детекция накормила чужой теневой вместо рождения своего"

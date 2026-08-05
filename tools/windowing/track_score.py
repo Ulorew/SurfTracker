@@ -38,8 +38,15 @@ FORM_MAHA_VDIR = "maha_vdir"
 # что-то решает — на разноразмерном пересечении она обязана проигрывать
 # форме 1. Без такого контроля утверждение "log h помогает" непроверяемо.
 FORM_MAHA_POS = "maha_pos"
+# ДИАГНОСТИЧЕСКАЯ форма сверх трёх заданных тикетом: d^2 + ln|S|, то есть
+# правдоподобие целиком, а не только его квадратичная часть. Заведена не для
+# красоты: R считается по размеру САМОГО кандидата, поэтому крупная рамка
+# получает большую S и одно лишь d^2 её систематически поощряет. Проверить это
+# можно только сравнением, поэтому форма существует отдельно.
+FORM_MAHA_LL = "maha_ll"
 ALL_FORMS = (FORM_DISTANCE, FORM_MAHA, FORM_MAHA_ANISO, FORM_MAHA_VDIR)
-MAHA_FORMS = (FORM_MAHA, FORM_MAHA_ANISO, FORM_MAHA_VDIR, FORM_MAHA_POS)
+MAHA_FORMS = (FORM_MAHA, FORM_MAHA_ANISO, FORM_MAHA_VDIR, FORM_MAHA_POS,
+              FORM_MAHA_LL)
 
 
 def _det_center(det):
@@ -103,7 +110,8 @@ def candidate_score(det, filt, pred_cx, pred_cy, pred_size, dt, cfg,
 
     if hasattr(filt, "score_distance2"):
         # анизотропия — свойство фильтра (она в Q), форма её только включает
-        score = filt.score_distance2(dcx, dcy, _det_size(det), dt)
+        d2, logdet = filt.score_distance2(dcx, dcy, _det_size(det), dt)
+        score = d2 + logdet if form == FORM_MAHA_LL else d2
     else:
         score = _fallback_maha(det, pred_cx, pred_cy, pred_size, cfg)
 

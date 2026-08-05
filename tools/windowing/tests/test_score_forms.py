@@ -157,6 +157,33 @@ class TestDirectionTerm:
         s_b = candidate_score(back, f, px, py, SIZE, DT, c, velocity_ready=True)
         assert s_b > s_f
 
+    def test_penalty_is_decisive_when_the_reversal_is_closer(self):
+        """Смысл формы 3 целиком: кандидат ПОЗАДИ, но БЛИЖЕ к предсказанию,
+        обязан проиграть более далёкому, но идущему вперёд. Пока штраф не
+        решает исход, форма 3 неотличима от формы 1 — и именно это ловит
+        мутацию "штраф применяется ко всем формам, кроме своей"."""
+        f = moving_filter()
+        px, py = f.predict(DT)
+        plain = cfg(SCORE_FORM=FORM_MAHA)
+        # "позади" считается от ПОЗИЦИИ, а смещение должно превышать шум
+        # измерения, иначе штраф молчит по построению
+        near_back = det(f.cx - 0.5 * SIZE, f.cy)
+        s_back = candidate_score(near_back, f, px, py, SIZE, DT, plain)
+        # передний кандидат подбирается так, чтобы без штрафа он проигрывал,
+        # но проигрывал МЕНЬШЕ, чем весит полный разворот: иначе тест проверял
+        # бы не решающую роль штрафа, а его отсутствие
+        far_fwd = None
+        for k in range(10, 40):
+            cand = det(px + k / 10 * SIZE, py)
+            gap = candidate_score(cand, f, px, py, SIZE, DT, plain) - s_back
+            if 0 < gap < base_cfg.VDIR_MAHA_LAMBDA:
+                far_fwd = cand
+                break
+        assert far_fwd is not None, "не удалось построить решающий случай"
+        c3 = cfg(SCORE_FORM=FORM_MAHA_VDIR)
+        assert candidate_score(near_back, f, px, py, SIZE, DT, c3, velocity_ready=True) > \
+            candidate_score(far_fwd, f, px, py, SIZE, DT, c3, velocity_ready=True)
+
     def test_form_2_cannot_tell_forward_from_backward(self):
         """Содержательная суть сравнения форм 2 и 3: гауссова Q симметрична,
         поэтому анизотропия одинаково "разрешает" уход вперёд и назад.
@@ -216,3 +243,132 @@ def test_distance_form_is_plain_euclid():
     f = moving_filter()
     c = cfg(SCORE_FORM=FORM_DISTANCE)
     assert candidate_score(det(0.3, 0.4), f, 0.0, 0.0, SIZE, DT, c) == pytest.approx(0.5)
+
+
+class TestExactFormulas:
+    """Мутационный прогон показал, что сами формулы (а не только их знаки)
+    ничем не закреплены: деление менялось на умножение, а тесты проходили.
+    Здесь проверяются ТОЧНЫЕ значения — это единственный способ поймать
+    подмену внутри выражения."""
+
+    def test_direction_penalty_endpoints_and_middle(self):
+        """(1-cos)/2 * lambda: разворот стоит ровно lambda, ход вперёд — ноль,
+        поворот на 90 градусов — половину.
+
+        Позиция и скорость взяты НЕ нулевыми и НЕ единичными намеренно: при
+        prev=(0,0) вычитание неотличимо от сложения, а при |v|=1 деление на
+        модуль неотличимо от умножения — мутационный прогон это и показал.
+        """
+        c = cfg()
+        vel = (0.6, 0.8)                 # |v| = 1.0 по модулю, но обе оси заняты
+        vel = (1.2, 1.6)                 # ...и модуль не единичный
+        px, py = 0.3, -0.2               # предыдущая позиция не в нуле
+        big = 10 * SIZE
+        u = (big * 0.6, big * 0.8)       # вдоль скорости
+        from track_score import direction_penalty
+        fwd = direction_penalty(det(px + u[0], py + u[1]), px, py, vel, SIZE, DT, c)
+        back = direction_penalty(det(px - u[0], py - u[1]), px, py, vel, SIZE, DT, c)
+        side = direction_penalty(det(px - u[1], py + u[0]), px, py, vel, SIZE, DT, c)
+        assert fwd == pytest.approx(0.0, abs=1e-12)
+        assert back == pytest.approx(c.VDIR_MAHA_LAMBDA)
+        assert side == pytest.approx(c.VDIR_MAHA_LAMBDA / 2)
+
+    def test_fallback_maha_exact_value(self):
+        """Ветка alpha-beta: (d/sigma_pos)^2 + (|ln(s/s_pred)|/sigma_logh)^2."""
+        from track_filters import AlphaBetaFilter
+        from track_score import _fallback_maha
+        c = cfg()
+        f = AlphaBetaFilter(0.6, 0.3, c)
+        f.seed(0.0, 0.0)
+        d, ratio = 0.02, 2.0
+        got = _fallback_maha(det(d, 0.0, size=ratio * SIZE), 0.0, 0.0, SIZE, c)
+        want = (d / (c.KALMAN_R_POS_SIZE_FRAC * SIZE)) ** 2 \
+            + (math.log(ratio) / c.KALMAN_R_LOGH) ** 2
+        assert got == pytest.approx(want, rel=1e-12)
+
+    def test_fallback_is_symmetric_in_log_size(self):
+        """Вдвое крупнее и вдвое мельче штрафуются одинаково — это и значит
+        "в логарифме"."""
+        from track_filters import AlphaBetaFilter
+        from track_score import _fallback_maha
+        c = cfg()
+        big = _fallback_maha(det(0, 0, size=2 * SIZE), 0.0, 0.0, SIZE, c)
+        small = _fallback_maha(det(0, 0, size=SIZE / 2), 0.0, 0.0, SIZE, c)
+        assert big == pytest.approx(small)
+
+    def test_position_only_form_without_covariance_is_normalised_distance(self):
+        from track_filters import AlphaBetaFilter
+        c = cfg(SCORE_FORM=FORM_MAHA_POS)
+        f = AlphaBetaFilter(0.6, 0.3, c)
+        f.seed(0.0, 0.0)
+        d = 0.02
+        got = candidate_score(det(d, 0.0), f, 0.0, 0.0, SIZE, DT, c)
+        assert got == pytest.approx((d / (c.KALMAN_R_POS_SIZE_FRAC * SIZE)) ** 2, rel=1e-12)
+
+    def test_det_center_and_size_on_an_asymmetric_box(self):
+        from track_score import _det_center, _det_size
+        box = (1.0, 2.0, 4.0, 10.0, 0.5)
+        assert _det_center(box) == (2.5, 6.0)
+        assert _det_size(box) == 8.0     # max(w,h), как везде в проекте
+
+
+class TestFormDispatch:
+    def test_log_likelihood_form_adds_the_logdet_term(self):
+        """Форма maha_ll = d^2 + ln|S| (диагностическая). Если equality в
+        диспетчере испортить, она молча станет обычной maha."""
+        from track_score import FORM_MAHA_LL
+        f = moving_filter()
+        px, py = f.predict(DT)
+        d = det(px + 2 * SIZE, py)
+        plain = candidate_score(d, f, px, py, SIZE, DT, cfg(SCORE_FORM=FORM_MAHA))
+        ll = candidate_score(d, f, px, py, SIZE, DT, cfg(SCORE_FORM=FORM_MAHA_LL))
+        d2, logdet = f.score_distance2(*_center(d), _size(d), DT)
+        assert ll == pytest.approx(d2 + logdet)
+        assert ll != pytest.approx(plain)
+
+    def test_velocity_ready_defaults_to_off(self):
+        """По умолчанию оценки скорости нет — направленный член обязан
+        молчать, иначе он раздаёт штрафы по мусорной скорости первых тактов."""
+        f = moving_filter()
+        px, py = f.predict(DT)
+        back = det(f.cx - 3 * SIZE, f.cy)
+        c3 = cfg(SCORE_FORM=FORM_MAHA_VDIR)
+        assert candidate_score(back, f, px, py, SIZE, DT, c3) == \
+            pytest.approx(candidate_score(back, f, px, py, SIZE, DT, cfg(SCORE_FORM=FORM_MAHA)))
+
+
+def _center(d):
+    return ((d[0] + d[2]) / 2, (d[1] + d[3]) / 2)
+
+
+def _size(d):
+    return max(d[2] - d[0], d[3] - d[1])
+
+
+class TestScoreRejectsWrongSizeSymmetrically:
+    def test_predicted_size_sets_the_positional_tolerance(self):
+        """Допуск по положению берётся из ПРЕДСКАЗАННОГО размера, а не из
+        размера кандидата: иначе крупной рамке "позволено" отклоняться, и при
+        равном расстоянии кандидат вдвое крупнее получал бы МЕНЬШИЙ счёт —
+        то есть счёт поощрял бы ровно ту подмену, ради которой заведён."""
+        f = moving_filter()
+        c = cfg(SCORE_FORM=FORM_MAHA)
+        px, py = f.predict(DT)
+        d = 2 * SIZE
+        half = candidate_score(det(px + d, py, size=SIZE / 2), f, px, py, SIZE, DT, c)
+        right = candidate_score(det(px + d, py, size=SIZE), f, px, py, SIZE, DT, c)
+        double = candidate_score(det(px + d, py, size=2 * SIZE), f, px, py, SIZE, DT, c)
+        assert right < half and right < double
+        assert half == pytest.approx(double, rel=0.02), "штраф за размер несимметричен в логарифме"
+
+    def test_old_behaviour_preferred_the_bigger_box(self):
+        """Контроль на само исправление: со старым правилом (R по кандидату)
+        крупная рамка выигрывала. Без этого теста нельзя утверждать, что
+        исправление что-то изменило."""
+        c = cfg(SCORE_FORM=FORM_MAHA, MAHA_R_FROM_PREDICTED_SIZE=False)
+        f = moving_filter(c)
+        px, py = f.predict(DT)
+        d = 2 * SIZE
+        right = candidate_score(det(px + d, py, size=SIZE), f, px, py, SIZE, DT, c)
+        double = candidate_score(det(px + d, py, size=2 * SIZE), f, px, py, SIZE, DT, c)
+        assert double < right

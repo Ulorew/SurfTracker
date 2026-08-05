@@ -37,6 +37,15 @@ CONFIGS = {
     "A_kalman_gate":     ["--enable-a", "--filter-level", "2", "--enable-gate"],
     "A_kalman_gate_vdir": ["--enable-a", "--filter-level", "2", "--enable-gate",
                             "--enable-vdir"],
+    # Финалист тикета "счёт кандидата": форма 2 (анизотропный махаланобис) +
+    # теневые треки + демпфирование экстраполяции. Форма выбрана стендом, а не
+    # клипами: восемь исходов переобучаются мгновенно.
+    "finalist": ["--enable-a", "--filter-level", "2", "--enable-gate",
+                  "--score-form", "maha_aniso", "--shadows"],
+    # Разложение финалиста: что даёт каждая часть по отдельности.
+    "finalist_no_shadows": ["--enable-a", "--filter-level", "2", "--enable-gate",
+                             "--score-form", "maha_aniso"],
+    "shadows_only": ["--enable-a", "--filter-level", "2", "--enable-gate", "--shadows"],
 }
 
 # Метрики, попадающие в таблицу. Радиальный критерий — основной (тикет:
