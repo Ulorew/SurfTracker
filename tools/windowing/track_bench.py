@@ -96,14 +96,24 @@ def detect(target, t, rng, cfg):
 JUNK_TID = -1
 
 
+# Разброс размеров мусорной детекции, в долях размера цели. Логравномерно и
+# ШИРОКО: на реальных прогонах мусор — это блики, гребни и куски чужих
+# парусов, и их рамки в разы мельче цели (в логе клипа racing t159 — 11 px
+# против 67 px у цели). Прежний узкий диапазон 0.5-1.5 делал мусор
+# размерно-правдоподобным по построению и тем самым обесценивал третью
+# координату счёта: стенд мерил бы не свойство формы, а свойство генератора.
+JUNK_SIZE_RANGE = (0.15, 3.0)
+
+
 def junk_detections(rng, cfg, n, cx, cy, side, size):
     """Мусор детектора: низкая уверенность, случайное место в окне. Должен
     проходить сквозь петлю бесследно — в том числе НЕ рождать теневых."""
     out = []
+    lo, hi = (math.log(v) for v in JUNK_SIZE_RANGE)
     for _ in range(n):
         x = cx + rng.uniform(-side / 2, side / 2)
         y = cy + rng.uniform(-side / 2, side / 2)
-        s = size * rng.uniform(0.5, 1.5)
+        s = size * math.exp(rng.uniform(lo, hi))
         conf = rng.uniform(0.08, cfg.SHADOW_BIRTH_CONF - 0.05)
         out.append((x - s / 2, y - s / 2, x + s / 2, y + s / 2, conf, JUNK_TID))
     return out
