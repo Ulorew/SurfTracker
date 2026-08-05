@@ -30,3 +30,12 @@ __pycache__/
 *.mov
 *.avi
 *.webm
+.venv-export/
+
+# Экспорт: артефакты тяжёлые и воспроизводятся скриптами; в репозитории
+# остаются только манифесты и отчёты сверки
+export/testset/
+export/testset_big/
+export/phone_pack/
+export/models/*.tflite
+export/*.log
