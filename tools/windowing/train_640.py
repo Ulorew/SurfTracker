@@ -222,6 +222,11 @@ def main():
                      help="папка с исходными кадрами (*.jpg/*.json) для --online-crop")
     ap.add_argument("--online-variants-dir", default=None,
                      help="папка с офлайн-версиями от online_variants.py (variants_manifest.json)")
+    ap.add_argument("--size-bins-fracs", type=float, nargs="+", default=None,
+                     help="целевые доли корзин config.SIZE_BINS для ОНЛАЙН-семплера, "
+                          "по одному числу на корзину (напр. 0.4 0.3 0.2 0.1). Нормируются "
+                          "к сумме 1. Работает только с розыгрышем от корзины, при "
+                          "--legacy-sampler доли не участвуют вовсе")
     ap.add_argument("--size-bins-floor", type=float, default=None,
                      help="нижняя граница нижней корзины config.SIZE_BINS для ОНЛАЙН-семплера; "
                           "без этого floor из --data yaml до него не доходит (yaml используется "
@@ -235,6 +240,22 @@ def main():
 
     if args.online_crop and not (args.online_frames_dir and args.online_variants_dir):
         raise SystemExit("--online-crop требует --online-frames-dir и --online-variants-dir")
+
+    if args.size_bins_fracs is not None:
+        import config as _cfg
+        if len(args.size_bins_fracs) != len(_cfg.SIZE_BINS):
+            raise SystemExit(f"--size-bins-fracs: нужно {len(_cfg.SIZE_BINS)} чисел "
+                              f"(по одному на корзину), дано {len(args.size_bins_fracs)}")
+        if args.legacy_sampler:
+            raise SystemExit("--size-bins-fracs вместе с --legacy-sampler бессмысленен: "
+                              "при розыгрыше от бокса доли не участвуют вовсе")
+        total = sum(args.size_bins_fracs)
+        if total <= 0:
+            raise SystemExit("--size-bins-fracs: сумма долей должна быть положительной")
+        _cfg.SIZE_BINS = [(lo, hi, f / total)
+                          for (lo, hi, _old), f in zip(_cfg.SIZE_BINS, args.size_bins_fracs)]
+        print("SIZE_BINS доли -> " + ", ".join(f"{b[0]:g}-{b[1]:g}:{b[2]:.3f}"
+                                                for b in _cfg.SIZE_BINS))
 
     if args.size_bins_floor is not None:
         import config as _cfg
@@ -398,6 +419,7 @@ def main():
         "online_neg_ratio": args.online_neg_ratio if args.online_crop else None,
         "sampler": ("legacy_per_box" if args.legacy_sampler else "bin_first_weighted"),
         "size_bins_floor": args.size_bins_floor,
+        "size_bins_fracs": args.size_bins_fracs,
         "size_bins": [list(b) for b in __import__("config").SIZE_BINS],
         "ultralytics_args": ultralytics_args,
         "effective": effective,
