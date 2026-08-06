@@ -1,6 +1,7 @@
 package com.surftracker.camfps;
 
 import android.app.Activity;
+import android.graphics.Bitmap;
 import android.graphics.ImageFormat;
 import android.graphics.SurfaceTexture;
 import android.hardware.camera2.*;
@@ -73,7 +74,26 @@ public class MainActivity extends Activity {
             java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>());
     final java.util.Map<Integer, java.util.List<Double>> tickByMinute =
             java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>());
+    final java.util.Map<Integer, java.util.List<Double>> cropByMinute =
+            java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>());
+    final java.util.Map<Integer, Integer> yuvByMinute =
+            java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>());
+    final java.util.Map<Integer, String> envByMinute =
+            java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>());
     long runStartMs;
+    android.os.PowerManager.WakeLock wake;
+    /** Сегментация записи: файл никогда не растёт больше лимита. Переключение
+     *  через setNextOutputFile — оно бесшовное, в отличие от stop/start, где
+     *  сессия камеры пересобирается и дырка измеряется сотнями миллисекунд. */
+    File videoDir;
+    int segIndex = 0;
+    final java.util.List<String> segEvents = java.util.Collections.synchronizedList(new ArrayList<>());
+    final java.util.List<Long> segSwitchNs = java.util.Collections.synchronizedList(new ArrayList<>());
+    /** Контроль честности (урок дефекта 4): раз в минуту сохраняем ПАРУ
+     *  вход-выход — сам кроп картинкой и детекции по нему. Без этого нельзя
+     *  отличить работающий конвейер от гоняющего нулевой буфер. */
+    volatile int proofMinute = -1;
+    final java.util.List<String> proofs = java.util.Collections.synchronizedList(new ArrayList<>());
     /** Левый верхний угол кропа в координатах ПОЛНОГО YUV-кадра. Фиксированный:
      *  трекера в этом прогоне нет, а место кропа на время инференса не влияет —
      *  влияет только объём конвертации, и он от места не зависит. */
@@ -148,8 +168,30 @@ public class MainActivity extends Activity {
         // фонового приложения: контрольные прогоны отдавали ~9 с из 30 ВО ВСЕХ
         // конфигурациях, включая вариант без YUV, — то есть дело было не в
         // потоке, а в этом. Флаг ставится из UI-потока.
-        runOnUiThread(() -> getWindow().addFlags(
-                android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON));
+        // Экран обязан остаться включённым: MIUI отбирает камеру у фонового
+        // приложения (в логе Camera2ClientBase "start to disconnect" +
+        // MIUISafety-Monitor op:26 active:false), и прогон обрывается на
+        // первой же минуте. Настройка "не выключать экран при отладке"
+        // действует ТОЛЬКО при зарядке, поэтому от батареи нужна своя защита.
+        // Три независимых способа: реальный content view (флаг окна без него
+        // ненадёжен), сам флаг и wake lock.
+        runOnUiThread(() -> {
+            android.widget.TextView tv = new android.widget.TextView(this);
+            tv.setText("прогон идёт");
+            setContentView(tv);
+            getWindow().addFlags(
+                    android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                    | android.view.WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                    | android.view.WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED);
+        });
+        try {
+            android.os.PowerManager pm = getSystemService(android.os.PowerManager.class);
+            wake = pm.newWakeLock(android.os.PowerManager.SCREEN_BRIGHT_WAKE_LOCK
+                    | android.os.PowerManager.ACQUIRE_CAUSES_WAKEUP, "camfps:run");
+            wake.acquire(40 * 60 * 1000L);
+        } catch (Throwable t) {
+            Log.e(TAG, "wake lock: " + t);
+        }
         File dir = getExternalFilesDir(null);
         String combo = getIntent().getStringExtra("combo");
         if (combo == null) combo = "priv1080+rec4k+yuvmax";
@@ -168,8 +210,10 @@ public class MainActivity extends Activity {
             cropY = (yuvMax.getHeight() - 640) / 2;
             Size jpegMax = biggest(map.getOutputSizes(ImageFormat.JPEG));
 
-            File video = new File(dir, "rec_" + combo + ".mp4");
-            if (video.exists()) video.delete();
+            videoDir = new File(dir, "rec_" + combo);
+            if (videoDir.isDirectory()) for (File f : videoDir.listFiles()) f.delete();
+            videoDir.mkdirs();
+            File video = new File(videoDir, "seg_0.mp4");
 
             List<Surface> targets = new ArrayList<>();
             previewTexture = new SurfaceTexture(0);
@@ -195,12 +239,34 @@ public class MainActivity extends Activity {
             rec.setVideoSize(prof.videoFrameWidth, prof.videoFrameHeight);
             rec.setVideoFrameRate(prof.videoFrameRate);
             rec.setVideoEncodingBitRate(prof.videoBitRate);
+            long segBytes = getIntent().getLongExtra("segment_bytes", 0L);
+            if (segBytes > 0) rec.setMaxFileSize(segBytes);
             // Без этих слушателей отказ записи выглядит как "камера отдала мало
             // кадров": когда MediaRecorder перестаёт разбирать буферы, встаёт
             // ВЕСЬ конвейер, включая другие потоки. Именно так и вышло: во всех
             // конфигурациях приходило ~9 с из 30-60, и виноват был не YUV.
-            rec.setOnInfoListener((mr, what, extra) ->
-                    Log.w(TAG, "MediaRecorder info what=" + what + " extra=" + extra));
+            rec.setOnInfoListener((mr, what, extra) -> {
+                Log.w(TAG, "MediaRecorder info what=" + what + " extra=" + extra);
+                try {
+                    if (what == MediaRecorder.MEDIA_RECORDER_INFO_MAX_FILESIZE_APPROACHING) {
+                        // готовим СЛЕДУЮЩИЙ файл заранее: рекордер переключится
+                        // на него сам, не останавливаясь
+                        File nf = new File(videoDir, "seg_" + (++segIndex) + ".mp4");
+                        mr.setNextOutputFile(nf);
+                        segEvents.add(String.format(java.util.Locale.US,
+                                "{\"t_s\": %.1f, \"событие\": \"подготовлен\", \"файл\": \"%s\"}",
+                                (System.currentTimeMillis() - runStartMs) / 1000.0, nf.getName()));
+                    } else if (what == MediaRecorder.MEDIA_RECORDER_INFO_NEXT_OUTPUT_FILE_STARTED) {
+                        segSwitchNs.add(System.nanoTime());
+                        segEvents.add(String.format(java.util.Locale.US,
+                                "{\"t_s\": %.1f, \"событие\": \"переключение\"}",
+                                (System.currentTimeMillis() - runStartMs) / 1000.0));
+                    }
+                } catch (Throwable t) {
+                    Log.e(TAG, "переключение сегмента: " + t);
+                    segEvents.add("{\"ошибка\": \"" + t + "\"}");
+                }
+            });
             rec.setOnErrorListener((mr, what, extra) ->
                     Log.e(TAG, "MediaRecorder ОШИБКА what=" + what + " extra=" + extra));
             rec.prepare();
@@ -305,8 +371,17 @@ public class MainActivity extends Activity {
                             lat.add(infMs);
                             tickMs.add(tickFull);
                             int min = (int) ((System.currentTimeMillis() - runStartMs) / 60000);
+                            if (min != proofMinute) {
+                                proofMinute = min;
+                                saveProof(min, bin, o2);
+                                envByMinute.put(min, env());
+                            }
                             byMinute.computeIfAbsent(min, k ->
                                     java.util.Collections.synchronizedList(new ArrayList<>())).add(infMs);
+                            cropByMinute.computeIfAbsent(min, k ->
+                                    java.util.Collections.synchronizedList(new ArrayList<>()))
+                                    .add(cropMs.isEmpty() ? 0.0 : cropMs.get(cropMs.size() - 1));
+                            yuvByMinute.merge(min, 1, Integer::sum);
                             tickByMinute.computeIfAbsent(min, k ->
                                     java.util.Collections.synchronizedList(new ArrayList<>())).add(tickFull);
                         }
@@ -384,10 +459,14 @@ public class MainActivity extends Activity {
                     double[] mi = arr(byMinute.get(m)), mt = arr(tickByMinute.get(m));
                     if (!f1) pm.append(",\n");
                     f1 = false;
+                    double[] mc = arr(cropByMinute.getOrDefault(m, new ArrayList<>()));
                     pm.append(String.format(java.util.Locale.US,
                             "    {\"минута\": %d, \"кадров\": %d, \"инференс_p50\": %.1f, "
-                            + "\"инференс_p95\": %.1f, \"такт_p50\": %.1f, \"такт_p95\": %.1f}",
-                            m + 1, mi.length, pct(mi, 50), pct(mi, 95), pct(mt, 50), pct(mt, 95)));
+                            + "\"инференс_p95\": %.1f, \"такт_p50\": %.1f, \"такт_p95\": %.1f, "
+                            + "\"кроп_p50\": %.1f, \"кроп_p95\": %.1f, \"yuv_кадров\": %d, %s}",
+                            m + 1, mi.length, pct(mi, 50), pct(mi, 95), pct(mt, 50), pct(mt, 95),
+                            pct(mc, 50), pct(mc, 95), yuvByMinute.getOrDefault(m, 0),
+                            envByMinute.getOrDefault(m, "\"температура\": null")));
                 }
                 double[] ta = arr(tickMs);
                 pm.append(String.format(java.util.Locale.US,
@@ -397,6 +476,10 @@ public class MainActivity extends Activity {
                         ta.length, pct(a, 50), pct(a, 95), pct(ta, 50), pct(ta, 95),
                         pct(cms, 50), pct(cms, 95),
                         Float.isNaN(hr) ? "null" : String.format(java.util.Locale.US, "%.3f", hr)));
+                pm.setLength(pm.length() - 2);   // убираем закрывающую скобку объекта
+                pm.append(",\n  \"сегменты\": [\n    ").append(String.join(",\n    ", segEvents))
+                  .append("\n  ],\n  \"честность\": [\n    ").append(String.join(",\n    ", proofs))
+                  .append("\n  ]\n}\n");
                 try (FileWriter w2 = new FileWriter(new File(dir, "infer_" + combo + ".json"))) {
                     w2.write(pm.toString());
                 }
@@ -412,7 +495,78 @@ public class MainActivity extends Activity {
         try (FileWriter w = new FileWriter(new File(dir, "camfps_" + combo + ".json"))) {
             w.write(j.toString());
         } catch (Exception ignored) { }
+        try { if (wake != null && wake.isHeld()) wake.release(); } catch (Throwable ignored) { }
         finish();
+    }
+
+    /**
+     * Контроль честности замера (урок дефекта 4: в первом худшем случае поток
+     * инференса гонял НУЛЕВОЙ буфер и ни разу не читал камеру, а числа
+     * выглядели правдоподобно).
+     *
+     * Раз в минуту сохраняем ПАРУ: сам вход картинкой (из того же буфера,
+     * который ушёл в сеть, а не из нового кадра) и детекции по нему. Если
+     * вход окажется нулевым — это будет видно чёрным квадратом, а не
+     * останется догадкой.
+     */
+    void saveProof(int minute, java.nio.ByteBuffer in, float[][][] out) {
+        try {
+            final int S = 640, PLANE = S * S;
+            int[] px = new int[PLANE];
+            double sum = 0;
+            for (int i = 0; i < PLANE; i++) {
+                int r = (int) (in.getFloat(i * 4) * 255);
+                int g = (int) (in.getFloat((PLANE + i) * 4) * 255);
+                int b = (int) (in.getFloat((2 * PLANE + i) * 4) * 255);
+                sum += r + g + b;
+                px[i] = 0xFF000000 | (clamp(r) << 16) | (clamp(g) << 8) | clamp(b);
+            }
+            Bitmap bmp = Bitmap.createBitmap(px, S, S, Bitmap.Config.ARGB_8888);
+            File f = new File(getExternalFilesDir(null), "proof_min" + (minute + 1) + ".png");
+            try (java.io.FileOutputStream os = new java.io.FileOutputStream(f)) {
+                bmp.compress(Bitmap.CompressFormat.PNG, 100, os);
+            }
+            StringBuilder d = new StringBuilder("[");
+            int n = 0;
+            for (int a = 0; a < 8400 && n < 8; a++) {
+                float conf = out[0][4][a];
+                if (conf < 0.25f) continue;
+                if (n++ > 0) d.append(", ");
+                d.append(String.format(java.util.Locale.US, "[%.1f, %.1f, %.1f, %.1f, %.3f]",
+                        out[0][0][a] * S, out[0][1][a] * S, out[0][2][a] * S, out[0][3][a] * S, conf));
+            }
+            int total = 0;
+            for (int a = 0; a < 8400; a++) if (out[0][4][a] >= 0.25f) total++;
+            d.append("]");
+            proofs.add(String.format(java.util.Locale.US,
+                    "{\"минута\": %d, \"среднее_значение_входа\": %.1f, \"детекций_conf025\": %d, "
+                    + "\"первые\": %s, \"файл\": \"%s\"}",
+                    minute + 1, sum / (3.0 * PLANE), total, d, f.getName()));
+        } catch (Throwable t) {
+            proofs.add("{\"минута\": " + (minute + 1) + ", \"ошибка\": \"" + t + "\"}");
+        }
+    }
+
+    static int clamp(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
+
+    /** Температура батареи, заряд и headroom — снимаются изнутри приложения,
+     *  чтобы попасть в тот же поминутный лог, что и скорость. */
+    String env() {
+        float temp = Float.NaN, hr = Float.NaN;
+        int lvl = -1, status = -1;
+        try {
+            android.content.Intent bi = registerReceiver(null,
+                    new android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED));
+            if (bi != null) {
+                temp = bi.getIntExtra(android.os.BatteryManager.EXTRA_TEMPERATURE, -1) / 10.0f;
+                lvl = bi.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1);
+                status = bi.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1);
+            }
+            hr = getSystemService(android.os.PowerManager.class).getThermalHeadroom(60);
+        } catch (Throwable ignored) { }
+        return String.format(java.util.Locale.US,
+                "\"температура\": %.1f, \"заряд\": %d, \"питание\": %d, \"headroom\": %s",
+                temp, lvl, status, Float.isNaN(hr) ? "null" : String.format(java.util.Locale.US, "%.3f", hr));
     }
 
     static double[] arr(java.util.List<Double> l) {
