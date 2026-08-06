@@ -50,6 +50,22 @@ public class MainActivity extends Activity {
         super.onCreate(b);
         bg = new HandlerThread("probe"); bg.start();
         handler = new Handler(bg.getLooper());
+        // pm grant заблокирован HyperOS (shell без GRANT_RUNTIME_PERMISSIONS),
+        // поэтому разрешение запрашивается самим приложением: один тап, дальше
+        // оно сохраняется и все последующие прогоны идут без участия человека.
+        if (checkSelfPermission(android.Manifest.permission.CAMERA)
+                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            Log.i(TAG, "ЖДУ РАЗРЕШЕНИЯ CAMERA — нужен тап на устройстве");
+            requestPermissions(new String[]{android.Manifest.permission.CAMERA}, 1);
+        } else {
+            new Thread(this::run).start();
+        }
+    }
+
+    @Override public void onRequestPermissionsResult(int code, String[] perms, int[] grants) {
+        boolean ok = grants.length > 0
+                && grants[0] == android.content.pm.PackageManager.PERMISSION_GRANTED;
+        Log.i(TAG, "разрешение CAMERA: " + (ok ? "выдано" : "ОТКАЗАНО"));
         new Thread(this::run).start();
     }
 

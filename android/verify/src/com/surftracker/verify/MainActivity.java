@@ -44,6 +44,9 @@ public class MainActivity extends Activity {
     void run() {
         File dir = getExternalFilesDir(null);
         try {
+            String mode = getIntent().getStringExtra("mode");
+            if ("bench".equals(mode)) { bench(dir); return; }
+            if ("thermal".equals(mode)) { thermal(dir); return; }
             String modelName = getIntent().getStringExtra("model");
             if (modelName == null) modelName = "surf_w8a32.tflite";
             int threads = getIntent().getIntExtra("threads", 1);
@@ -143,6 +146,162 @@ public class MainActivity extends Activity {
                 w.write(String.valueOf(t));
             } catch (Exception ignored) { }
         }
+        finish();
+    }
+
+    /**
+     * Пункт 2 тикета: скорость. Бенчмарк живёт ВНУТРИ приложения, а не запускается
+     * adb-бинарём, — именно этого требует тикет: планировщик Android душит
+     * фоновые процессы, и на многопоточном CPU разница видна.
+     *
+     * Меряется чистый interp.run() на одном и том же кадре: препроцессинг и
+     * декод PNG в бюджет инференса не входят и мерились бы иначе.
+     */
+    void bench(File dir) throws Exception {
+        String modelName = getIntent().getStringExtra("model");
+        if (modelName == null) modelName = "surf_w8a32.tflite";
+        int threads = getIntent().getIntExtra("threads", 1);
+        boolean xnn = !"0".equals(getIntent().getStringExtra("xnnpack"));
+        int warmup = getIntent().getIntExtra("warmup", 30);
+        int runs = getIntent().getIntExtra("runs", 200);
+
+        Interpreter.Options opts = new Interpreter.Options();
+        opts.setNumThreads(threads);
+        String xnnNote;
+        try {
+            Interpreter.Options.class.getMethod("setUseXNNPACK", boolean.class).invoke(opts, xnn);
+            xnnNote = String.valueOf(xnn);
+        } catch (Throwable t) {
+            xnnNote = "флага нет, по умолчанию";
+        }
+        Interpreter interp = new Interpreter(new File(dir, modelName), opts);
+
+        File[] files = new File(dir, "frames").listFiles((d, n) -> n.toLowerCase().endsWith(".png"));
+        Arrays.sort(files);
+        Bitmap bmp = BitmapFactory.decodeFile(files[0].getAbsolutePath());
+        int[] px = new int[SIDE * SIDE];
+        bmp.getPixels(px, 0, SIDE, 0, 0, SIDE, SIDE);
+        ByteBuffer in = ByteBuffer.allocateDirect(4 * 3 * SIDE * SIDE).order(ByteOrder.nativeOrder());
+        for (int c = 0; c < 3; c++) {
+            int shift = c == 0 ? 16 : (c == 1 ? 8 : 0);
+            for (int i = 0; i < px.length; i++) in.putFloat(((px[i] >> shift) & 0xFF) / 255.0f);
+        }
+        float[][][] out = new float[1][ROWS][ANCHORS];
+
+        for (int i = 0; i < warmup; i++) { in.rewind(); interp.run(in, out); }
+
+        long[] ns = new long[runs];
+        for (int i = 0; i < runs; i++) {
+            in.rewind();
+            long t0 = System.nanoTime();
+            interp.run(in, out);
+            ns[i] = System.nanoTime() - t0;
+        }
+        interp.close();
+        long[] sorted = ns.clone();
+        Arrays.sort(sorted);
+        double p50 = sorted[(int) (0.50 * (runs - 1))] / 1e6;
+        double p95 = sorted[(int) (0.95 * (runs - 1))] / 1e6;
+        double p99 = sorted[(int) (0.99 * (runs - 1))] / 1e6;
+        double mn = sorted[0] / 1e6, mx = sorted[runs - 1] / 1e6;
+        double mean = 0; for (long v : ns) mean += v / 1e6 / runs;
+
+        String json = String.format(java.util.Locale.US,
+                "{\"model\": \"%s\", \"threads\": %d, \"xnnpack\": \"%s\", "
+                + "\"warmup\": %d, \"runs\": %d, \"p50_ms\": %.3f, \"p95_ms\": %.3f, "
+                + "\"p99_ms\": %.3f, \"min_ms\": %.3f, \"max_ms\": %.3f, \"mean_ms\": %.3f}\n",
+                modelName, threads, xnnNote, warmup, runs, p50, p95, p99, mn, mx, mean);
+        try (FileWriter w = new FileWriter(new File(dir, "bench_t" + threads + ".json"))) {
+            w.write(json);
+        }
+        Log.i(TAG, "БЕНЧ " + json.trim());
+        finish();
+    }
+
+    /**
+     * Пункт 3: тепло. Непрерывный инференс, кривая задержки по минутам,
+     * getThermalHeadroom раз в 2 с, заряд в лог.
+     *
+     * Первая минута в отчёт не входит (прогрев) — но пишется, чтобы было
+     * видно, с чего начиналось. NaN у headroom проверяется явно: MediaTek
+     * может не отдавать его вовсе, и молча получить "нет данных" вместо
+     * "перегрева нет" — худший исход.
+     */
+    void thermal(File dir) throws Exception {
+        int minutes = getIntent().getIntExtra("minutes", 15);
+        int threads = getIntent().getIntExtra("threads", 1);
+        String modelName = getIntent().getStringExtra("model");
+        if (modelName == null) modelName = "surf_w8a32.tflite";
+
+        getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
+        Interpreter.Options opts = new Interpreter.Options();
+        opts.setNumThreads(threads);
+        Interpreter interp = new Interpreter(new File(dir, modelName), opts);
+
+        File[] files = new File(dir, "frames").listFiles((d, n) -> n.toLowerCase().endsWith(".png"));
+        Arrays.sort(files);
+        Bitmap bmp = BitmapFactory.decodeFile(files[0].getAbsolutePath());
+        int[] px = new int[SIDE * SIDE];
+        bmp.getPixels(px, 0, SIDE, 0, 0, SIDE, SIDE);
+        ByteBuffer in = ByteBuffer.allocateDirect(4 * 3 * SIDE * SIDE).order(ByteOrder.nativeOrder());
+        for (int c = 0; c < 3; c++) {
+            int shift = c == 0 ? 16 : (c == 1 ? 8 : 0);
+            for (int i = 0; i < px.length; i++) in.putFloat(((px[i] >> shift) & 0xFF) / 255.0f);
+        }
+        float[][][] out = new float[1][ROWS][ANCHORS];
+
+        android.os.PowerManager pm = getSystemService(android.os.PowerManager.class);
+        android.os.BatteryManager bm = getSystemService(android.os.BatteryManager.class);
+
+        StringBuilder j = new StringBuilder("{\n  \"minutes\": " + minutes
+                + ", \"threads\": " + threads + ",\n  \"samples\": [\n");
+        long t_end = System.currentTimeMillis() + minutes * 60_000L;
+        long nextSample = System.currentTimeMillis();
+        java.util.ArrayList<Double> bucket = new java.util.ArrayList<>();
+        int minute = 0;
+        boolean firstRow = true;
+        long minuteEnd = System.currentTimeMillis() + 60_000L;
+
+        while (System.currentTimeMillis() < t_end) {
+            in.rewind();
+            long t0 = System.nanoTime();
+            interp.run(in, out);
+            bucket.add((System.nanoTime() - t0) / 1e6);
+
+            long now = System.currentTimeMillis();
+            if (now >= nextSample) {
+                nextSample = now + 2000;
+                float hr = Float.NaN;
+                try { hr = pm.getThermalHeadroom(60); } catch (Throwable ignored) { }
+                int lvl = -1;
+                try { lvl = bm.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY); }
+                catch (Throwable ignored) { }
+                if (!firstRow) j.append(",\n");
+                firstRow = false;
+                j.append(String.format(java.util.Locale.US,
+                        "    {\"t_s\": %d, \"headroom\": %s, \"battery\": %d, \"status\": %d}",
+                        (minutes * 60 - (t_end - now) / 1000), Float.isNaN(hr) ? "null" : String.format(java.util.Locale.US, "%.4f", hr),
+                        lvl, pm.getCurrentThermalStatus()));
+            }
+            if (now >= minuteEnd) {
+                minuteEnd = now + 60_000L;
+                double[] a = new double[bucket.size()];
+                for (int i = 0; i < a.length; i++) a[i] = bucket.get(i);
+                Arrays.sort(a);
+                Log.i(TAG, String.format(java.util.Locale.US,
+                        "ТЕПЛО минута %d: прогонов %d p50 %.1f p95 %.1f",
+                        ++minute, a.length, a[a.length / 2], a[(int) (0.95 * (a.length - 1))]));
+                j.append(String.format(java.util.Locale.US,
+                        ",\n    {\"minute\": %d, \"runs\": %d, \"p50_ms\": %.2f, \"p95_ms\": %.2f}",
+                        minute, a.length, a[a.length / 2], a[(int) (0.95 * (a.length - 1))]));
+                bucket.clear();
+            }
+        }
+        interp.close();
+        j.append("\n  ]\n}\n");
+        try (FileWriter w = new FileWriter(new File(dir, "thermal.json"))) { w.write(j.toString()); }
+        Log.i(TAG, "ТЕПЛО ГОТОВО");
         finish();
     }
 
