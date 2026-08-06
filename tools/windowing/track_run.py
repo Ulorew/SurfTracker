@@ -205,6 +205,11 @@ def main():
                           "(см. track_score.py); махаланобисовы требуют --filter-level 2")
     ap.add_argument("--shadows", action="store_true",
                      help="теневые треки: чужие детекции заняты и не притягивают цель")
+    ap.add_argument("--size-veto-ratio", type=float, default=None,
+                     help="порог вето механизма А по отношению размеров (умолчание 1.8)")
+    ap.add_argument("--shadow-birth-needs-pick", action="store_true",
+                     help="не заводить теневых на такте без принятого кандидата "
+                          "(правка ловушки закрепления ошибки)")
     ap.add_argument("--size-lambda", type=float, default=None,
                      help="вес размерного слагаемого механизма А; 0 оставляет только вето "
                           "(на стенде вето несёт всю пользу, а слагаемое шумит)")
@@ -233,7 +238,11 @@ def main():
     tcfg.ENABLE_VELOCITY_DIRECTION = args.enable_vdir
     if args.size_lambda is not None:
         tcfg.SIZE_LAMBDA = args.size_lambda
+    if args.size_veto_ratio is not None:
+        tcfg.SIZE_VETO_RATIO = args.size_veto_ratio
     tcfg.ENABLE_SHADOW_TRACKS = args.shadows
+    if args.shadow_birth_needs_pick:
+        tcfg.SHADOW_BIRTH_REQUIRES_PICK = True
     if args.score_form:
         from track_score import ALL_FORMS, FORM_DISTANCE
         if args.score_form not in ALL_FORMS:

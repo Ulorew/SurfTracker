@@ -33,19 +33,19 @@ def load(paths):
 
 
 def cell(res):
+    """Ячейка честной линейки: на цели / подмена / отказ, знаменатель один.
+
+    Три числа, а не одно: конфигурация, которая перестала вести цель,
+    прежней метрикой получала за это премию (racing t322 входил как 1.000,
+    посчитанная по 6 тактам из 30). Отказ и подмена для камеры —
+    противоположные исходы, и в одной колонке им не место.
+    """
     if res is None or "error" in res:
         return "—"
-    v = res.get("on_target_fraction")
+    v = res.get("on_target_all")
     if v is None:
         return "нет истины"
-    trans = res.get("n_losses", 0) + res.get("n_reacquisitions", 0)
-    swaps = res.get("n_target_swaps_auto", 0)
-    marks = []
-    if swaps:
-        marks.append(f"п{swaps}")
-    if trans:
-        marks.append(f"пер{trans}")
-    return f"{v:.2f}" + (" " + "/".join(marks) if marks else "")
+    return f"{v:.2f} / {res.get('swap_all', 0):.2f} / {res.get('refuse_all', 0):.2f}"
 
 
 def main():
@@ -55,8 +55,11 @@ def main():
     hzs = sorted({float(k.split("|")[1]) for k in results})
 
     print(f"Веса: `{meta['weights'].split('/')[-1]}` (один детектор во всех строках)\n")
-    print("В ячейке: доля тактов на цели (радиальный критерий); "
-          "`пN` — автоподмены, `перN` — потери+повторные захваты.\n")
+    print("В ячейке: **на цели / подмена / отказ** — доли ВСЕХ размеченных "
+          "тактов (сумма = 1). Радиальный критерий.\n")
+    print("Отказ и подмена разведены намеренно: для камеры это противоположные "
+          "исходы. Отказ — камера стоит, цель, скорее всего, ещё в кадре. "
+          "Подмена — камера уехала за чужим.\n")
 
     for hz in hzs:
         print(f"\n### Такт {hz:g} Гц\n")
@@ -68,9 +71,9 @@ def main():
                 row.append(cell(results.get(f"{c}|{hz:g}|{clip}")))
             print("| " + " | ".join(row) + " |")
 
-        avg = ["**среднее**"]
+        avg = ["**среднее на цели**"]
         for c in configs:
-            vals = [results[f"{c}|{hz:g}|{clip}"].get("on_target_fraction")
+            vals = [results[f"{c}|{hz:g}|{clip}"].get("on_target_all")
                     for clip in clips
                     if f"{c}|{hz:g}|{clip}" in results
                     and "error" not in results[f"{c}|{hz:g}|{clip}"]]
@@ -78,14 +81,25 @@ def main():
             avg.append(f"**{sum(vals) / len(vals):.3f}**" if vals else "—")
         print("| " + " | ".join(avg) + " |")
 
-        tot = ["всего подмен/переходов"]
+        for label, key in (("**среднее подмена**", "swap_all"),
+                            ("**среднее отказ**", "refuse_all"),
+                            ("**среднее ведение**", "lead_fraction")):
+            row = [label]
+            for c in configs:
+                vals = [results[f"{c}|{hz:g}|{clip}"].get(key) for clip in clips
+                        if f"{c}|{hz:g}|{clip}" in results
+                        and "error" not in results[f"{c}|{hz:g}|{clip}"]]
+                vals = [v for v in vals if v is not None]
+                row.append(f"**{sum(vals) / len(vals):.3f}**" if vals else "—")
+            print("| " + " | ".join(row) + " |")
+
+        tot = ["тактов: на цели / подмена / отказ"]
         for c in configs:
             rs = [results[k] for k in results
                   if k.startswith(f"{c}|{hz:g}|") and "error" not in results[k]]
-            sw = sum(r.get("n_target_swaps_auto", 0) or 0 for r in rs)
-            tr = sum((r.get("n_losses", 0) or 0) + (r.get("n_reacquisitions", 0) or 0)
-                     for r in rs)
-            tot.append(f"{sw} / {tr}")
+            tot.append(f"{sum(r.get('n_hit', 0) or 0 for r in rs)} / "
+                       f"{sum(r.get('n_swap', 0) or 0 for r in rs)} / "
+                       f"{sum(r.get('n_refuse', 0) or 0 for r in rs)}")
         print("| " + " | ".join(tot) + " |")
 
     # Гейт против фиксированного радиуса

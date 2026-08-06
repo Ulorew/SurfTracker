@@ -158,6 +158,14 @@ class ShadowSet:
 
         self.tracks = [t for t in self.tracks if t.misses < self.cfg.SHADOW_MAX_MISSES]
 
+        if chosen is None and getattr(self.cfg, "SHADOW_BIRTH_REQUIRES_PICK", False):
+            # Такт без принятого кандидата — тот, где мы не знаем, кто цель.
+            # Рождение здесь и есть первый шаг ловушки закрепления: истинная
+            # детекция заводит свой теневой и оказывается заперта правилом
+            # 0.7 навсегда. Существующие теневые при этом ЖИВУТ дальше —
+            # снимается только рождение.
+            return
+
         for j, d in enumerate(free):
             if j in used or _det_conf(d) < self.cfg.SHADOW_BIRTH_CONF:
                 continue

@@ -68,12 +68,30 @@ CONFIGS = {
     # окна и забивает позиционный член.
     "prod_veto_only": ["--enable-a", "--size-lambda", "0", "--filter-level", "2",
                         "--enable-gate", "--shadows", "--score-form", "distance"],
+    # Пересчёт на честной линейке (после валидации). Каждая строка отличается
+    # от prod_frozen ровно одним решением.
+    "prod_veto15": ["--enable-a", "--size-lambda", "0", "--size-veto-ratio", "1.5",
+                     "--filter-level", "2", "--enable-gate", "--shadows",
+                     "--score-form", "distance"],
+    "prod_no_shadows": ["--enable-a", "--filter-level", "2", "--enable-gate",
+                         "--score-form", "distance"],
+    "prod_birthguard": ["--enable-a", "--filter-level", "2", "--enable-gate",
+                         "--shadows", "--shadow-birth-needs-pick",
+                         "--score-form", "distance"],
+    "prod_birthguard_noA": ["--filter-level", "2", "--enable-gate", "--shadows",
+                             "--shadow-birth-needs-pick", "--score-form", "distance"],
+    "prod_maha": ["--enable-a", "--filter-level", "2", "--enable-gate", "--shadows",
+                   "--score-form", "maha"],
 }
 
 # Метрики, попадающие в таблицу. Радиальный критерий — основной (тикет:
 # "в отчёте только радиальный"), осевой остаётся в json прогона.
-METRICS = ["on_target_fraction", "in_window_fraction_radial", "n_target_swaps_auto",
-           "n_losses", "n_reacquisitions", "miss_streak_max", "margin_frac_p50"]
+# Честная линейка: знаменатель всегда все GT-такты, отказ и подмена —
+# РАЗНЫЕ колонки (для камеры это противоположные исходы: отказ — стоит на
+# месте, подмена — уехала за чужим).
+METRICS = ["on_target_all", "swap_all", "refuse_all", "lead_fraction",
+           "in_window_fraction_radial", "n_losses", "n_reacquisitions",
+           "miss_streak_max", "margin_frac_p50"]
 
 
 def clips():
@@ -143,8 +161,12 @@ def main():
                 res = run_one(args.python, args.weights, clip, cfg_name, hz,
                                args.out_dir, args.imgsz)
                 summary["results"][key] = res
-                flag = "ОШИБКА" if "error" in res else \
-                    f"на цели {res.get('on_target_fraction')}"
+                if "error" in res:
+                    flag = "ОШИБКА"
+                else:
+                    flag = (f"на цели {res.get('on_target_all')}"
+                            f"  подмена {res.get('swap_all')}"
+                            f"  отказ {res.get('refuse_all')}")
                 print(f"[{done}/{total}] {key}: {flag}", flush=True)
                 # пишем на каждом шаге: прогон длинный, обрыв не должен
                 # стоить всей уже сделанной работы

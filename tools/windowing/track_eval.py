@@ -363,14 +363,41 @@ def compute_metrics(rows, gt_track):
 
     graded = [f for f in on_target_flags if f is not None]
 
+    # --- честная линейка: три ВЗАИМОИСКЛЮЧАЮЩИХ исхода на каждый GT-такт ----
+    #
+    # Прежняя on_target_fraction считалась только по тактам, где петля
+    # кого-то ВЫБРАЛА, то есть знаменатель зависел от поведения оцениваемого:
+    # конфигурация, переставшая вести цель, получала за это премию. На
+    # racing t322 это дало 1.000, посчитанную по 6 тактам из 30 — молчание,
+    # засчитанное за ответ. Метрика оставлена ради сравнимости со старыми
+    # прогонами, но помечена и не должна использоваться для решений.
+    #
+    # Отказ и подмена разведены в РАЗНЫЕ колонки: для камеры это
+    # противоположные исходы. Отказ — камера стоит на месте (цель, скорее
+    # всего, всё ещё в кадре). Подмена — камера уехала за чужим (цель
+    # потеряна и, вероятно, безвозвратно).
+    n_gt = len(on_target_flags)
+    n_hit = sum(1 for f in on_target_flags if f is True)
+    n_swap = sum(1 for f in on_target_flags if f is False)
+    n_refuse = sum(1 for f in on_target_flags if f is None)
+    assert n_hit + n_swap + n_refuse == n_gt, "исходы обязаны разбивать все GT-такты"
+
     return {
         "n_ticks": n_ticks,
         "n_gt_ticks": len(pred_axis),
+        # --- честная линейка (знаменатель ВСЕГДА все GT-такты) ---
+        "on_target_all": (n_hit / n_gt) if n_gt else None,
+        "swap_all": (n_swap / n_gt) if n_gt else None,
+        "refuse_all": (n_refuse / n_gt) if n_gt else None,
+        "lead_fraction": ((n_hit + n_swap) / n_gt) if n_gt else None,
+        "n_hit": n_hit, "n_swap": n_swap, "n_refuse": n_refuse,
         # основная метрика тикета, обе формулировки критерия
         "in_window_fraction": (sum(pred_axis) / len(pred_axis)) if pred_axis else None,
         "in_window_fraction_radial": (sum(pred_radial) / len(pred_radial)) if pred_radial else None,
-        # ведём ли ту цель вообще (подмена)
-        "on_target_fraction": (sum(graded) / len(graded)) if graded else None,
+        # ПРЕЖНЯЯ метрика с плавающим знаменателем — только для сравнимости
+        # со старыми прогонами, для решений не использовать
+        "on_target_fraction_LEGACY_floating_denominator":
+            (sum(graded) / len(graded)) if graded else None,
         "n_target_swaps_auto": count_swap_runs(on_target_flags) if graded else None,
         "n_target_swaps": None,  # ручной счётчик по визуализации, тикет п.5
         "miss_streak_median": statistics.median(streaks) if streaks else 0,
@@ -380,6 +407,9 @@ def compute_metrics(rows, gt_track):
         "margin_frac_p50": pctl(margins, 50),
         "margin_frac_p95": pctl(margins, 95),
         "n_margin_samples": len(margins),
+        # Снимок конфигурации в САМ артефакт (регламент): без него метрика,
+        # посчитанная на другом дереве, неотличима от посчитанной на этом.
+        "config": {k: getattr(tcfg, k) for k in dir(tcfg) if k.isupper()},
     }
 
 

@@ -130,3 +130,39 @@ class TestDeathRuleGivesNoEscape:
         assert gap > tol, (
             f"сломанное правило смерти сдвигает P15 на {gap:.4f} при допуске {tol:.4f} — "
             "соседний тест такую мутацию не увидит")
+
+
+class TestBirthGuardBreaksTheTrap:
+    """Правка: не заводить теневых на такте без принятого кандидата.
+
+    Бьёт в ИЗМЕРЕННЫЙ механизм ловушки, а не в её следствие: шаг (2) —
+    рождение теневого на истинной детекции в тот момент, когда петля не
+    выбрала никого, — становится невозможен. Существующие теневые правка не
+    трогает, поэтому защита от чужих детекций сохраняется.
+    """
+
+    GUARD = dict(PROD, SHADOW_BIRTH_REQUIRES_PICK=True)
+
+    def test_trap_fires_far_less_often(self):
+        base, guard = measure(PROD), measure(self.GUARD)
+        assert guard["trapped"] < base["trapped"] - tolerance(base["n"]), (
+            f"ловушка срабатывает {guard['trapped']:.3f} против {base['trapped']:.3f} — "
+            "правка не бьёт в измеренный механизм")
+
+    def test_return_probability_improves(self):
+        base, guard = measure(PROD), measure(self.GUARD)
+        assert guard["P15"] > base["P15"], (
+            f"P(возврат) {guard['P15']:.3f} против {base['P15']:.3f}")
+
+    def test_guard_does_not_disable_shadows_entirely(self):
+        """Страховка от того, что правка чинит ловушку, просто выключая
+        механизм: теневые обязаны продолжать рождаться на тактах, где цель
+        выбрана, — иначе это не правка, а отключение."""
+        from track_bench import cfg_with, run_scenario, scen_crossing
+        import random
+        seen = 0
+        for i in range(40):
+            res = run_scenario(scen_crossing(random.Random(i)),
+                               cfg_with(**self.GUARD), seed=i)
+            seen += max(t["n_shadows"] for t in res.ticks)
+        assert seen > 0, "с правкой теневые не рождаются вовсе — это отключение, а не правка"

@@ -25,6 +25,7 @@ N точечных целей с заданными траекториями В 
 import argparse
 import json
 import math
+import os
 import random
 import statistics as st
 import sys
@@ -40,6 +41,16 @@ from track_score import ALL_FORMS
 INTR = ang.from_fov(1920, 1080, 75.0, "стенд")
 MIN_WINDOW = ang.px_size_to_angle(640, INTR)
 MAX_WINDOW = ang.px_size_to_angle(1080, INTR)
+
+
+def _git_head():
+    import subprocess
+    try:
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=os.path.dirname(__file__),
+                            capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() or None
+    except Exception:
+        return None
 
 
 def cfg_with(**overrides):
@@ -164,7 +175,27 @@ class BenchResult:
                 return r["chosen_tid"] == 0
         return False
 
+    def outcomes(self):
+        """Три ВЗАИМОИСКЛЮЧАЮЩИХ исхода на такт, знаменатель — все такты.
+
+        Тот же дефект, что был в track_eval: доля "на цели" по тактам, где
+        петля кого-то выбрала, вознаграждает отказ от ведения. Отказ и
+        подмена разведены: для камеры это противоположные исходы.
+        """
+        n = len(self.ticks)
+        hit = sum(1 for r in self.ticks if r["chosen_tid"] == 0)
+        swap = sum(1 for r in self.ticks
+                   if r["chosen_tid"] is not None and r["chosen_tid"] != 0)
+        refuse = n - hit - swap
+        return {"on_target_all": hit / n, "swap_all": swap / n,
+                "refuse_all": refuse / n, "lead_fraction": (hit + swap) / n}
+
+    def on_target_all(self):
+        return self.outcomes()["on_target_all"]
+
     def on_target_fraction(self):
+        """ПРЕЖНЯЯ метрика с плавающим знаменателем. Оставлена только для
+        сравнимости со старыми прогонами; для решений — outcomes()."""
         graded = [r for r in self.ticks if r["chosen_tid"] is not None]
         if not graded:
             return 0.0
@@ -433,14 +464,18 @@ def evaluate(form, runs, seed0=0, shadows=True, taken_ratio=None, scenarios=None
     out = {}
     for name in (scenarios or SCENARIOS):
         maker, kw = SCENARIOS[name]
-        surv, frac = 0, []
+        surv, frac, acc = 0, [], {}
         for i in range(runs):
             rng = random.Random(seed0 + i)
             targets = maker(rng)
             res = run_scenario(targets, cfg_with(**over), seed=seed0 + i, **kw)
             surv += res.survived
             frac.append(res.on_target_fraction())
-        out[name] = {"survived": surv / runs, "on_target": st.mean(frac), "runs": runs}
+            for k, v in res.outcomes().items():
+                acc.setdefault(k, []).append(v)
+        out[name] = {"survived": surv / runs, "on_target_LEGACY": st.mean(frac),
+                     "runs": runs,
+                     **{k: st.mean(v) for k, v in acc.items()}}
     return out
 
 
