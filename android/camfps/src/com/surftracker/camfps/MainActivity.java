@@ -160,6 +160,12 @@ public class MainActivity extends Activity {
                     }
                 }
             }, h);
+            // yuv_hz > 0: поток анализа НЕ входит в повторяющийся запрос, а
+            // запрашивается отдельными capture() с нужной частотой. Смысл: в
+            // повторяющемся запросе сенсор и ISP гонят полноразмерный YUV
+            // каждый такт, и запись теряет треть кадров (29.8 -> 20.7 fps,
+            // проверено по самим файлам). Нам же нужно 3-5 кадров в секунду.
+            int yuvHz = getIntent().getIntExtra("yuv_hz", 0);
             if (!"none".equals(yuvMode)) targets.add(yuv.getSurface());
 
             ImageReader jpeg = null;
@@ -190,7 +196,7 @@ public class MainActivity extends Activity {
 
             CaptureRequest.Builder rq = dev.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
             rq.addTarget(preview); rq.addTarget(recSurf);
-            if (!"none".equals(yuvMode)) rq.addTarget(yuv.getSurface());
+            if (!"none".equals(yuvMode) && yuvHz <= 0) rq.addTarget(yuv.getSurface());
             box[0].setRepeatingRequest(rq.build(), new CameraCaptureSession.CaptureCallback() {
                 public void onCaptureCompleted(CameraCaptureSession s, CaptureRequest r, TotalCaptureResult res) {
                     results.incrementAndGet();
@@ -230,7 +236,14 @@ public class MainActivity extends Activity {
 
             long end = System.currentTimeMillis() + seconds * 1000L;
             long nextJpeg = System.currentTimeMillis();
+            long nextYuv = System.currentTimeMillis();
             while (System.currentTimeMillis() < end) {
+                if (yuvHz > 0 && !"none".equals(yuvMode) && System.currentTimeMillis() >= nextYuv) {
+                    nextYuv += 1000 / yuvHz;
+                    CaptureRequest.Builder an = dev.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+                    an.addTarget(yuv.getSurface());
+                    box[0].capture(an.build(), null, h);
+                }
                 if (jpeg != null && System.currentTimeMillis() >= nextJpeg) {
                     nextJpeg += 1000 / Math.max(jpegPerSec, 1);
                     CaptureRequest.Builder still = dev.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
@@ -257,11 +270,11 @@ public class MainActivity extends Activity {
                     "{\"combo\": \"%s\", \"seconds\": %d, \"yuv_size\": \"%s\", "
                     + "\"yuv_frames\": %d, \"yuv_fps\": %.2f, \"capture_results\": %d, "
                     + "\"result_fps\": %.2f, \"max_gap_ms\": %.1f, \"median_gap_ms\": %.1f, "
-                    + "\"jpeg_frames\": %d, \"video_bytes\": %d}\n",
+                    + "\"jpeg_frames\": %d, \"video_bytes\": %d, \"yuv_hz_requested\": %d}\n",
                     combo, seconds, "none".equals(yuvMode) ? "нет" : yuvSize.toString(), yuvFrames.get(),
                     yuvFrames.get() / Math.max(secs, 1e-9), results.get(),
                     results.get() / (double) seconds, maxGap / 1e6, medGap,
-                    jpegFrames.get(), video.length()));
+                    jpegFrames.get(), video.length(), yuvHz));
             if (!lat.isEmpty()) {
                 double[] a = new double[lat.size()];
                 for (int i = 0; i < a.length; i++) a[i] = lat.get(i);
