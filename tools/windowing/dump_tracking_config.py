@@ -78,25 +78,68 @@ def git(*args):
         return None
 
 
+def measured_from_matrix(path):
+    """Числа берутся ИЗ ПРОГОНА, а не из литералов в этом файле.
+
+    Валидация показала, что прежний блок MEASURED был захардкожен: снимок
+    выглядел выходом конвейера, а был ручной записью, и одно из чисел (0.857)
+    не воспроизводилось никогда. Теперь снимок либо содержит числа реального
+    прогона, либо честно говорит, что их нет.
+    """
+    if not path or not os.path.exists(path):
+        return None
+    data = json.load(open(path))
+    res, out = data["results"], {}
+    for key, r in res.items():
+        cfg_name, hz, clip = key.split("|")
+        if "error" in r:
+            continue
+        d = out.setdefault(cfg_name, {"такт_гц": float(hz), "проезды": {},
+                                       "флаги": data["configs"].get(cfg_name)})
+        d["проезды"][clip] = {k: r.get(k) for k in
+                              ("on_target_all", "swap_all", "refuse_all",
+                               "lead_fraction", "n_hit", "n_swap", "n_refuse")}
+    for cfg_name, d in out.items():
+        p = d["проезды"].values()
+        n = len(p) or 1
+        d["среднее_по_проездам"] = {
+            k: round(sum(x[k] for x in p) / n, 4)
+            for k in ("on_target_all", "swap_all", "refuse_all", "lead_fraction")}
+        d["оговорка"] = ("8 стресс-проездов, знаменатель — все размеченные такты; "
+                          "различия между составами на этой выборке не разрешимы "
+                          "(максимум ~2 se)")
+    return {"источник": os.path.abspath(path), "веса": data.get("weights"),
+            "конфигурации": out}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     ap.add_argument("--note", default="")
+    ap.add_argument("--version", default="tracking-v2")
+    ap.add_argument("--matrix", default=None,
+                     help="summary.json прогона матрицы: числа берутся ОТТУДА, "
+                          "а не из литералов")
     args = ap.parse_args()
 
     values = {k: getattr(tcfg, k) for k in dir(tcfg) if k.isupper()}
+    measured = measured_from_matrix(args.matrix)
     snapshot = {
-        "версия": "tracking-v1",
+        "версия": args.version,
         "коммит": git("rev-parse", "HEAD"),
         "ветка": git("rev-parse", "--abbrev-ref", "HEAD"),
         "дерево_чистое": git("status", "--porcelain") == "",
         "примечание": args.note,
         "значения": values,
-        "измеренные_конфигурации": MEASURED,
+        "измерено_прогоном": measured,
+        "измеренные_конфигурации_РУЧНЫЕ_ЛИТЕРАЛЫ": MEASURED,
         "клипы": "Data/frames/val_manual, 8 проездов, такт 3 Гц, "
                   "веса models/night_legacy_s3_best.pt",
         "стенд": "track_bench.py, 8 сценариев по 500 прогонов",
     }
+    if measured is None:
+        snapshot["ВНИМАНИЕ"] = ("--matrix не задан: числа прогоном не "
+                                 "подтверждены, в блоке ниже ручные литералы")
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as f:
         json.dump(snapshot, f, indent=2, ensure_ascii=False, sort_keys=False)
