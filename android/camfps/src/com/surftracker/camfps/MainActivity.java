@@ -93,6 +93,10 @@ public class MainActivity extends Activity {
      *  вход-выход — сам кроп картинкой и детекции по нему. Без этого нельзя
      *  отличить работающий конвейер от гоняющего нулевой буфер. */
     volatile int proofMinute = -1;
+    /** 0 = полный путь, 1 = только чтение плоскостей, 2 = чтение+конвертация. */
+    volatile int cropStage = 0;
+    /** Время ожидания и получения Image из ImageReader — отдельная стадия. */
+    final java.util.List<Double> acquireMs = java.util.Collections.synchronizedList(new ArrayList<>());
     final java.util.List<String> proofs = java.util.Collections.synchronizedList(new ArrayList<>());
     /** Левый верхний угол кропа в координатах ПОЛНОГО YUV-кадра. Фиксированный:
      *  трекера в этом прогоне нет, а место кропа на время инференса не влияет —
@@ -108,9 +112,24 @@ public class MainActivity extends Activity {
      * из плоскостей Y (полное разрешение) и U/V (половинное, отсюда деление
      * координат на два).
      */
+    /**
+     * Профилирование пути кропа по стадиям (тикет "ночь", блок 1.1).
+     *
+     * Вложенные таймеры вокруг участков в наносекунды исказили бы сами
+     * участки, поэтому стадии разделяются ВАРИАНТАМИ: A — только чтение
+     * плоскостей, B — чтение и конвертация, C — полный путь с упаковкой.
+     * Разности дают вклад стадий, а C обязан сойтись с суммой (проверяется
+     * в отчёте).
+     *
+     * Итог чтения в варианте A складывается в sink и печатается: без этого
+     * JIT выбросит цикл целиком, и "чтение" окажется бесплатным.
+     */
+    volatile long sink;
+
     void cropFromYuv(Image im) {
         long t0 = System.nanoTime();
         cropArrivedNs.set(t0);
+        int stage = cropStage;   // 0=полный, 1=только чтение, 2=чтение+конвертация
         Image.Plane[] pl = im.getPlanes();
         java.nio.ByteBuffer yb = pl[0].getBuffer(), ub = pl[1].getBuffer(), vb = pl[2].getBuffer();
         int yRow = pl[0].getRowStride();
@@ -118,6 +137,7 @@ public class MainActivity extends Activity {
         int vRow = pl[2].getRowStride(), vPix = pl[2].getPixelStride();
         java.nio.ByteBuffer out = cropOut;
         final int S = 640, PLANE = S * S;
+        long acc = 0;
         for (int j = 0; j < S; j++) {
             int sy = cropY + j;
             int yBase = sy * yRow + cropX;
@@ -128,15 +148,18 @@ public class MainActivity extends Activity {
                 int uvx = (cropX + i) >> 1;
                 int U = (ub.get(uvBase + uvx * uPix) & 0xFF) - 128;
                 int V = (vb.get(vvBase + uvx * vPix) & 0xFF) - 128;
+                if (stage == 1) { acc += Y + U + V; continue; }
                 int R = Y + ((91881 * V) >> 16);
                 int G = Y - ((22554 * U + 46802 * V) >> 16);
                 int B = Y + ((116130 * U) >> 16);
+                if (stage == 2) { acc += R + G + B; continue; }
                 int idx = j * S + i;
                 out.putFloat(idx * 4, (R < 0 ? 0 : R > 255 ? 255 : R) / 255.0f);
                 out.putFloat((PLANE + idx) * 4, (G < 0 ? 0 : G > 255 ? 255 : G) / 255.0f);
                 out.putFloat((2 * PLANE + idx) * 4, (B < 0 ? 0 : B > 255 ? 255 : B) / 255.0f);
             }
         }
+        sink += acc;
         cropMs.add((System.nanoTime() - t0) / 1e6);
         cropDone.incrementAndGet();
     }
@@ -196,6 +219,7 @@ public class MainActivity extends Activity {
         String combo = getIntent().getStringExtra("combo");
         if (combo == null) combo = "priv1080+rec4k+yuvmax";
         int seconds = getIntent().getIntExtra("seconds", 60);
+        cropStage = getIntent().getIntExtra("crop_stage", 0);
         int jpegPerSec = getIntent().getIntExtra("jpeg_per_sec", 0);
         StringBuilder j = new StringBuilder();
         CameraDevice dev = null;
@@ -282,7 +306,9 @@ public class MainActivity extends Activity {
             ImageReader yuv = yuvReader = ImageReader.newInstance(
                     yuvSize.getWidth(), yuvSize.getHeight(), ImageFormat.YUV_420_888, 3);
             yuv.setOnImageAvailableListener(r -> {
+                long ta = System.nanoTime();
                 try (Image im = r.acquireLatestImage()) {
+                    acquireMs.add((System.nanoTime() - ta) / 1e6);
                     if (im != null) {
                         long t = System.nanoTime();
                         firstNs.compareAndSet(0, t); lastNs.set(t);
@@ -470,7 +496,11 @@ public class MainActivity extends Activity {
                 }
                 double[] ta = arr(tickMs);
                 pm.append(String.format(java.util.Locale.US,
-                        "\n  ],\n  \"итого\": {\"кадров\": %d, \"инференс_p50\": %.1f, "
+                        "\n  ],\n  \"стадия_кропа\": " + cropStage + ", \"acquire_p50\": "
+                        + String.format(java.util.Locale.US, "%.2f", pct(arr(acquireMs), 50))
+                        + ", \"acquire_p95\": "
+                        + String.format(java.util.Locale.US, "%.2f", pct(arr(acquireMs), 95))
+                        + ",\n  \"итого\": {\"кадров\": %d, \"инференс_p50\": %.1f, "
                         + "\"инференс_p95\": %.1f, \"такт_p50\": %.1f, \"такт_p95\": %.1f, "
                         + "\"кроп_p50\": %.1f, \"кроп_p95\": %.1f, \"headroom\": %s}\n}\n",
                         ta.length, pct(a, 50), pct(a, 95), pct(ta, 50), pct(ta, 95),

@@ -87,6 +87,47 @@ def _file_sha256(path):
     return h.hexdigest()
 
 
+class VideoSource:
+    """Кадры прямо из видеофайла, без распаковки в папку (тикет "ночь", блок 2).
+
+    Зачем не через кадры на диске: 168 минут ютубного материала на такте 3 Гц —
+    это 30 тысяч файлов и около 9 ГБ, которые тут же станут мусором. Сама петля
+    от источника не зависит: ей нужен кадр и его таймстамп.
+
+    Тайминг РОВНЫЙ (кадр берётся по времени такта, а не по номеру): рваные
+    тайминги пришлось бы выдумывать, а настоящий лог тактов появится из
+    интеграции.
+    """
+
+    def __init__(self, path, tick_hz):
+        self.cap = cv2.VideoCapture(path)
+        if not self.cap.isOpened():
+            raise SystemExit(f"не открывается видео: {path}")
+        self.w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
+        n = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        self.duration = n / fps if n else 0.0
+        self.period = 1.0 / tick_hz
+        self.name = os.path.basename(path)
+
+    def ticks(self):
+        """[{"name","frame_index","timestamp_sec"}] — по одному на такт."""
+        out, t = [], 0.0
+        i = 0
+        while t < self.duration:
+            out.append({"name": f"{self.name}@{t:.3f}", "frame_index": i,
+                        "timestamp_sec": t})
+            t += self.period
+            i += 1
+        return out
+
+    def read_at(self, t_sec):
+        self.cap.set(cv2.CAP_PROP_POS_MSEC, t_sec * 1000.0)
+        ok, frame = self.cap.read()
+        return frame if ok else None
+
+
 def load_manifest(frames_dir):
     with open(os.path.join(frames_dir, "manifest.json")) as f:
         m = json.load(f)
@@ -143,13 +184,16 @@ def bootstrap_seed_from_gt(gt_track, ticks):
     return None, None, None
 
 
-def bootstrap_seed(model, frames_dir, frames, imgsz, conf=0.25):
+def bootstrap_seed(model, frames_dir, frames, imgsz, conf=0.25, src=None):
     """Первая детекция на ПОЛНОМ кадре (единственное место в петле, где
     решение принимается по уверенности — состояния/предсказания ещё нет,
     select_target по расстоянию тут неприменим). Пробуем кадры по порядку,
     пока не найдётся хоть одна детекция."""
     for rec in frames:
-        frame = cv2.imread(os.path.join(frames_dir, rec["name"]))
+        frame = src.read_at(rec["timestamp_sec"]) if src \
+            else cv2.imread(os.path.join(frames_dir, rec["name"]))
+        if frame is None:
+            continue
         res = model.predict(frame, imgsz=imgsz, conf=conf, verbose=False)[0]
         if len(res.boxes) == 0:
             continue
@@ -185,7 +229,9 @@ def draw_overlay(frame, tick_idx, n_ticks, ts_sec, square, detections, chosen, s
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--frames-dir", required=True)
+    ap.add_argument("--frames-dir", default=None)
+    ap.add_argument("--video", default=None,
+                     help="читать кадры прямо из видеофайла вместо папки кадров")
     ap.add_argument("--weights", required=True)
     ap.add_argument("--tick-hz", type=float, default=tcfg.TICK_HZ_BASE)
     ap.add_argument("--imgsz", type=int, default=640)
@@ -266,7 +312,7 @@ def main():
         # детекций нет ни с одной).
         "weights": os.path.abspath(args.weights),
         "weights_sha256": _file_sha256(args.weights),
-        "frames_dir": os.path.abspath(args.frames_dir),
+        "frames_dir": os.path.abspath(args.frames_dir) if args.frames_dir else None,
         "imgsz": args.imgsz,
         "detect_low_conf": tcfg.DETECT_LOW_CONF,
         "mechanism_A_size": args.enable_a,
@@ -298,12 +344,22 @@ def main():
     from ultralytics import YOLO
     model = YOLO(args.weights)
 
-    manifest = load_manifest(args.frames_dir)
-    frame_w, frame_h = manifest["frame_w"], manifest["frame_h"]
-    ticks = decimate_by_timestamp(manifest["frames"], args.tick_hz)
-    assert ticks, f"нет кадров в {args.frames_dir}"
+    src = None
+    if args.video:
+        src = VideoSource(args.video, args.tick_hz)
+        frame_w, frame_h = src.w, src.h
+        ticks = src.ticks()
+        run_cfg["video"] = os.path.abspath(args.video)
+        run_cfg["video_minutes"] = round(src.duration / 60.0, 2)
+    else:
+        manifest = load_manifest(args.frames_dir)
+        frame_w, frame_h = manifest["frame_w"], manifest["frame_h"]
+        ticks = decimate_by_timestamp(manifest["frames"], args.tick_hz)
+    assert ticks, f"нет кадров в {args.frames_dir or args.video}"
 
     try:
+        if args.video:
+            raise ValueError("видео без разметки")
         gt_track = load_gt_track(args.frames_dir,
                                   manual_first_pick_index=args.gt_first_pick)
     except ValueError:
@@ -318,7 +374,7 @@ def main():
 
     if start_i is None:
         seed_rec, seed_center, seed_size = bootstrap_seed(
-            model, args.frames_dir, ticks, args.imgsz, conf=args.bootstrap_conf)
+            model, args.frames_dir, ticks, args.imgsz, conf=args.bootstrap_conf, src=src)
         if seed_rec is None:
             raise SystemExit(f"не нашли цель ни на одном такте для затравки: {args.frames_dir}")
         start_i = next(i for i, r in enumerate(ticks) if r["name"] == seed_rec["name"])
@@ -326,8 +382,9 @@ def main():
 
     ticks = ticks[start_i:]
 
-    intr = ang.intrinsics_for(os.path.basename(os.path.normpath(args.frames_dir)),
-                               frame_w, frame_h)
+    intr = ang.intrinsics_for(
+        os.path.basename(args.video if args.video else os.path.normpath(args.frames_dir)),
+        frame_w, frame_h)
     # Пол и потолок стороны окна — угловые эквиваленты прежних пиксельных:
     # WINDOW_SIZE (столько crop() вырежет в любом случае) и короткая сторона
     # кадра (за ней вырезка перестаёт быть квадратной).
@@ -350,7 +407,10 @@ def main():
     prev_ts = ticks[0]["timestamp_sec"]
 
     for i, rec in enumerate(ticks):
-        frame = cv2.imread(os.path.join(args.frames_dir, rec["name"]))
+        frame = src.read_at(rec["timestamp_sec"]) if src \
+            else cv2.imread(os.path.join(args.frames_dir, rec["name"]))
+        if frame is None:
+            break
         dt = rec["timestamp_sec"] - prev_ts if i > 0 else 0.0
         prev_ts = rec["timestamp_sec"]
 
