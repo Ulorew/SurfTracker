@@ -25,10 +25,10 @@ $JAVA_HOME/bin/javac -source 17 -target 17 -nowarn \
 
 # 3. dex: наши классы + рантайм LiteRT
 $BT/d8 --lib $JAR --min-api 29 --output $OUT/dex \
-    $(find $OUT/classes -name '*.class') 
+    $(find $OUT/classes -name '*.class') "$LIB/classes.jar" "$LIB/api/classes.jar" 
 
 # 4. собираем apk: dex + нативные библиотеки
-true
+cp $LIB/jni/arm64-v8a/*.so $OUT/apk/lib/arm64-v8a/
 cp $OUT/dex/classes.dex $OUT/apk/
 (cd $OUT/apk && zip -q -r ../unsigned.apk .)
 (cd $OUT && zip -q ../$OUT/base.apk -j apk/classes.dex >/dev/null 2>&1 || true)

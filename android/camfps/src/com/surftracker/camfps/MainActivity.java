@@ -25,6 +25,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import org.tensorflow.lite.Interpreter;
 
 /**
  * Практический прогон комбинации потоков (тикет "телефон", п.4б и 4в).
@@ -44,6 +45,26 @@ public class MainActivity extends Activity {
     final AtomicInteger jpegFrames = new AtomicInteger();
     final AtomicLong firstNs = new AtomicLong(), lastNs = new AtomicLong();
     final List<Long> resultTs = java.util.Collections.synchronizedList(new ArrayList<>());
+    /**
+     * СИЛЬНАЯ ссылка на SurfaceTexture превью — обязательна.
+     *
+     * Была локальной переменной, и сборщик мусора собирал её прямо посреди
+     * сессии: последнее использование заканчивалось на targets.add(), дальше
+     * объект недостижим, финализатор бросает BufferQueue, камера получает
+     * "BufferQueue has been abandoned" (-19) и встаёт ВЕСЬ конвейер — включая
+     * запись и YUV. В логе это выглядело как обрыв записи на девятой секунде,
+     * и первые три версии объяснения (YUV не тянет, экран гаснет, параметры
+     * записи) были поэтому неверны. Surface сам по себе SurfaceTexture не
+     * держит.
+     */
+    SurfaceTexture previewTexture;
+    /** По той же причине, что и previewTexture: локальные ImageReader-ы
+     *  становились недостижимы сразу после сборки запроса, финализатор бросал
+     *  их BufferQueue, и захват вставал ровно через 9 секунд. Держать обязаны
+     *  ВСЕ участники сессии, а не только те, к которым обращаемся позже. */
+    ImageReader yuvReader, jpegReader;
+    MediaRecorder recorder;
+    Surface previewSurface;
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -87,12 +108,12 @@ public class MainActivity extends Activity {
             if (video.exists()) video.delete();
 
             List<Surface> targets = new ArrayList<>();
-            SurfaceTexture st = new SurfaceTexture(0);
-            st.setDefaultBufferSize(1920, 1080);
-            Surface preview = new Surface(st);
+            previewTexture = new SurfaceTexture(0);
+            previewTexture.setDefaultBufferSize(1920, 1080);
+            Surface preview = previewSurface = new Surface(previewTexture);
             targets.add(preview);
 
-            rec = new MediaRecorder();
+            rec = recorder = new MediaRecorder();
             rec.setVideoSource(MediaRecorder.VideoSource.SURFACE);
             // Параметры записи — из ПРОФИЛЯ УСТРОЙСТВА, а не назначенные руками.
             // Руками заданные 3840x2160 @ 40 Мбит/с давали ошибку дорожки
@@ -128,8 +149,8 @@ public class MainActivity extends Activity {
             String yuvMode = getIntent().getStringExtra("yuv");
             if (yuvMode == null) yuvMode = "max";
             Size yuvSize = "1080".equals(yuvMode) ? new Size(1920, 1080) : yuvMax;
-            ImageReader yuv = ImageReader.newInstance(yuvSize.getWidth(), yuvSize.getHeight(),
-                    ImageFormat.YUV_420_888, 3);
+            ImageReader yuv = yuvReader = ImageReader.newInstance(
+                    yuvSize.getWidth(), yuvSize.getHeight(), ImageFormat.YUV_420_888, 3);
             yuv.setOnImageAvailableListener(r -> {
                 try (Image im = r.acquireLatestImage()) {
                     if (im != null) {
@@ -143,8 +164,8 @@ public class MainActivity extends Activity {
 
             ImageReader jpeg = null;
             if (jpegPerSec > 0) {
-                jpeg = ImageReader.newInstance(jpegMax.getWidth(), jpegMax.getHeight(),
-                        ImageFormat.JPEG, 3);
+                jpeg = jpegReader = ImageReader.newInstance(jpegMax.getWidth(),
+                        jpegMax.getHeight(), ImageFormat.JPEG, 3);
                 jpeg.setOnImageAvailableListener(r -> {
                     try (Image im = r.acquireLatestImage()) {
                         if (im != null) jpegFrames.incrementAndGet();
@@ -179,6 +200,34 @@ public class MainActivity extends Activity {
             }, h);
             rec.start();
 
+            // Худший случай целиком: инференс идёт ОДНОВРЕМЕННО с записью 4K и
+            // выдачей YUV. Мерить их порознь бессмысленно — на телефоне они
+            // делят и кристалл, и тепловой бюджет.
+            Thread infer = null;
+            final java.util.List<Double> lat = java.util.Collections.synchronizedList(new ArrayList<>());
+            final boolean[] stop = {false};
+            if (getIntent().getBooleanExtra("infer", false)) {
+                infer = new Thread(() -> {
+                    try {
+                        File model = new File(getExternalFilesDir(null), "surf_w8a32.tflite");
+                        Interpreter.Options o = new Interpreter.Options();
+                        o.setNumThreads(1);
+                        Interpreter it = new Interpreter(model, o);
+                        java.nio.ByteBuffer bin = java.nio.ByteBuffer
+                                .allocateDirect(4 * 3 * 640 * 640).order(java.nio.ByteOrder.nativeOrder());
+                        float[][][] o2 = new float[1][5][8400];
+                        while (!stop[0]) {
+                            bin.rewind();
+                            long t0 = System.nanoTime();
+                            it.run(bin, o2);
+                            lat.add((System.nanoTime() - t0) / 1e6);
+                        }
+                        it.close();
+                    } catch (Throwable t) { Log.e(TAG, "инференс: " + t); }
+                });
+                infer.start();
+            }
+
             long end = System.currentTimeMillis() + seconds * 1000L;
             long nextJpeg = System.currentTimeMillis();
             while (System.currentTimeMillis() < end) {
@@ -190,6 +239,8 @@ public class MainActivity extends Activity {
                 }
                 Thread.sleep(20);
             }
+            stop[0] = true;
+            if (infer != null) infer.join(3000);
             box[0].stopRepeating();
             Thread.sleep(300);
             rec.stop();
@@ -211,6 +262,18 @@ public class MainActivity extends Activity {
                     yuvFrames.get() / Math.max(secs, 1e-9), results.get(),
                     results.get() / (double) seconds, maxGap / 1e6, medGap,
                     jpegFrames.get(), video.length()));
+            if (!lat.isEmpty()) {
+                double[] a = new double[lat.size()];
+                for (int i = 0; i < a.length; i++) a[i] = lat.get(i);
+                java.util.Arrays.sort(a);
+                android.os.PowerManager pmg = getSystemService(android.os.PowerManager.class);
+                float hr = Float.NaN;
+                try { hr = pmg.getThermalHeadroom(60); } catch (Throwable ignored) { }
+                Log.i(TAG, String.format(java.util.Locale.US,
+                        "ИНФЕРЕНС ПОД ЗАПИСЬЮ: прогонов %d p50 %.1f p95 %.1f headroom %s",
+                        a.length, a[a.length / 2], a[(int) (0.95 * (a.length - 1))],
+                        Float.isNaN(hr) ? "нет" : String.format(java.util.Locale.US, "%.3f", hr)));
+            }
             Log.i(TAG, "ГОТОВО " + j);
         } catch (Throwable t) {
             Log.e(TAG, "ОШИБКА " + t, t);
