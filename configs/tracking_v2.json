@@ -1,9 +1,9 @@
 {
   "версия": "tracking-v2",
-  "коммит": "a3711caefce31bd7f777ebe819a983da57f7bb27",
+  "коммит": "3304aedda4324f08524cd97bd915cbcc0d011fca",
   "ветка": "master",
   "дерево_чистое": false,
-  "примечание": "прод: A + Калман + гейт, БЕЗ теневых (решение после пересчёта честной линейкой)",
+  "примечание": "прод: A + Калман + гейт, БЕЗ теневых; линейка с фиксированным знаменателем",
   "значения": {
     "ALPHA_BETA_ALPHA": 0.6,
     "ALPHA_BETA_BETA": 0.3,
@@ -11,7 +11,7 @@
     "DETECT_MIN_WINDOW_PX": 640,
     "ENABLE_MAHALANOBIS_GATE": true,
     "ENABLE_OCCLUSION_HOLD": false,
-    "ENABLE_SHADOW_TRACKS": true,
+    "ENABLE_SHADOW_TRACKS": false,
     "ENABLE_SIZE_SCORING": true,
     "ENABLE_VELOCITY_DIRECTION": false,
     "ENABLE_VELOCITY_GATE": false,
