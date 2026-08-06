@@ -80,10 +80,13 @@ class TestIntrinsicsTable:
         for key, intr in angles.CLIP_INTRINSICS.items():
             assert intr.source, f"у {key} не указан источник f_x"
 
-    def test_frame_size_override_moves_center_but_not_focal(self):
+    def test_frame_size_override_moves_center_and_scales_focal(self):
+        """Раньше тест требовал, чтобы f_x НЕ менялся при смене размера кадра,
+        и тем самым закреплял дефект: на 4K это давало FOV 113.8° вместо 75°.
+        Правильно — масштабировать f_x вместе с шириной, сохраняя поле зрения."""
         base = intrinsics_for("YT_Primbee_Speed_Windsurfing_8bYtDBZkrpM")
         moved = intrinsics_for("YT_Primbee_Speed_Windsurfing_8bYtDBZkrpM", 1600, 1012)
-        assert moved.fx == base.fx
+        assert moved.fx == pytest.approx(base.fx * 1600 / 1920)
         assert moved.cx == pytest.approx(800.0)
         assert moved.cy == pytest.approx(506.0)
 
@@ -133,3 +136,34 @@ class TestIntrinsicsTable:
             assert intr.cy == pytest.approx(h / 2.0), f"{name}: высота в таблице не та"
             seen.add(name)
         assert seen, "тест бесполезен, если ни один клип не проверен"
+
+
+class TestFocalScalesWithResolution:
+    """f_x измеряется в ПИКСЕЛЯХ и обязан расти вместе с шириной кадра.
+
+    Раньше при передаче размера кадра пересчитывался только центр, а f_x
+    оставался табличным. На 4K-видео (3840 против табличных 1920) это давало
+    подразумеваемое поле зрения 113.8° вместо 75° — то есть все углы вдвое
+    меньше настоящих. Дефект нашла валидация, не тесты.
+    """
+
+    def test_double_width_doubles_focal(self):
+        base = intrinsics_for("YT_best_windsurf_racing_bp6nX64OeI0", 1920, 1080)
+        big = intrinsics_for("YT_best_windsurf_racing_bp6nX64OeI0", 3840, 2160)
+        assert big.fx == pytest.approx(2 * base.fx, rel=1e-9)
+        assert big.cx == pytest.approx(1920.0)
+
+    def test_field_of_view_is_preserved_across_resolutions(self):
+        """Смысл масштабирования: поле зрения — свойство объектива и от
+        разрешения не зависит."""
+        for w, h in ((1920, 1080), (3840, 2160), (2560, 1440)):
+            intr = intrinsics_for("YT_best_windsurf_racing_bp6nX64OeI0", w, h)
+            fov = 2 * math.degrees(math.atan((w / 2) / intr.fx))
+            assert fov == pytest.approx(75.0, abs=0.1), f"{w}x{h}: FOV {fov:.1f}"
+
+    def test_angle_of_the_same_direction_is_resolution_independent(self):
+        """Прямая проверка следствия: точка на одной и той же ДОЛЕ кадра
+        обязана давать один и тот же угол при любом разрешении."""
+        a = px_to_angle(1920 * 0.75, 540, intrinsics_for("VID_20230624_145515", 1920, 1080))
+        b = px_to_angle(3840 * 0.75, 1080, intrinsics_for("VID_20230624_145515", 3840, 2160))
+        assert a[0] == pytest.approx(b[0], rel=1e-9)
