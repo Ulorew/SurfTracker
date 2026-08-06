@@ -58,6 +58,68 @@ public class MainActivity extends Activity {
      * держит.
      */
     SurfaceTexture previewTexture;
+    /** Кроп 640x640 в NCHW float32 RGB — ровно то, что ест модель. Заполняется
+     *  из YUV-кадра; null, пока инференс не включён. */
+    volatile java.nio.ByteBuffer cropOut;
+    final AtomicInteger cropDone = new AtomicInteger();
+    final java.util.List<Double> cropMs = java.util.Collections.synchronizedList(new ArrayList<>());
+    /** Сквозной такт: приход кадра с камеры -> конец инференса. Именно эта
+     *  величина сравнивается с бюджетом 333 мс, а не время интерпретатора:
+     *  конвертация YUV->RGB тоже входит в такт. */
+    final java.util.List<Double> tickMs = java.util.Collections.synchronizedList(new ArrayList<>());
+    final AtomicLong cropArrivedNs = new AtomicLong();
+    /** Поминутные корзины: [минута][список] для инференса и для такта. */
+    final java.util.Map<Integer, java.util.List<Double>> byMinute =
+            java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>());
+    final java.util.Map<Integer, java.util.List<Double>> tickByMinute =
+            java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>());
+    long runStartMs;
+    /** Левый верхний угол кропа в координатах ПОЛНОГО YUV-кадра. Фиксированный:
+     *  трекера в этом прогоне нет, а место кропа на время инференса не влияет —
+     *  влияет только объём конвертации, и он от места не зависит. */
+    int cropX, cropY;
+
+    /**
+     * Конвертация YUV_420_888 -> RGB float32 NCHW ТОЛЬКО для окна 640x640.
+     *
+     * Полный кадр 4080x3060 — это 12.5 млн пикселей; конвертировать его целиком
+     * ради 0.41 млн нужных значило бы отдать десятки миллисекунд ни за что.
+     * Читаются только строки cropY..cropY+639 и в них только нужные столбцы,
+     * из плоскостей Y (полное разрешение) и U/V (половинное, отсюда деление
+     * координат на два).
+     */
+    void cropFromYuv(Image im) {
+        long t0 = System.nanoTime();
+        cropArrivedNs.set(t0);
+        Image.Plane[] pl = im.getPlanes();
+        java.nio.ByteBuffer yb = pl[0].getBuffer(), ub = pl[1].getBuffer(), vb = pl[2].getBuffer();
+        int yRow = pl[0].getRowStride();
+        int uRow = pl[1].getRowStride(), uPix = pl[1].getPixelStride();
+        int vRow = pl[2].getRowStride(), vPix = pl[2].getPixelStride();
+        java.nio.ByteBuffer out = cropOut;
+        final int S = 640, PLANE = S * S;
+        for (int j = 0; j < S; j++) {
+            int sy = cropY + j;
+            int yBase = sy * yRow + cropX;
+            int uvBase = (sy >> 1) * uRow;
+            int vvBase = (sy >> 1) * vRow;
+            for (int i = 0; i < S; i++) {
+                int Y = yb.get(yBase + i) & 0xFF;
+                int uvx = (cropX + i) >> 1;
+                int U = (ub.get(uvBase + uvx * uPix) & 0xFF) - 128;
+                int V = (vb.get(vvBase + uvx * vPix) & 0xFF) - 128;
+                int R = Y + ((91881 * V) >> 16);
+                int G = Y - ((22554 * U + 46802 * V) >> 16);
+                int B = Y + ((116130 * U) >> 16);
+                int idx = j * S + i;
+                out.putFloat(idx * 4, (R < 0 ? 0 : R > 255 ? 255 : R) / 255.0f);
+                out.putFloat((PLANE + idx) * 4, (G < 0 ? 0 : G > 255 ? 255 : G) / 255.0f);
+                out.putFloat((2 * PLANE + idx) * 4, (B < 0 ? 0 : B > 255 ? 255 : B) / 255.0f);
+            }
+        }
+        cropMs.add((System.nanoTime() - t0) / 1e6);
+        cropDone.incrementAndGet();
+    }
     /** По той же причине, что и previewTexture: локальные ImageReader-ы
      *  становились недостижимы сразу после сборки запроса, финализатор бросал
      *  их BufferQueue, и захват вставал ровно через 9 секунд. Держать обязаны
@@ -102,6 +164,8 @@ public class MainActivity extends Activity {
             StreamConfigurationMap map = cm.getCameraCharacteristics(id)
                     .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
             Size yuvMax = biggest(map.getOutputSizes(ImageFormat.YUV_420_888));
+            cropX = (yuvMax.getWidth() - 640) / 2;
+            cropY = (yuvMax.getHeight() - 640) / 2;
             Size jpegMax = biggest(map.getOutputSizes(ImageFormat.JPEG));
 
             File video = new File(dir, "rec_" + combo + ".mp4");
@@ -157,6 +221,7 @@ public class MainActivity extends Activity {
                         long t = System.nanoTime();
                         firstNs.compareAndSet(0, t); lastNs.set(t);
                         yuvFrames.incrementAndGet();
+                        if (cropOut != null) cropFromYuv(im);
                     }
                 }
             }, h);
@@ -221,12 +286,29 @@ public class MainActivity extends Activity {
                         Interpreter it = new Interpreter(model, o);
                         java.nio.ByteBuffer bin = java.nio.ByteBuffer
                                 .allocateDirect(4 * 3 * 640 * 640).order(java.nio.ByteOrder.nativeOrder());
+                        cropOut = bin;   // с этого момента слушатель YUV пишет сюда кроп
                         float[][][] o2 = new float[1][5][8400];
+                        int seen = -1;
                         while (!stop[0]) {
+                            // ждём НОВЫЙ кроп: инференс идёт по кадрам камеры, а
+                            // не крутится вхолостую на одном и том же буфере
+                            int n = cropDone.get();
+                            if (n == seen) { Thread.sleep(2); continue; }
+                            seen = n;
                             bin.rewind();
+                            long arrived = cropArrivedNs.get();
                             long t0 = System.nanoTime();
                             it.run(bin, o2);
-                            lat.add((System.nanoTime() - t0) / 1e6);
+                            long t1 = System.nanoTime();
+                            double infMs = (t1 - t0) / 1e6;
+                            double tickFull = (t1 - arrived) / 1e6;
+                            lat.add(infMs);
+                            tickMs.add(tickFull);
+                            int min = (int) ((System.currentTimeMillis() - runStartMs) / 60000);
+                            byMinute.computeIfAbsent(min, k ->
+                                    java.util.Collections.synchronizedList(new ArrayList<>())).add(infMs);
+                            tickByMinute.computeIfAbsent(min, k ->
+                                    java.util.Collections.synchronizedList(new ArrayList<>())).add(tickFull);
                         }
                         it.close();
                     } catch (Throwable t) { Log.e(TAG, "инференс: " + t); }
@@ -234,6 +316,7 @@ public class MainActivity extends Activity {
                 infer.start();
             }
 
+            runStartMs = System.currentTimeMillis();
             long end = System.currentTimeMillis() + seconds * 1000L;
             long nextJpeg = System.currentTimeMillis();
             long nextYuv = System.currentTimeMillis();
@@ -282,10 +365,41 @@ public class MainActivity extends Activity {
                 android.os.PowerManager pmg = getSystemService(android.os.PowerManager.class);
                 float hr = Float.NaN;
                 try { hr = pmg.getThermalHeadroom(60); } catch (Throwable ignored) { }
+                double[] cms = new double[cropMs.size()];
+                for (int i = 0; i < cms.length; i++) cms[i] = cropMs.get(i);
+                java.util.Arrays.sort(cms);
                 Log.i(TAG, String.format(java.util.Locale.US,
-                        "ИНФЕРЕНС ПОД ЗАПИСЬЮ: прогонов %d p50 %.1f p95 %.1f headroom %s",
+                        "ИНФЕРЕНС ПОД ЗАПИСЬЮ: прогонов %d p50 %.1f p95 %.1f | кроп+YUV->RGB "
+                        + "p50 %.1f p95 %.1f (кропов %d, из %dx%d в (%d,%d)) | headroom %s",
                         a.length, a[a.length / 2], a[(int) (0.95 * (a.length - 1))],
+                        cms.length > 0 ? cms[cms.length / 2] : -1,
+                        cms.length > 0 ? cms[(int) (0.95 * (cms.length - 1))] : -1,
+                        cms.length, yuvSize.getWidth(), yuvSize.getHeight(), cropX, cropY,
                         Float.isNaN(hr) ? "нет" : String.format(java.util.Locale.US, "%.3f", hr)));
+                StringBuilder pm = new StringBuilder("{\n  \"crop\": {\"from\": \""
+                        + yuvSize.getWidth() + "x" + yuvSize.getHeight() + "\", \"at\": [" + cropX
+                        + ", " + cropY + "], \"size\": 640},\n  \"по_минутам\": [\n");
+                boolean f1 = true;
+                for (Integer m : new java.util.TreeSet<>(byMinute.keySet())) {
+                    double[] mi = arr(byMinute.get(m)), mt = arr(tickByMinute.get(m));
+                    if (!f1) pm.append(",\n");
+                    f1 = false;
+                    pm.append(String.format(java.util.Locale.US,
+                            "    {\"минута\": %d, \"кадров\": %d, \"инференс_p50\": %.1f, "
+                            + "\"инференс_p95\": %.1f, \"такт_p50\": %.1f, \"такт_p95\": %.1f}",
+                            m + 1, mi.length, pct(mi, 50), pct(mi, 95), pct(mt, 50), pct(mt, 95)));
+                }
+                double[] ta = arr(tickMs);
+                pm.append(String.format(java.util.Locale.US,
+                        "\n  ],\n  \"итого\": {\"кадров\": %d, \"инференс_p50\": %.1f, "
+                        + "\"инференс_p95\": %.1f, \"такт_p50\": %.1f, \"такт_p95\": %.1f, "
+                        + "\"кроп_p50\": %.1f, \"кроп_p95\": %.1f, \"headroom\": %s}\n}\n",
+                        ta.length, pct(a, 50), pct(a, 95), pct(ta, 50), pct(ta, 95),
+                        pct(cms, 50), pct(cms, 95),
+                        Float.isNaN(hr) ? "null" : String.format(java.util.Locale.US, "%.3f", hr)));
+                try (FileWriter w2 = new FileWriter(new File(dir, "infer_" + combo + ".json"))) {
+                    w2.write(pm.toString());
+                }
             }
             Log.i(TAG, "ГОТОВО " + j);
         } catch (Throwable t) {
@@ -299,6 +413,18 @@ public class MainActivity extends Activity {
             w.write(j.toString());
         } catch (Exception ignored) { }
         finish();
+    }
+
+    static double[] arr(java.util.List<Double> l) {
+        double[] a = new double[l.size()];
+        for (int i = 0; i < a.length; i++) a[i] = l.get(i);
+        java.util.Arrays.sort(a);
+        return a;
+    }
+
+    static double pct(double[] sorted, int p) {
+        if (sorted.length == 0) return -1;
+        return sorted[Math.min(sorted.length - 1, (int) (p / 100.0 * (sorted.length - 1)))];
     }
 
     static Size biggest(Size[] s) {
