@@ -55,6 +55,7 @@ config.EVAL_REALIZATIONS_PER_BOX независимыми окнами (свой
 
 import argparse
 import json
+import math
 import os
 import random
 import statistics
@@ -65,6 +66,24 @@ import config
 from crop import crop
 from eval_640 import bin_name, box_center, box_size, center_dist_ratio, iou, load_gt
 from geometry import Square, resolve_placement
+
+
+# Критерии сопоставления детекция<->истина. Главный — радиальный (тикет
+# "камерное зрение": задача наведение, а не обводка). IoU остаётся колонкой
+# LEGACY по §5 регламента, радиусы 0.4/0.6 — проверка чувствительности:
+# если порядок рецептов зависит от радиуса в этом диапазоне, значит и
+# радиальный критерий их не разрешает.
+#
+# ВНИМАНИЕ, расхождение с трекером: track_eval использует
+# GT_HIT_RADIAL_FRAC = 0.6, а здесь тикетом задано 0.5. По ФОРМЕ критерии
+# совпали, по КОНСТАНТЕ — нет. Оставлено как есть (тикет явный), 0.6 всё
+# равно считается соседней колонкой; сведение констант — решение владельца.
+MAIN_CRITERION = f"radial_{config.EVAL_CENTER_HIT_THRESHOLD:g}"
+LEGACY_CRITERION = f"iou_{config.EVAL_IOU_MATCH_THR:g}"
+CRITERIA = {MAIN_CRITERION: ("radial", config.EVAL_CENTER_HIT_THRESHOLD),
+            LEGACY_CRITERION: ("iou", config.EVAL_IOU_MATCH_THR)}
+for _f in config.EVAL_RADIAL_SENSITIVITY:
+    CRITERIA.setdefault(f"radial_{_f:g}", ("radial", _f))
 
 
 def split_target_ignore(boxes):
@@ -140,16 +159,66 @@ def center_inside(a, b):
     return a_has_b_center or b_has_a_center
 
 
-def classify_detection(pred, primary, other_targets, ignore_boxes, iou_thr):
-    """-> ('primary', iou) | ('other_target', None) | ('ignore', None) | ('fp', None)."""
-    piou = iou(pred, primary)
-    if piou >= iou_thr:
-        return "primary", piou
+def radial_match(pred, gt, frac):
+    """-> (совпало: bool, качество: float). Критерий НАВЕДЕНИЯ.
+
+    Расстояние центров меньше frac от размера истинной рамки; размер —
+    большая сторона, как везде в проекте.
+
+    Почему это вместо IoU. Задача — навести камеру, а не обвести объект.
+    Физический вопрос «попали ли мы в цель» означает «достаточно ли близок
+    центр»: окно центрируется по цели, механика поворачивается на угол.
+    IoU на вытянутой рамке паруса (w/h ~ 0.13-0.5) отвечает на другой
+    вопрос — насколько совпали ПЛОЩАДИ, — и падает от несовпадения формы
+    даже при идеально совпавших центрах. Тот же критерий уже используют
+    track_eval и клиповая матрица, так что оценка модели и оценка трекера
+    впервые считают одно и то же.
+
+    Качество — насколько близко к центру (1.0 в точку, 0.0 на границе):
+    нужно, чтобы из нескольких попавших детекций выбрать лучшую, как это
+    делал IoU.
+    """
+    px, py = box_center(pred)
+    gx, gy = box_center(gt)
+    r = frac * max(gt[2] - gt[0], gt[3] - gt[1])
+    if r <= 0:
+        return False, 0.0
+    d = math.hypot(px - gx, py - gy)
+    return d <= r, max(0.0, 1.0 - d / r)
+
+
+def classify_detection(pred, primary, other_targets, ignore_boxes, thr,
+                        criterion="radial"):
+    """-> ('primary', качество) | ('other_target', None) | ('ignore', None) | ('fp', None).
+
+    criterion: "radial" — расстояние центров < thr * размер истины (основной,
+    см. radial_match); "iou" — прежний площадной порог, оставлен колонкой
+    LEGACY по §5 регламента.
+
+    Критерий применяется ко ВСЕМ трём сопоставлениям, а не только к цели:
+    иначе «ложной» осталась бы детекция, попавшая в соседа или в ignore по
+    центру, но не по площади, и колонки считали бы разное разным способом.
+    """
+    if criterion == "iou":
+        piou = iou(pred, primary)
+        if piou >= thr:
+            return "primary", piou
+        for ot in other_targets:
+            if iou(pred, ot) >= thr:
+                return "other_target", None
+        for ig in ignore_boxes:
+            if iou(pred, ig) >= thr or center_inside(pred, ig):
+                return "ignore", None
+        return "fp", None
+
+    ok, q = radial_match(pred, primary, thr)
+    if ok:
+        return "primary", q
     for ot in other_targets:
-        if iou(pred, ot) >= iou_thr:
+        if radial_match(pred, ot, thr)[0]:
             return "other_target", None
     for ig in ignore_boxes:
-        if iou(pred, ig) >= iou_thr or center_inside(pred, ig):
+        if radial_match(pred, ig, thr)[0] or center_inside(pred, ig):
             return "ignore", None
     return "fp", None
 
@@ -202,20 +271,27 @@ def evaluate_track(weights, images_dir, labels_dir, k=3.5, jitter_frac=0.15, see
                 confs = [float(c) for c in res.boxes.conf.cpu().numpy()]
                 preds = preds_to_frame(preds_local, placement)
 
-                match_conf = None
-                match_iou = 0.0
-                fp_confs = []
-                for p, c in zip(preds, confs):
-                    kind, piou = classify_detection(p, g, other_targets, ignore, iou_thr)
-                    if kind == "primary":
-                        if match_conf is None or piou > match_iou:
-                            match_conf, match_iou = c, piou
-                    elif kind == "fp":
-                        fp_confs.append(c)
-                    # other_target / ignore: не цель этого испытания и не ложная — пропускаем
+                # Одна и та же детекция классифицируется КАЖДЫМ критерием:
+                # инференс общий, различается только сопоставление. Иначе
+                # колонки считались бы на разных прогонах модели, и разница
+                # между ними включала бы недетерминизм.
+                by = {}
+                for cname, (crit, cthr) in CRITERIA.items():
+                    m_conf, m_q, fps = None, 0.0, []
+                    for p, c in zip(preds, confs):
+                        kind, q = classify_detection(p, g, other_targets, ignore,
+                                                      cthr, crit)
+                        if kind == "primary":
+                            if m_conf is None or q > m_q:
+                                m_conf, m_q = c, q
+                        elif kind == "fp":
+                            fps.append(c)
+                        # other_target / ignore: не цель этого испытания и не ложная
+                    by[cname] = {"match_conf": m_conf, "fp_confs": fps}
 
-                trials.append({"bin": b, "match_conf": match_conf, "fp_confs": fp_confs})
-                per_box_hits_fixed[box_key].append(match_conf is not None and match_conf >= fixed_conf)
+                trials.append({"bin": b, "by": by})
+                main_conf = by[MAIN_CRITERION]["match_conf"]
+                per_box_hits_fixed[box_key].append(main_conf is not None and main_conf >= fixed_conf)
 
                 if viz_dir and r == 0 and len(viz_samples) < viz_n * 3:
                     gt_local = gt_to_local_box(g, placement)
@@ -230,33 +306,58 @@ def evaluate_track(weights, images_dir, labels_dir, k=3.5, jitter_frac=0.15, see
     n_partial_boxes = sum(1 for v in per_box_rate.values() if 0 < v < 1)
     partial_rate = (n_partial_boxes / len(per_box_rate)) if per_box_rate else float("nan")
 
-    def completeness_at(conf_thr):
-        """(per_bin found/total, center_total) при заданном пороге уверенности."""
+    def completeness_at(conf_thr, cname=None):
+        """(per_bin found/total) при заданном пороге уверенности."""
+        cname = cname or MAIN_CRITERION
         stats = {}
         for t in trials:
             stats.setdefault(t["bin"], [0, 0])
             stats[t["bin"]][1] += 1
-            if t["match_conf"] is not None and t["match_conf"] >= conf_thr:
+            mc = t["by"][cname]["match_conf"]
+            if mc is not None and mc >= conf_thr:
                 stats[t["bin"]][0] += 1
         return stats
 
-    def fp_rate_at(conf_thr):
-        total_fp = sum(1 for t in trials for c in t["fp_confs"] if c >= conf_thr)
+    def fp_rate_at(conf_thr, cname=None):
+        cname = cname or MAIN_CRITERION
+        total_fp = sum(1 for t in trials for c in t["by"][cname]["fp_confs"] if c >= conf_thr)
         return total_fp / len(trials) if trials else float("nan")
 
-    # --- патч 3.2: подбор порога под целевую частоту ложных ---
-    candidate_thrs = sorted({round(c, 4) for t in trials for c in ([t["match_conf"]] if t["match_conf"] is not None else []) + t["fp_confs"]})
-    if not candidate_thrs:
-        candidate_thrs = [fixed_conf]
-    best_thr = candidate_thrs[0]
-    best_diff = float("inf")
-    for thr in candidate_thrs:
-        fr = fp_rate_at(thr)
-        diff = abs(fr - target_fp_per_window)
-        if diff < best_diff:
-            best_diff, best_thr = diff, thr
-    aligned_thr = best_thr
-    aligned_fp_rate = fp_rate_at(aligned_thr)
+    def align(cname):
+        """Порог под целевую частоту ложных — СВОЙ для каждого критерия.
+
+        Общий порог был бы ошибкой: критерии по-разному решают, что считать
+        ложной, поэтому и бюджет 0.05/окно достигается на разных порогах.
+
+        budget_reached: если ложных меньше бюджета даже на самом низком
+        пороге, подбор вырождается — порог откатывается к нижнему кандидату
+        (~low_conf), и полнота получается завышенной ни за что. Раньше это
+        молчало; теперь пишется в отчёт (замер: прореживание ложных до 85
+        штук поднимало полноту 0.9221 -> 0.9843 без изменения модели).
+        """
+        cand = sorted({round(c, 4) for t in trials
+                       for c in ([t["by"][cname]["match_conf"]]
+                                 if t["by"][cname]["match_conf"] is not None else [])
+                       + t["by"][cname]["fp_confs"]})
+        if not cand:
+            cand = [fixed_conf]
+        best, best_diff = cand[0], float("inf")
+        for thr in cand:
+            diff = abs(fp_rate_at(thr, cname) - target_fp_per_window)
+            if diff < best_diff:
+                best_diff, best = diff, thr
+        return {
+            "aligned_threshold": best,
+            "aligned_fp_per_window": fp_rate_at(best, cname),
+            "budget_reached": fp_rate_at(cand[0], cname) >= target_fp_per_window,
+            "completeness_aligned": {b_: {"found": f_, "total": t_}
+                                      for b_, (f_, t_) in completeness_at(best, cname).items()},
+        }
+
+    per_criterion = {cname: align(cname) for cname in CRITERIA}
+    main = per_criterion[MAIN_CRITERION]
+    aligned_thr = main["aligned_threshold"]
+    aligned_fp_rate = main["aligned_fp_per_window"]
     completeness_aligned = completeness_at(aligned_thr)
     completeness_fixed = completeness_at(fixed_conf)
     fp_at_fixed_conf = fp_rate_at(fixed_conf)
@@ -271,8 +372,9 @@ def evaluate_track(weights, images_dir, labels_dir, k=3.5, jitter_frac=0.15, see
     # --- медианная уверенность на найденной цели, по корзинам (патч 3.3) ---
     conf_by_bin = {}
     for t in trials:
-        if t["match_conf"] is not None:
-            conf_by_bin.setdefault(t["bin"], []).append(t["match_conf"])
+        mc = t["by"][MAIN_CRITERION]["match_conf"]
+        if mc is not None:
+            conf_by_bin.setdefault(t["bin"], []).append(mc)
     conf_median = {b: statistics.median(v) for b, v in conf_by_bin.items()}
 
     # --- вывод: главная метрика (completeness_aligned) первой колонкой,
@@ -286,8 +388,20 @@ def evaluate_track(weights, images_dir, labels_dir, k=3.5, jitter_frac=0.15, see
         print(f"{b:>10} {af}/{at}={af / at if at else float('nan'):>6.2f}   "
               f"{ff}/{ft}={ff / ft if ft else float('nan'):>6.2f}      {mc:>8.3f}")
 
-    print(f"\n[главная] порог под {target_fp_per_window} ложных/окно: conf>={aligned_thr:.3f} "
-          f"(факт. частота {aligned_fp_rate:.3f}/окно)")
+    print(f"\n[главная] критерий {MAIN_CRITERION}, порог под {target_fp_per_window} "
+          f"ложных/окно: conf>={aligned_thr:.3f} (факт. частота {aligned_fp_rate:.3f}/окно)")
+    if not main["budget_reached"]:
+        print("[ВНИМАНИЕ] бюджет ложных не достигнут даже на низшем пороге — "
+              "порог выродился, полнота завышена, для сравнений НЕ годится")
+    print("[критерии] полнота по всем критериям (микро, все корзины):")
+    for cname in CRITERIA:
+        d = per_criterion[cname]["completeness_aligned"]
+        f_ = sum(v["found"] for v in d.values()); t_ = sum(v["total"] for v in d.values())
+        mark = " <- главный" if cname == MAIN_CRITERION else (
+            " <- LEGACY" if cname == LEGACY_CRITERION else "")
+        print(f"    {cname:>12}: {f_}/{t_} = {f_ / t_ if t_ else float('nan'):.4f}  "
+              f"порог {per_criterion[cname]['aligned_threshold']:.4f}"
+              f"{'' if per_criterion[cname]['budget_reached'] else '  БЮДЖЕТ НЕ ДОСТИГНУТ'}{mark}")
     print(f"[диагностика] fp_at_fixed_conf (conf={fixed_conf}, для сверки со старыми отчётами): "
           f"{fp_at_fixed_conf:.3f}/окно")
     print(f"[диагностика] jitter_spread (pstdev полноты по реализациям бокса): {jitter_spread:.3f}")
@@ -314,7 +428,14 @@ def evaluate_track(weights, images_dir, labels_dir, k=3.5, jitter_frac=0.15, see
         # --- главная метрика решений ---
         "aligned_threshold": aligned_thr,
         "aligned_fp_per_window": aligned_fp_rate,
+        "budget_reached": main["budget_reached"],
+        "match_criterion": MAIN_CRITERION,
         "completeness_aligned": {b: {"found": f_, "total": t} for b, (f_, t) in completeness_aligned.items()},
+        # --- прежний площадной критерий, для сверки со старыми отчётами ---
+        "completeness_aligned_LEGACY_iou": per_criterion[LEGACY_CRITERION]["completeness_aligned"],
+        "aligned_threshold_LEGACY_iou": per_criterion[LEGACY_CRITERION]["aligned_threshold"],
+        # --- чувствительность к радиусу: все критерии целиком ---
+        "by_criterion": per_criterion,
         # --- диагностика (переименовано, тикет "патч v2", п.2) ---
         "fixed_conf": fixed_conf,
         "fp_at_fixed_conf": fp_at_fixed_conf,
