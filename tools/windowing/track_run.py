@@ -268,6 +268,10 @@ def main():
     ap.add_argument("--enable-gate", action="store_true",
                      help="махаланобисов гейт вместо фиксированного радиуса отбора "
                           "(требует --filter-level 2: у alpha-beta нет ковариации)")
+    ap.add_argument("--view-clamp", choices=["window", "frame", "off"], default="window",
+                     help="ограничение убеждения полем зрения: window — вырезка целиком в "
+                          "кадре (умолчание), frame — центр до края кадра, off — без "
+                          "ограничения (прежнее поведение, поглощающая ловушка)")
     ap.add_argument("--gt-first-pick", type=int, default=None,
                      help="индекс бокса трекуемой цели на ПЕРВОМ размеченном кадре — если цель "
                           "не помечена group_id (или помечена не та). Дальше цель тянется "
@@ -287,6 +291,7 @@ def main():
     if args.size_veto_ratio is not None:
         tcfg.SIZE_VETO_RATIO = args.size_veto_ratio
     tcfg.ENABLE_SHADOW_TRACKS = args.shadows
+    tcfg.VIEW_CLAMP_KEEPS_WINDOW_INSIDE = args.view_clamp == "window"
     if args.shadow_birth_needs_pick:
         tcfg.SHADOW_BIRTH_REQUIRES_PICK = True
     if args.score_form:
@@ -399,13 +404,15 @@ def main():
     run_cfg["min_window_deg"] = math.degrees(min_window_ang)
     run_cfg["max_window_deg"] = math.degrees(max_window_ang)
     run_cfg["view_half_deg"] = [math.degrees(view_half_w), math.degrees(view_half_h)]
+    run_cfg["view_clamp"] = args.view_clamp
     with open(os.path.splitext(args.log_out)[0] + ".runcfg.json", "w") as f:
         json.dump(run_cfg, f, indent=2, ensure_ascii=False)
 
     seed_th, seed_ph = ang.px_to_angle(seed_center[0], seed_center[1], intr)
     ts_state = TrackState(tcfg, seed_th, seed_ph, ang.px_size_to_angle(seed_size, intr),
                            min_window_ang, max_window_ang,
-                           view_half_w=view_half_w, view_half_h=view_half_h)
+                           view_half_w=None if args.view_clamp == "off" else view_half_w,
+                           view_half_h=None if args.view_clamp == "off" else view_half_h)
 
     writer = cv2.VideoWriter(args.out, cv2.VideoWriter_fourcc(*"mp4v"), max(args.tick_hz, 1.0),
                               (frame_w, frame_h))

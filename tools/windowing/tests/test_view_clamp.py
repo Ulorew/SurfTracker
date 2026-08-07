@@ -194,3 +194,50 @@ def test_bounds_are_optional_and_default_to_no_clamping():
     ts.filter.cx = 99.0
     ts.clamp_belief_to_view()
     assert ts.filter.cx == 99.0
+
+
+class TestMarginsThemselves:
+    """Прямые проверки _view_margins: сценарные тесты выше их не различают,
+    потому что max(0, ...) съедает разницу, когда полокна больше полукадра.
+    Эти три мутанта (умножение вместо деления по вертикали, значение по
+    умолчанию флага, односторонние границы) пережили мутационный прогон —
+    отсюда и раздел."""
+
+    SMALL = math.radians(4.0)      # окно заведомо меньше полукадра по ОБЕИМ осям
+
+    def test_vertical_margin_uses_half_the_side_not_a_multiple(self):
+        ts = state()
+        mw, mh = ts._view_margins(self.SMALL)
+        assert mh == pytest.approx(HALF_H - self.SMALL / 2)
+        assert mh > 0, "тест не различает деление и умножение при нулевом запасе"
+
+    def test_horizontal_margin_matches_too(self):
+        mw, _ = state()._view_margins(self.SMALL)
+        assert mw == pytest.approx(HALF_W - self.SMALL / 2)
+
+    def test_margin_never_goes_negative(self):
+        """Окно шире кадра: центр обязан встать ровно в центр кадра, а не
+        уехать на отрицательный запас."""
+        mw, mh = state()._view_margins(10 * HALF_W)
+        assert (mw, mh) == (0.0, 0.0)
+
+    def test_flag_absent_means_window_mode(self):
+        """Стенд и старые конфиги флага не знают. Умолчание обязано быть
+        безопасным: вырезка в кадре, а не центр до края."""
+        c = cfg()
+        del c.VIEW_CLAMP_KEEPS_WINDOW_INSIDE
+        ts = TrackState(c, 0.0, 0.0, SIZE, math.radians(10.0), math.radians(40.0),
+                        view_half_w=HALF_W, view_half_h=HALF_H)
+        assert ts._view_margins(self.SMALL)[0] == pytest.approx(HALF_W - self.SMALL / 2)
+
+    def test_frame_mode_lets_the_centre_reach_the_edge(self):
+        ts = state(VIEW_CLAMP_KEEPS_WINDOW_INSIDE=False)
+        assert ts._view_margins(self.SMALL) == (HALF_W, HALF_H)
+
+    @pytest.mark.parametrize("w,h", [(HALF_W, None), (None, HALF_H)])
+    def test_one_sided_bounds_are_refused(self, w, h):
+        """Одна граница из двух — молча неограниченная вторая ось. Лучше
+        отказ при создании, чем трек, уезжающий по вертикали."""
+        with pytest.raises(ValueError):
+            TrackState(cfg(), 0.0, 0.0, SIZE, math.radians(10.0), math.radians(40.0),
+                       view_half_w=w, view_half_h=h)

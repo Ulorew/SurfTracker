@@ -200,6 +200,9 @@ class TrackState:
         # промах, значит окно остаётся снаружи). Меряно на ютубном проходе:
         # пока центр в кадре, петля ведёт цель на 55-100% тактов, а вне
         # кадра — на 0.0-1.4%, и обратно она практически не возвращается.
+        if (view_half_w is None) != (view_half_h is None):
+            raise ValueError("границы кадра задаются обе или ни одной: одна "
+                             "молча оставила бы вторую ось без ограничения")
         self.view_half_w = view_half_w
         self.view_half_h = view_half_h
         self.filter = make_filter(cfg)
@@ -302,7 +305,7 @@ class TrackState:
 
     def clamp_to_view(self, cx: float, cy: float, side: float = None) -> "tuple[float, float]":
         """Проекция точки на допустимую область центра. Без границ — тождество."""
-        if self.view_half_w is None or self.view_half_h is None:
+        if self.view_half_w is None:      # обе или ни одной, см. конструктор
             return cx, cy
         mw, mh = self._view_margins(side)
         return (min(max(cx, -mw), mw), min(max(cy, -mh), mh))
@@ -321,7 +324,7 @@ class TrackState:
         и сужать гейт там, где фильтр знает меньше всего, — та же ошибка, что
         запрещена для затухания экстраполяции.
         """
-        if self.view_half_w is None or self.view_half_h is None:
+        if self.view_half_w is None:      # обе или ни одной, см. конструктор
             return
         if self.filter.cx is not None:
             self.filter.cx, self.filter.cy = self.clamp_to_view(
