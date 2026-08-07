@@ -25,6 +25,15 @@ echo "экран перед стартом: $W"
 [ "$W" = "mWakefulness=Awake" ] || { echo "ОТКАЗ: экран не проснулся"; exit 1; }
 
 timeout 25 adb -s $D shell rm -rf $F/rec_$COMBO $F/infer_$COMBO.json $F/camfps_$COMBO.json >/dev/null 2>&1
+# Пруфы прошлого прогона — СНАЧАЛА забрать, потом удалять. Раньше здесь
+# стояло только rm, и когда понадобилось перепроверить нулевые детекции по
+# сырым пикселям, проверять оказалось нечего: ни одного файла не осталось
+# ни на устройстве, ни в репозитории.
+PROOFS="$(dirname "$0")/proofs/prev_$COMBO"
+mkdir -p "$PROOFS"
+for f in $(timeout 25 adb -s $D shell "ls $F/proof_min*.png 2>/dev/null" | tr -d '\r'); do
+    timeout 25 adb -s $D pull "$f" "$PROOFS/" >/dev/null 2>&1 || true
+done
 timeout 25 adb -s $D shell "rm -f $F/proof_min*.png" >/dev/null 2>&1
 timeout 25 adb -s $D shell am start -n $C/.MainActivity --es combo "$COMBO" --es yuv max \
     --ei seconds "$SECONDS_RUN" --ei yuv_hz "$HZ" --ez infer true \

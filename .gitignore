@@ -39,3 +39,6 @@ export/testset_big/
 export/phone_pack/
 export/models/*.tflite
 export/*.log
+
+# пруфы с устройства (данные, не код)
+android/camfps/proofs/
