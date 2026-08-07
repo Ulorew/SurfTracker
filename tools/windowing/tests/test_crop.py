@@ -115,3 +115,49 @@ def test_crop_side_larger_than_frame_does_not_crash():
     frame = make_frame(300, 200)
     out = crop(frame, Square(cx=150, cy=100, side=5000))
     assert out.shape == (config.WINDOW_SIZE, config.WINDOW_SIZE, 3)
+
+
+@pytest.mark.parametrize("fw,fh", [(1920, 500), (640, 1000), (400, 300)])
+def test_frame_shorter_than_window_still_yields_the_contract(fw, fh):
+    """Кадр, у которого ось меньше WINDOW_SIZE.
+
+    Мутационный прогон показал, что контракт 640x640 держится не тестами, а
+    тем, что все РЕАЛЬНЫЕ кадры больше 640 по обеим осям (счёт crop.py был
+    1/8). Телефон 4К такие кадры не даёт, но вырезка у края и уменьшенные
+    потоки — дают, и вырожденную ветку надо закрепить явно.
+    """
+    frame = make_frame(fw, fh)
+    out = crop(frame, Square(cx=fw / 2, cy=fh / 2, side=5000))
+    assert out.shape == (config.WINDOW_SIZE, config.WINDOW_SIZE, 3)
+
+
+def test_degenerate_frame_matches_direct_resize_bit_for_bit():
+    """Вырожденная ветка обязана быть ИМЕННО ресайзом всего кадра, а не
+    чем-то похожим: иначе «поле зрения окна» на таком кадре молча разъедется
+    с тем, что видит модель."""
+    frame = make_frame(1920, 500)
+    out = crop(frame, Square(cx=960, cy=250, side=5000))
+    direct = cv2.resize(frame, (config.WINDOW_SIZE, config.WINDOW_SIZE),
+                        interpolation=cv2.INTER_LINEAR)
+    assert np.array_equal(out, direct)
+
+
+def test_upscaling_branch_uses_linear_not_area():
+    """INTER_AREA на увеличении даёт блочные артефакты; ветка выбора
+    интерполятора обязана различать уменьшение и увеличение."""
+    frame = make_frame(400, 300)
+    out = crop(frame, Square(cx=200, cy=150, side=5000))
+    area = cv2.resize(frame, (config.WINDOW_SIZE, config.WINDOW_SIZE),
+                      interpolation=cv2.INTER_AREA)
+    assert not np.array_equal(out, area), "выбран INTER_AREA на увеличении"
+
+
+def test_empty_frame_returns_contract_shaped_zeros():
+    """Кадр с нулевой осью: ветка «не падать же» обязана вернуть контракт
+    640x640x3, а не что попало. Мутант по числу каналов её переживал —
+    ветка не была покрыта ничем."""
+    frame = np.zeros((0, 100, 3), dtype=np.uint8)
+    out = crop(frame, Square(cx=50, cy=0, side=640))
+    assert out.shape == (config.WINDOW_SIZE, config.WINDOW_SIZE, 3)
+    assert out.dtype == np.uint8
+    assert not out.any()

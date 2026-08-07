@@ -73,7 +73,7 @@ def split_target_ignore(boxes):
     return targets, ignore
 
 
-def build_track_square(gt_box, k, jitter_frac, rng):
+def build_track_square(gt_box, k, jitter_frac, rng, frame_w=None, frame_h=None):
     """Окно оценки вокруг известной цели.
 
     Сторона берётся с полом config.EVAL_WINDOW_MIN_PX: crop() без паддинга
@@ -85,6 +85,12 @@ def build_track_square(gt_box, k, jitter_frac, rng):
     size = box_size(gt_box)
     cx, cy = box_center(gt_box)
     side = max(k * size, config.EVAL_WINDOW_MIN_PX)
+    # Потолок — короткая сторона кадра: больше пикселей, чем в кадре есть, не
+    # возьмёт ни квадрат, ни прямоугольник, а без потолка clamp_box_to_frame
+    # обрезает сторону по одной оси и crop() сжимает холст анизотропно. Тот
+    # же потолок уже стоит в боевой петле (track_run), здесь его не было.
+    if frame_w is not None and frame_h is not None:
+        side = min(side, frame_w, frame_h)
     jitter = jitter_frac * side
     jx = rng.uniform(-jitter, jitter)
     jy = rng.uniform(-jitter, jitter)
@@ -187,7 +193,7 @@ def evaluate_track(weights, images_dir, labels_dir, k=3.5, jitter_frac=0.15, see
             b = bin_name(size)
 
             for r in range(realizations):
-                square = build_track_square(g, k, jitter_frac, rng)
+                square = build_track_square(g, k, jitter_frac, rng, fw, fh)
                 placement = resolve_placement(square, fw, fh, config.WINDOW_SIZE)
                 window_img = crop(frame, square)
 
@@ -239,7 +245,7 @@ def evaluate_track(weights, images_dir, labels_dir, k=3.5, jitter_frac=0.15, see
         return total_fp / len(trials) if trials else float("nan")
 
     # --- патч 3.2: подбор порога под целевую частоту ложных ---
-    candidate_thrs = sorted({round(c, 4) for t in trials for c in ([t["match_conf"]] if t["match_conf"] else []) + t["fp_confs"]})
+    candidate_thrs = sorted({round(c, 4) for t in trials for c in ([t["match_conf"]] if t["match_conf"] is not None else []) + t["fp_confs"]})
     if not candidate_thrs:
         candidate_thrs = [fixed_conf]
     best_thr = candidate_thrs[0]

@@ -112,7 +112,11 @@ def resolve_gt_track(candidates, group_id=None, manual_first_pick_index=None):
     if jumps:
         med = statistics.median(d for _, d in jumps)
         thresh = max(med * 3, 30.0)
-        warnings = [(name, d) for name, d in jumps if d > thresh]
+        # ПЛЮС, а не вместо: присваивание выбрасывало все разрывы цепочки,
+        # накопленные выше (21 предупреждение из 21 не доходило до человека).
+        # Это два РАЗНЫХ рода сомнения — цепочка порвалась и шаг аномально
+        # велик, — и молча заменять первый вторым нельзя.
+        warnings = warnings + [(name, d) for name, d in jumps if d > thresh]
     return track, warnings
 
 

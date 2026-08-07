@@ -68,6 +68,21 @@ class TestClampBoxToFrame:
         assert out.w == 40
         assert out.x0 == 0
 
+    def test_shifts_inward_past_bottom_edge_keeps_side(self):
+        """Зеркало горизонтальным случаям. Мутация `frame_h - h` -> `frame_h + h`
+        переживала ВСЕ 427 тестов: вертикальный прижим к краю не был покрыт
+        ничем, хотя горизонтальный двойник покрыт двумя тестами."""
+        box = IntBox(10, 90, 50, 130)   # h=40, вылезает за y=100
+        out = clamp_box_to_frame(box, 100, 100)
+        assert out.h == 40
+        assert out.y1 == 100
+
+    def test_shifts_inward_past_top_edge_keeps_side(self):
+        box = IntBox(10, -20, 50, 20)   # h=40
+        out = clamp_box_to_frame(box, 100, 100)
+        assert out.h == 40
+        assert out.y0 == 0
+
     def test_side_larger_than_frame_degrades_to_full_frame(self):
         box = IntBox(-50, -50, 250, 250)
         out = clamp_box_to_frame(box, 100, 80)
@@ -77,6 +92,16 @@ class TestClampBoxToFrame:
         box = square_to_int_box(Square(cx=-10000, cy=-10000, side=100))
         out = clamp_box_to_frame(box, 1000, 800)
         assert out.x0 == 0 and out.y0 == 0 and out.w == 100 and out.h == 100
+
+
+class TestDegenerateBox:
+    def test_zero_width_box_yields_neutral_placement(self):
+        """Вырожденный бокс (нулевой по ОДНОЙ оси) обязан уходить в ту же
+        безопасную ветку, что и нулевой по обеим: масштаб window/0 — это
+        деление на ноль. Мутант `or` -> `and` на этой строке выживал."""
+        pl = resolve_placement(Square(cx=0, cy=50, side=0), 100, 100, 640)
+        if pl.src_box.w == 0 or pl.src_box.h == 0:
+            assert (pl.scale_x, pl.scale_y) == (1.0, 1.0)
 
 
 class TestExpandBox:
@@ -94,9 +119,17 @@ class TestBoxesIntersect:
     def test_overlapping(self):
         assert boxes_intersect(IntBox(0, 0, 10, 10), IntBox(5, 5, 15, 15))
 
-    def test_touching_edges_not_intersecting(self):
-        # полуоткрытый интервал [x0,x1) — соприкасающиеся боксы не пересекаются
-        assert not boxes_intersect(IntBox(0, 0, 10, 10), IntBox(10, 0, 20, 10))
+    @pytest.mark.parametrize("other", [
+        IntBox(10, 0, 20, 10),    # справа вплотную
+        IntBox(-10, 0, 0, 10),    # слева вплотную
+        IntBox(0, 10, 10, 20),    # снизу вплотную
+        IntBox(0, -10, 10, 0),    # сверху вплотную
+    ])
+    def test_touching_edges_not_intersecting(self, other):
+        """Полуоткрытый интервал [x0,x1). Проверяются ВСЕ четыре стороны:
+        тест на одной убивал одно сравнение из четырёх, три мутанта
+        `<` -> `<=` переживали прогон."""
+        assert not boxes_intersect(IntBox(0, 0, 10, 10), other)
 
     def test_disjoint(self):
         assert not boxes_intersect(IntBox(0, 0, 10, 10), IntBox(20, 20, 30, 30))
