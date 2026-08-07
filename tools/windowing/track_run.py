@@ -392,14 +392,20 @@ def main():
     max_window_ang = ang.px_size_to_angle(min(frame_w, frame_h), intr)
     run_cfg["intrinsics"] = {"fx": intr.fx, "cx": intr.cx, "cy": intr.cy,
                               "source": intr.source, "note": intr.note}
+    # Угловые полуразмеры кадра: за ними наблюдать нечем, туда убеждению
+    # трека ходить незачем (см. clamp_belief_to_view).
+    view_half_w, view_half_h = ang.px_to_angle(frame_w, frame_h, intr)
+    view_half_w, view_half_h = abs(view_half_w), abs(view_half_h)
     run_cfg["min_window_deg"] = math.degrees(min_window_ang)
     run_cfg["max_window_deg"] = math.degrees(max_window_ang)
+    run_cfg["view_half_deg"] = [math.degrees(view_half_w), math.degrees(view_half_h)]
     with open(os.path.splitext(args.log_out)[0] + ".runcfg.json", "w") as f:
         json.dump(run_cfg, f, indent=2, ensure_ascii=False)
 
     seed_th, seed_ph = ang.px_to_angle(seed_center[0], seed_center[1], intr)
     ts_state = TrackState(tcfg, seed_th, seed_ph, ang.px_size_to_angle(seed_size, intr),
-                           min_window_ang, max_window_ang)
+                           min_window_ang, max_window_ang,
+                           view_half_w=view_half_w, view_half_h=view_half_h)
 
     writer = cv2.VideoWriter(args.out, cv2.VideoWriter_fourcc(*"mp4v"), max(args.tick_hz, 1.0),
                               (frame_w, frame_h))

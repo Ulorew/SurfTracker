@@ -191,8 +191,17 @@ class TrackState:
     """
 
     def __init__(self, cfg, init_cx: float, init_cy: float, init_size: float,
-                 min_window: float, max_window: float):
+                 min_window: float, max_window: float,
+                 view_half_w: float = None, view_half_h: float = None):
         self.cfg = cfg
+        # Угловые полуразмеры КАДРА. Убеждение за их пределами не поддержано
+        # ничем: наблюдать там нечем, и предсказание, уехавшее за край, —
+        # поглощающее состояние (окно уходит наружу, детекций нет, значит
+        # промах, значит окно остаётся снаружи). Меряно на ютубном проходе:
+        # пока центр в кадре, петля ведёт цель на 55-100% тактов, а вне
+        # кадра — на 0.0-1.4%, и обратно она практически не возвращается.
+        self.view_half_w = view_half_w
+        self.view_half_h = view_half_h
         self.filter = make_filter(cfg)
         self.filter.seed(init_cx, init_cy, init_size)
         # Медленная EMA размера — только для фильтров, которые сами размер не
@@ -266,11 +275,59 @@ class TrackState:
         она вышла из зоны приёма и захват уехал на соседнего сёрфера.
         """
         side = self.current_window_side()
+        self.clamp_belief_to_view(side)
         if self.status == STATUS_TRACKING:
-            cx, cy = self.filter.predict(dt)
+            cx, cy = self.clamp_to_view(*self.filter.predict(dt), side=side)
         else:
             cx, cy = self.last_pred_cx, self.last_pred_cy
         return cx, cy, side
+
+    def _view_margins(self, side: float = None) -> "tuple[float, float]":
+        """Докуда пускать центр окна.
+
+        Режим WINDOW: центр отходит от края на полокна, то есть вырезка
+        целиком лежит в кадре — ровно то, что делает пиксельный
+        resolve_placement. Режим FRAME: центр пускается до самого края кадра,
+        вырезка при этом наполовину висит в полях.
+
+        Разница не косметическая: приём кандидатов меряется от центра
+        радиусом 0.3*стороны, а полокна — это 0.5*стороны. Центр, прижатый к
+        краю, отвергает середину кадра. Какой режим лучше на деле — вопрос
+        замера, а не рассуждения (см. VIEW_CLAMP_KEEPS_WINDOW_INSIDE).
+        """
+        if side is None or not getattr(self.cfg, "VIEW_CLAMP_KEEPS_WINDOW_INSIDE", True):
+            return self.view_half_w, self.view_half_h
+        return (max(0.0, self.view_half_w - side / 2.0),
+                max(0.0, self.view_half_h - side / 2.0))
+
+    def clamp_to_view(self, cx: float, cy: float, side: float = None) -> "tuple[float, float]":
+        """Проекция точки на допустимую область центра. Без границ — тождество."""
+        if self.view_half_w is None or self.view_half_h is None:
+            return cx, cy
+        mw, mh = self._view_margins(side)
+        return (min(max(cx, -mw), mw), min(max(cy, -mh), mh))
+
+    def clamp_belief_to_view(self, side: float = None) -> None:
+        """Проекция ПОЗИЦИИ на видимый конус; скорость и ковариация не
+        трогаются.
+
+        Почему позиция, а не только вырезка: приём кандидатов меряется от
+        предсказания, и центр, уехавший на 80° при полу-FOV 23°, отвергает
+        всё, что реально видно в кадре. Ограничить одну лишь вырезку значит
+        показать модели правильную картинку и отвергнуть всё, что она в ней
+        найдёт.
+
+        Почему не сжимать ковариацию: цель за краем действительно неизвестна,
+        и сужать гейт там, где фильтр знает меньше всего, — та же ошибка, что
+        запрещена для затухания экстраполяции.
+        """
+        if self.view_half_w is None or self.view_half_h is None:
+            return
+        if self.filter.cx is not None:
+            self.filter.cx, self.filter.cy = self.clamp_to_view(
+                self.filter.cx, self.filter.cy, side)
+        self.last_pred_cx, self.last_pred_cy = self.clamp_to_view(
+            self.last_pred_cx, self.last_pred_cy, side)
 
     def step(self, dt: float, detections: list) -> TickResult:
         """detections уже переведены в углы (низкий conf, см. tracking_config).
