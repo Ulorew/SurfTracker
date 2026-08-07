@@ -82,6 +82,18 @@ CONFIGS = {
                              "--shadow-birth-needs-pick", "--score-form", "distance"],
     "prod_maha": ["--enable-a", "--filter-level", "2", "--enable-gate", "--shadows",
                    "--score-form", "maha"],
+    # Ограничение убеждения полем зрения (тикет "критические ошибки"). На
+    # ютубном проходе центр окна уходил за кадр на 68% тактов и не
+    # возвращался; на клипах он не уходит НИ РАЗУ — но прижатие "вырезка
+    # целиком в кадре" срабатывало бы здесь на 34% тактов. Значит правка на
+    # клипах не нейтральна, и её обязан проверить единственный набор с
+    # разметкой. Строки отличаются от prod_no_shadows ровно одним флагом.
+    "clamp_off": ["--enable-a", "--filter-level", "2", "--enable-gate",
+                   "--score-form", "distance", "--view-clamp", "off"],
+    "clamp_frame": ["--enable-a", "--filter-level", "2", "--enable-gate",
+                     "--score-form", "distance", "--view-clamp", "frame"],
+    "clamp_window": ["--enable-a", "--filter-level", "2", "--enable-gate",
+                      "--score-form", "distance", "--view-clamp", "window"],
 }
 
 # Метрики, попадающие в таблицу. Радиальный критерий — основной (тикет:
