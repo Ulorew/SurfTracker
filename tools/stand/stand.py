@@ -40,6 +40,8 @@ FRAME_W, FRAME_H = 1920, 1080
 OFF_X, OFF_Y = (SCREEN_W - FRAME_W) // 2, (SCREEN_H - FRAME_H) // 2
 
 CHESS = (9, 6)          # внутренних углов
+MARK_XY = (110, 110)    # чёрный диск в левом верхнем углу кадра — метка
+MARK_R = 55             # асимметрии, вне поля доски
 SETTLE_SEC = 1.2        # дать монитору отрисоваться и экспозиции устояться
 
 
@@ -71,6 +73,13 @@ def capture(tag, cx=None, cy=None, hist=False, side=640):
         cmd += ["--ei", "cx", str(int(cx)), "--ei", "cy", str(int(cy))]
     if hist:
         cmd += ["--ez", "hist", "true"]
+    # Удалить ПРЕЖНИЕ артефакты до съёмки. Без этого ожидание "файл появился"
+    # выполняется мгновенно на файле с прошлого прогона, снимок не ждётся, и
+    # забираются старые данные — а числа выглядят правдоподобно. Ровно это и
+    # произошло на первой калибровке: результат совпал с предыдущим до знака.
+    adb("shell", "rm", "-f", *[f"{REMOTE}/{tag}{e}" for e in
+                                (".json", ".rgb.png", ".yuvmeta.json", ".y", ".u", ".v",
+                                 ".hist.json")])
     r = adb(*cmd)
     if r.returncode != 0:
         raise SystemExit(f"am start не прошёл: {r.stderr.strip()}")
@@ -103,6 +112,13 @@ def chessboard():
     y0 = (FRAME_H - board.shape[0]) // 2
     x0 = (FRAME_W - board.shape[1]) // 2
     img[y0:y0 + board.shape[0], x0:x0 + board.shape[1]] = board
+    # МЕТКА АСИММЕТРИИ. Доска 9x6 симметрична относительно поворота на 180
+    # градусов, и findChessboardCorners вернёт углы в обратном порядке, если
+    # камера смотрит на экран перевёрнуто. Гомография при этом ляжет ИДЕАЛЬНО
+    # (обе сетки согласованы), ошибка подгонки останется меньше пикселя, а
+    # наведение будет бить в точку, отражённую через центр доски. Ошибку
+    # подгонки этим не поймать в принципе — нужна асимметрия в самой картинке.
+    cv2.circle(img, MARK_XY, MARK_R, 0, -1)
     return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR), (x0, y0, cell)
 
 
@@ -133,6 +149,27 @@ def cmd_calib():
     obj = np.array([[bx0 + (c + 1) * cell, by0 + (r + 1) * cell]
                     for r in range(CHESS[1]) for c in range(CHESS[0])], np.float32)
     Hm, mask = cv2.findHomography(obj, corners.reshape(-1, 2), cv2.RANSAC, 3.0)
+    # Проверка ориентации по метке: где по гомографии должен быть чёрный диск,
+    # там сенсор обязан быть тёмным, а в диагонально противоположной точке —
+    # светлым. Если наоборот, углы пришли в обратном порядке.
+    def brightness(H, xy):
+        q = cv2.perspectiveTransform(np.array([[xy]], np.float32), H).reshape(-1)
+        u, v = int(round(q[0])), int(round(q[1]))
+        if not (0 <= u < gray.shape[1] and 0 <= v < gray.shape[0]):
+            return None
+        return float(gray[max(0, v - 8):v + 8, max(0, u - 8):u + 8].mean())
+
+    opp = (FRAME_W - MARK_XY[0], FRAME_H - MARK_XY[1])
+    b_mark, b_opp = brightness(Hm, MARK_XY), brightness(Hm, opp)
+    flipped = False
+    if b_mark is None or b_opp is None or b_mark >= b_opp:
+        flipped = True
+        Hm, mask = cv2.findHomography(obj, corners.reshape(-1, 2)[::-1], cv2.RANSAC, 3.0)
+        corners = corners[::-1]
+        b_mark, b_opp = brightness(Hm, MARK_XY), brightness(Hm, opp)
+        if b_mark is None or b_opp is None or b_mark >= b_opp:
+            raise SystemExit(f"метка не найдена ни в одной ориентации "
+                              f"(метка {b_mark}, напротив {b_opp}) — смотрите out/calib_full.jpg")
     err = np.linalg.norm(
         cv2.perspectiveTransform(obj.reshape(-1, 1, 2), Hm).reshape(-1, 2)
         - corners.reshape(-1, 2), axis=1)
@@ -141,12 +178,16 @@ def cmd_calib():
             "ошибка_px": {"медиана": float(np.median(err)), "p95": float(np.percentile(err, 95)),
                            "макс": float(err.max())},
             "яркость_Y": ys,
-            "масштаб_кадр_в_сенсор": float(np.sqrt(abs(np.linalg.det(Hm[:2, :2]))))}
+            "масштаб_кадр_в_сенсор": float(np.sqrt(abs(np.linalg.det(Hm[:2, :2])))),
+            "углы_развёрнуты": flipped,
+            "яркость_метки": round(b_mark, 1), "яркость_напротив": round(b_opp, 1)}
     json.dump(res, open(os.path.join(OUT, "calib.result.json"), "w"),
               ensure_ascii=False, indent=1)
     print(json.dumps(res["ошибка_px"], ensure_ascii=False))
     print("яркость Y:", json.dumps(ys, ensure_ascii=False))
     print("масштаб кадр->сенсор:", round(res["масштаб_кадр_в_сенсор"], 3))
+    print(f"ориентация: {'РАЗВЁРНУТА на 180 (углы переставлены)' if flipped else 'прямая'}; "
+          f"метка {b_mark:.0f} против {b_opp:.0f} напротив")
     if res["ошибка_px"]["p95"] > 12:
         print("ВНИМАНИЕ: гомография неточная (p95 > 12 px) — наведение кропа "
               "будет мазать; проверьте геометрию стенда")

@@ -112,22 +112,44 @@ def _iou(a, b):
     return inter / ua if ua > 0 else 0.0
 
 
+# Допуск на расхождение уверенности между рантаймами. Ноль тут недостижим:
+# на телефоне LiteRT со своим XNNPACK, на ноутбуке — свой, порядок сложения
+# в свёртках разный. Замер на пробном снимке: 0.121 против 0.1123. Допуск
+# взят с запасом ВЫШЕ наблюдаемого, но НИЖЕ того, что способно изменить
+# решение (порог модели 0.18-0.56, шаг решения — десятые).
+CONF_TOL = 0.02
+
+
 def level2(j, phone_rgb):
+    """Сверка на НИЗКОМ пороге: сравнивать надо сами рамки, а не то, что
+    осталось после отсечки. На пробном снимке отсечка 0.25 не оставила ни
+    одной рамки ни у той, ни у другой стороны, и вердикт «прошёл» не значил
+    ничего."""
     if phone_rgb is None or not os.path.exists(MODEL):
         return {"вердикт": "нет данных"}
-    phone = nms([d for d in j.get("detections", []) if d["conf"] >= CONF_MAIN])
-    host = nms([d for d in laptop_infer(phone_rgb) if d["conf"] >= CONF_MAIN])
+    LOW = 0.02
+    phone = nms([d for d in j.get("detections", []) if d["conf"] >= LOW])
+    host = nms([d for d in laptop_infer(phone_rgb) if d["conf"] >= LOW])
     pairs = []
     for p in phone:
-        best = max((( _iou(p, hh), hh) for hh in host), default=(0, None))
+        # key=, а не сравнение кортежей: при равном IoU python полез бы
+        # сравнивать сами словари и падал
+        best = max(((_iou(p, hh), hh) for hh in host), key=lambda t: t[0],
+                   default=(0.0, None))
         pairs.append((p, best[1], best[0]))
     matched = [x for x in pairs if x[2] >= 0.5]
+    dconf = max((abs(p["conf"] - q["conf"]) for p, q, _ in matched), default=0.0)
+    if not phone and not host:
+        verdict = "нечего сравнивать (обе стороны пусты)"
+    elif len(phone) == len(host) == len(matched) and dconf <= CONF_TOL:
+        verdict = "прошёл"
+    elif len(phone) == len(host) == len(matched):
+        verdict = f"РАСХОЖДЕНИЕ CONF {dconf:.3f}"
+    else:
+        verdict = "РАСХОЖДЕНИЕ РАМОК"
     return {"рамок_телефон": len(phone), "рамок_ноутбук": len(host),
-            "совпало": len(matched),
-            "макс_дельта_conf": round(max((abs(p["conf"] - q["conf"])
-                                            for p, q, _ in matched), default=0.0), 4),
-            "вердикт": ("прошёл" if len(phone) == len(host) == len(matched)
-                         else "РАСХОЖДЕНИЕ ИНФЕРЕНСА")}
+            "совпало": len(matched), "макс_дельта_conf": round(dconf, 4),
+            "вердикт": verdict}
 
 
 def level3(rec, j):

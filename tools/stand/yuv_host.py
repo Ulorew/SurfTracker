@@ -67,7 +67,10 @@ def y_stats(base):
     meta, planes = load_planes(base)
     W, H = meta["width"], meta["height"]
     yb, y_row, _ = planes["y"]
-    Y = yb[: H * y_row].reshape(H, y_row)[:, :W]
+    # Последняя строка приходит обрезанной до ШИРИНЫ, а не до stride: буфер
+    # короче H*row на (row-W) байт. Читать по полному stride нельзя.
+    rows = len(yb) // y_row
+    Y = yb[: rows * y_row].reshape(rows, y_row)[:, :W]
     return {
         "min": int(Y.min()), "max": int(Y.max()),
         "доля_ниже_16": float((Y < 16).mean()),
