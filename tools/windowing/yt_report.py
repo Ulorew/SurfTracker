@@ -82,7 +82,8 @@ def main():
         for w in v["худшие_минуты"]:
             allw.append((w["отказ"], w["потерь"], k, w["минута"]))
     for r, l, k, mn in sorted(allw, reverse=True)[:5]:
-        print(f"  отказ {r:.2f}, потерь {l}  —  {k[:44]}  минута {mn} ({mn//60}:{mn%60:02d})")
+        # mn — номер минуты от начала, значит таймкод mn:00, а не mn секунд
+        print(f"  отказ {r:.2f}, потерь {l}  —  {k[:44]}  с {mn}:00 по {mn+1}:00")
     json.dump(out, open(os.path.join(d, "summary.json"), "w"), ensure_ascii=False, indent=1)
     return 0
 
