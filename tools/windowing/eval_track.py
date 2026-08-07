@@ -229,7 +229,8 @@ def evaluate_track(weights, images_dir, labels_dir, k=3.5, jitter_frac=0.15, see
                     iou_thr=config.EVAL_IOU_MATCH_THR,
                     center_thr=config.EVAL_CENTER_HIT_THRESHOLD,
                     target_fp_per_window=config.EVAL_TARGET_FP_PER_WINDOW,
-                    imgsz=config.WINDOW_SIZE, viz_dir=None, viz_n=10, subset_of=None):
+                    imgsz=config.WINDOW_SIZE, viz_dir=None, viz_n=10, subset_of=None,
+                    window_ceiling=True):
     from ultralytics import YOLO
 
     model = YOLO(weights)
@@ -262,7 +263,9 @@ def evaluate_track(weights, images_dir, labels_dir, k=3.5, jitter_frac=0.15, see
             b = bin_name(size)
 
             for r in range(realizations):
-                square = build_track_square(g, k, jitter_frac, rng, fw, fh)
+                square = build_track_square(g, k, jitter_frac, rng,
+                                             fw if window_ceiling else None,
+                                             fh if window_ceiling else None)
                 placement = resolve_placement(square, fw, fh, config.WINDOW_SIZE)
                 window_img = crop(frame, square)
 
@@ -463,13 +466,18 @@ if __name__ == "__main__":
     ap.add_argument("--viz-dir", default=None)
     ap.add_argument("--viz-n", type=int, default=10)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--no-window-ceiling", action="store_true",
+                     help="отключить потолок стороны окна оценки короткой стороной кадра "
+                          "(добавлен 07.08). Только для СВЕРКИ со старыми числами: без него "
+                          "1.18% испытаний получают анизотропную вырезку")
     a = ap.parse_args()
 
     report = evaluate_track(a.weights, a.images_dir, a.labels_dir, k=a.k,
                              jitter_frac=a.jitter_frac, seed=a.seed,
                              realizations=a.realizations,
                              low_conf=a.low_conf, fixed_conf=a.fixed_conf,
-                             viz_dir=a.viz_dir, viz_n=a.viz_n)
+                             viz_dir=a.viz_dir, viz_n=a.viz_n,
+                             window_ceiling=not a.no_window_ceiling)
     if a.out:
         with open(a.out, "w") as f:
             json.dump(report, f, indent=2, ensure_ascii=False)

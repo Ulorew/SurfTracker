@@ -14,5 +14,8 @@
         <category android:name="android.intent.category.LAUNCHER"/>
       </intent-filter>
     </activity>
+    <!-- Стенд сквозной сверки зрения: один снимок по команде, наведённый
+         кроп, сырой YUV на диск до конвертации (тикет "камерное зрение"). -->
+    <activity android:name=".StandActivity" android:exported="true"/>
   </application>
 </manifest>

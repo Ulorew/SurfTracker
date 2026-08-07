@@ -1,0 +1,76 @@
+[
+ {
+  "tag": "f1_крупная_верх_лево",
+  "file": "VID_20230710_153350_f000030.jpg",
+  "aim": [
+   745.4,
+   358.9
+  ],
+  "target_px": 318,
+  "n_targets": 1
+ },
+ {
+  "tag": "f2_средняя_верх_право",
+  "file": "VID_20230701_135956_f001050.jpg",
+  "aim": [
+   1415.2,
+   382.3
+  ],
+  "target_px": 143,
+  "n_targets": 1
+ },
+ {
+  "tag": "f3_МЕЛКАЯ_низ_лево",
+  "file": "Primbee Speed Windsurfing [8bYtDBZkrpM]_f001992.jpg",
+  "aim": [
+   500.4,
+   665.3
+  ],
+  "target_px": 52,
+  "n_targets": 1
+ },
+ {
+  "tag": "f4_средняя_низ_право",
+  "file": "The BEST windsurf racing of all time？! Top 5 Racing Moments from the PWA World Tour 2025 [bp6nX64OeI0]_f012600.jpg",
+  "aim": [
+   1161.4,
+   745.1
+  ],
+  "target_px": 149,
+  "n_targets": 1
+ },
+ {
+  "tag": "f5_много_целей",
+  "file": "GOING OFF!!!  Pozo Training Diaries Ep 1 - 2026 [kkwi0oM5NW4]_f007075.jpg",
+  "aim": [
+   1242.0,
+   343.5
+  ],
+  "target_px": 94,
+  "n_targets": 7
+ },
+ {
+  "tag": "f6_много_целей",
+  "file": "GOING OFF!!!  Pozo Training Diaries Ep 1 - 2026 [kkwi0oM5NW4]_f007600.jpg",
+  "aim": [
+   1075.2,
+   537.0
+  ],
+  "target_px": 162,
+  "n_targets": 5
+ },
+ {
+  "tag": "f7_пустой",
+  "file": "The BEST windsurf racing of all time？! Top 5 Racing Moments from the PWA World Tour 2025 [bp6nX64OeI0]_f006025.jpg",
+  "aim": null,
+  "target_px": null,
+  "n_targets": 0
+ },
+ {
+  "tag": "f8_пустой",
+  "file": "VID_20230701_135956_f001020.jpg",
+  "aim": null,
+  "target_px": null,
+  "n_targets": 0
+ }
+]

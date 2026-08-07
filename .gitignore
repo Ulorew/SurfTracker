@@ -42,3 +42,5 @@ export/*.log
 
 # пруфы с устройства (данные, не код)
 android/camfps/proofs/
+tools/stand/out/
+android/camfps/build/

@@ -129,40 +129,15 @@ public class MainActivity extends Activity {
     void cropFromYuv(Image im) {
         long t0 = System.nanoTime();
         cropArrivedNs.set(t0);
-        int stage = cropStage;   // 0=полный, 1=только чтение, 2=чтение+конвертация
-        Image.Plane[] pl = im.getPlanes();
-        java.nio.ByteBuffer yb = pl[0].getBuffer(), ub = pl[1].getBuffer(), vb = pl[2].getBuffer();
-        int yRow = pl[0].getRowStride();
-        int uRow = pl[1].getRowStride(), uPix = pl[1].getPixelStride();
-        int vRow = pl[2].getRowStride(), vPix = pl[2].getPixelStride();
-        java.nio.ByteBuffer out = cropOut;
-        final int S = 640, PLANE = S * S;
-        long acc = 0;
-        for (int j = 0; j < S; j++) {
-            int sy = cropY + j;
-            int yBase = sy * yRow + cropX;
-            int uvBase = (sy >> 1) * uRow;
-            int vvBase = (sy >> 1) * vRow;
-            for (int i = 0; i < S; i++) {
-                int Y = yb.get(yBase + i) & 0xFF;
-                int uvx = (cropX + i) >> 1;
-                int U = (ub.get(uvBase + uvx * uPix) & 0xFF) - 128;
-                int V = (vb.get(vvBase + uvx * vPix) & 0xFF) - 128;
-                if (stage == 1) { acc += Y + U + V; continue; }
-                int R = Y + ((91881 * V) >> 16);
-                int G = Y - ((22554 * U + 46802 * V) >> 16);
-                int B = Y + ((116130 * U) >> 16);
-                if (stage == 2) { acc += R + G + B; continue; }
-                int idx = j * S + i;
-                out.putFloat(idx * 4, (R < 0 ? 0 : R > 255 ? 255 : R) / 255.0f);
-                out.putFloat((PLANE + idx) * 4, (G < 0 ? 0 : G > 255 ? 255 : G) / 255.0f);
-                out.putFloat((2 * PLANE + idx) * 4, (B < 0 ? 0 : B > 255 ? 255 : B) / 255.0f);
-            }
-        }
-        sink += acc;
+        // Сам перевод — в Yuv.convert, ОДНОЙ реализацией со стендом сверки
+        // (тикет "камерное зрение"): скопированный "такой же" цикл разъехался
+        // бы на первой правке, и доказательство зрения перестало бы
+        // относиться к боевому пути.
+        sink += Yuv.convert(im, cropOut, cropX, cropY, 640, cropStage);
         cropMs.add((System.nanoTime() - t0) / 1e6);
         cropDone.incrementAndGet();
     }
+
     /** По той же причине, что и previewTexture: локальные ImageReader-ы
      *  становились недостижимы сразу после сборки запроса, финализатор бросал
      *  их BufferQueue, и захват вставал ровно через 9 секунд. Держать обязаны
