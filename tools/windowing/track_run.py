@@ -46,7 +46,7 @@ def det_to_angles(det, intr, index):
     return (th0, ph0, th1, ph1, conf, index)
 
 
-def angular_window_to_square(cx_ang, cy_ang, side_ang, intr):
+def angular_window_to_square(cx_ang, cy_ang, side_ang, intr, frame_w=None, frame_h=None):
     """Угловое окно -> квадрат в пикселях для crop().
 
     Сторона — БОЛЬШАЯ из двух пиксельных проекций угловой стороны: tan
@@ -68,8 +68,20 @@ def angular_window_to_square(cx_ang, cy_ang, side_ang, intr):
 
     u_lo, v_lo = ang.angle_to_px(clamp(cx_ang - side_ang / 2), clamp(cy_ang - side_ang / 2), intr)
     u_hi, v_hi = ang.angle_to_px(clamp(cx_ang + side_ang / 2), clamp(cy_ang + side_ang / 2), intr)
-    return Square(cx=(u_lo + u_hi) / 2.0, cy=(v_lo + v_hi) / 2.0,
-                   side=max(u_hi - u_lo, v_hi - v_lo))
+    side_px = max(u_hi - u_lo, v_hi - v_lo)
+    # Потолок в ПИКСЕЛЯХ. Заявленный max_window угловой, а разворачивается он
+    # обратно в пиксели во внеосевой точке, где tan растянут: замер по матрице
+    # клипов — 21.6% тактов получали сторону больше короткой стороны кадра, и
+    # 16.6% вырезок приходили в модель анизотропно сжатыми, хотя комментарий
+    # самого кода обещает обратное. Обрезка стороны у clamp_box_to_frame идёт
+    # по каждой оси независимо, поэтому квадрат становился прямоугольником.
+    #
+    # Урезать безопасно: сторона окна, по которой считается радиус приёма,
+    # остаётся угловой и прежней, то есть отбор не становится строже — просто
+    # модель видит ровно то, что физически есть в кадре.
+    if frame_w and frame_h:
+        side_px = min(side_px, float(min(frame_w, frame_h)))
+    return Square(cx=(u_lo + u_hi) / 2.0, cy=(v_lo + v_hi) / 2.0, side=side_px)
 
 
 STATUS_COLOR = {
@@ -431,7 +443,8 @@ def main():
         # иначе модель смотрит в одно окно, а цель выбирается относительно
         # другого центра (см. plan_window в track_logic).
         cx_ang, cy_ang, side_ang = ts_state.plan_window(dt)
-        square = angular_window_to_square(cx_ang, cy_ang, side_ang, intr)
+        square = angular_window_to_square(cx_ang, cy_ang, side_ang, intr,
+                                           frame_w, frame_h)
 
         if i == 0:
             # затравочный такт: состояние уже проинициализировано, детекцию не гоняем повторно
@@ -454,7 +467,7 @@ def main():
             # предсказание, и смещение вырезки в неё попадать не должно
             pred_u, pred_v = ang.angle_to_px(r.predicted_cx, r.predicted_cy, intr)
             win_px = angular_window_to_square(r.predicted_cx, r.predicted_cy,
-                                               r.window_side, intr)
+                                               r.window_side, intr, frame_w, frame_h)
             chosen_dist_px = None
             if chosen is not None:
                 ccx, ccy = (chosen[0] + chosen[2]) / 2.0, (chosen[1] + chosen[3]) / 2.0

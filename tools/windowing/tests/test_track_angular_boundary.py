@@ -151,3 +151,59 @@ class TestNoPixelsLeakIntoTheLoop:
         assert abs(ts.filter.cx) < math.pi
         assert ts.filtered_size == pytest.approx(ang.px_size_to_angle(100, INTR))
         assert ts.filtered_size < 0.1, "размер цели хранится в пикселях, а не в радианах"
+
+
+class TestPixelCeilingIsRealAtFrameEdges:
+    """Заявленный `max_window` — угловой, а вырезка меряется в пикселях.
+
+    tan растянут вне оптической оси, поэтому один и тот же угол у края кадра
+    занимает заметно больше пикселей, чем в центре. Замер по матрице клипов:
+    21.6% тактов получали сторону БОЛЬШЕ короткой стороны кадра, 16.6%
+    вырезок приходили в модель анизотропно сжатыми — при том, что комментарий
+    самого кода обещает обратное.
+
+    Прежние тесты этого не ловили, потому что все щупали ровно центр кадра
+    (960, 540), где растяжения нет.
+    """
+
+    W, H = 1920, 1080
+
+    @staticmethod
+    def _intr():
+        import angles as ang
+        return ang.intrinsics_for("YT_best_windsurf_racing",
+                                   TestPixelCeilingIsRealAtFrameEdges.W,
+                                   TestPixelCeilingIsRealAtFrameEdges.H)
+
+    @pytest.mark.parametrize("u", [960, 1440, 1700, 1850, 1919])
+    @pytest.mark.parametrize("v", [540, 900, 1079])
+    def test_side_never_exceeds_short_frame_side(self, u, v):
+        import angles as ang
+        from track_run import angular_window_to_square
+        intr = self._intr()
+        th, ph = ang.px_to_angle(u, v, intr)
+        side_ang = ang.px_size_to_angle(min(self.W, self.H), intr)
+        sq = angular_window_to_square(th, ph, side_ang, intr, self.W, self.H)
+        assert sq.side <= min(self.W, self.H) + 1e-9
+
+    def test_without_the_ceiling_it_does_exceed(self):
+        """Различающая сила: без передачи размеров кадра та же точка даёт
+        сторону заметно больше кадра — значит тест выше сторожит потолок, а
+        не малость угла."""
+        import angles as ang
+        from track_run import angular_window_to_square
+        intr = self._intr()
+        th, ph = ang.px_to_angle(1850, 540, intr)
+        side_ang = ang.px_size_to_angle(min(self.W, self.H), intr)
+        sq = angular_window_to_square(th, ph, side_ang, intr)
+        assert sq.side > min(self.W, self.H) * 1.2
+
+    def test_crop_of_a_capped_square_stays_square(self):
+        """Смысл потолка: вырезка перестаёт быть прямоугольной. При стороне
+        больше короткой оси clamp_box_to_frame обрезает по каждой оси
+        независимо, и crop() сжимает холст анизотропно."""
+        from geometry import resolve_placement, Square
+        sq = Square(cx=1850, cy=540, side=min(self.W, self.H))
+        pl = resolve_placement(sq, self.W, self.H, 640)
+        assert pl.src_box.w == pl.src_box.h
+        assert pl.scale_x == pytest.approx(pl.scale_y)
