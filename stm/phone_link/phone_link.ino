@@ -26,6 +26,20 @@
 // ============================ СБОРКА ============================
 #define MOTOR_ENABLED 0
 
+// Куда смотрит протокол.
+//   1 — на ST-LINK VCP (Serial). Так плату проверяет ноутбук проводом; этой
+//       возможностью найдены обе ошибки прошивки, и терять её насовсем нельзя.
+//   0 — на USART1, к ESP32. VCP при этом свободен, но говорить по нему
+//       нельзя: канал бинарный, и любой текст в него сломал бы разбор.
+#define LINK_ON_VCP 1
+
+// Пины USART1. НЕ PA9/PA10, хотя это отображение по умолчанию: PA9 — это D8,
+// а D8 занят под enable драйвера (BLDCDriver3PWM(9, 5, 6, 8)). Взята
+// альтернативная пара того же USART1: RX = PA10 (D2), TX = PB6 (D10) — оба
+// пина шилд не использует.
+#define LINK_RX_PIN PA10
+#define LINK_TX_PIN PB6
+
 // ==================== ПАРАМЕТРЫ (в лог по §3) ====================
 // Эти числа обязаны попадать в снимок конфигурации каждого лога: без них
 // разбор "почему остановился именно так" задним числом невозможен.
@@ -50,6 +64,13 @@ static const unsigned long SENS_MAX_US = 920;
 // недостаточной на железе.
 
 // ============================ ЖЕЛЕЗО ============================
+#if LINK_ON_VCP
+  #define LINK Serial
+#else
+  HardwareSerial LinkUart(LINK_RX_PIN, LINK_TX_PIN);
+  #define LINK LinkUart
+#endif
+
 MagneticSensorPWM sensor = MagneticSensorPWM(3, SENS_MIN_US, SENS_MAX_US);
 void doPWM() { sensor.handlePWM(); }
 
@@ -133,12 +154,12 @@ static void sendReply(uint8_t seq) {
   memcpy(&out[2], &theta, 4);
   out[6] = st;
   out[7] = crc8(out, RESP_LEN - 1);
-  Serial.write(out, RESP_LEN);
+  LINK.write(out, RESP_LEN);
 }
 
 static void pump() {
-  while (Serial.available() > 0) {
-    uint8_t b = (uint8_t)Serial.read();
+  while (LINK.available() > 0) {
+    uint8_t b = (uint8_t)LINK.read();
     if (rxn == 0 && b != MAGIC) continue;   // мусор до магика
     rxbuf[rxn++] = b;
     if (rxn < REQ_LEN) continue;
@@ -165,7 +186,7 @@ static void pump() {
 
 // ============================ ЦИКЛ ============================
 void setup() {
-  Serial.begin(BAUD);
+  LINK.begin(BAUD);
 
   pinMode(LED_BUILTIN, OUTPUT);
 
