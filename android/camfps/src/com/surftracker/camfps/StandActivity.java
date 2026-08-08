@@ -81,7 +81,9 @@ public class StandActivity extends Activity {
     void shot() {
         String tag = getIntent().getStringExtra("tag");
         if (tag == null) tag = "shot";
-        final int S = getIntent().getIntExtra("side", 640);
+        // Сторона ЗАПРОШЕННОГО окна. Больше короткой стороны сенсора взять
+        // нечего, меньше входа сети — незачем (пол тот же, что в петле).
+        final int S = Math.max(640, getIntent().getIntExtra("side", 640));
         boolean wantHist = getIntent().getBooleanExtra("hist", false);
         File dir = new File(getExternalFilesDir(null), "stand");
         dir.mkdirs();
@@ -101,10 +103,11 @@ public class StandActivity extends Activity {
             // в тех же условиях, а не только в улучшенных.
             int cx = getIntent().getIntExtra("cx", W / 2);
             int cy = getIntent().getIntExtra("cy", H / 2);
-            int cropX = clamp(cx - S / 2, 0, W - S);
-            int cropY = clamp(cy - S / 2, 0, H - S);
+            int Sc = Math.min(S, Math.min(W, H));   // потолок кадром
+            int cropX = clamp(cx - Sc / 2, 0, W - Sc);
+            int cropY = clamp(cy - Sc / 2, 0, H - Sc);
             j.append("\"tag\":\"").append(tag).append("\",\"sensor_w\":").append(W)
-             .append(",\"sensor_h\":").append(H).append(",\"side\":").append(S)
+             .append(",\"sensor_h\":").append(H).append(",\"side\":").append(Sc)
              .append(",\"aim_cx\":").append(cx).append(",\"aim_cy\":").append(cy)
              .append(",\"crop_x\":").append(cropX).append(",\"crop_y\":").append(cropY);
 
@@ -180,16 +183,20 @@ public class StandActivity extends Activity {
                 write(new File(base.getPath() + ".hist.json"), hs.toString());
             }
 
-            // 2. БОЕВОЙ путь: та же Yuv.convert, что в MainActivity
-            ByteBuffer bin = ByteBuffer.allocateDirect(4 * 3 * S * S).order(ByteOrder.nativeOrder());
+            // 2. БОЕВОЙ путь: тот же Yuv.crop, что в MainActivity. Тензор ВСЕГДА
+            // 640 — вход сети фиксирован; окно крупнее честно уменьшается.
+            // Раньше здесь выделялся тензор S*S, и при side != 640 в сеть уходил
+            // буфер, которого она не принимает.
+            final int NET = 640;
+            ByteBuffer bin = ByteBuffer.allocateDirect(4 * 3 * NET * NET).order(ByteOrder.nativeOrder());
             long t0 = System.nanoTime();
-            long sink = Yuv.convert(im, bin, cropX, cropY, S, 0);
+            long sink = Yuv.crop(im, bin, cropX, cropY, Sc, NET, 0);
             double convMs = (System.nanoTime() - t0) / 1e6;
             j.append(",\"convert_ms\":").append(round3(convMs)).append(",\"sink\":").append(sink);
             im.close();
 
             // 3. Пост-конвертационный кроп картинкой — ровно то, что ушло в сеть
-            savePng(bin, S, new File(base.getPath() + ".rgb.png"));
+            savePng(bin, NET, new File(base.getPath() + ".rgb.png"));
 
             // 4. Инференс на этом же тензоре
             File model = new File(getExternalFilesDir(null), "surf_w8a32.tflite");
@@ -204,7 +211,10 @@ public class StandActivity extends Activity {
                 double infMs = (System.nanoTime() - t1) / 1e6;
                 it.close();
                 j.append(",\"infer_ms\":").append(round3(infMs));
-                j.append(",\"detections\":").append(detections(out[0], S));
+                    // Координаты — в пикселях ОБЛАСТИ Sc, а не тензора: сеть
+                // видела уменьшенную копию, и обратно надо в те же пиксели,
+                // из которых её сделали.
+                j.append(",\"detections\":").append(detections(out[0], Sc));
             } else {
                 j.append(",\"error_model\":\"нет surf_w8a32.tflite\"");
             }

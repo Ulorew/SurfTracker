@@ -102,6 +102,11 @@ public class MainActivity extends Activity {
      *  трекера в этом прогоне нет, а место кропа на время инференса не влияет —
      *  влияет только объём конвертации, и он от места не зависит. */
     int cropX, cropY;
+    /** Сторона ЗАПРОШЕННОГО окна в пикселях сенсора. Тензор всегда 640:
+     *  окно крупнее честно уменьшается (см. Yuv.crop). Пока петли на телефоне
+     *  нет, сторона приходит параметром запуска; когда появится — её будет
+     *  задавать петля, как и в офлайне. */
+    int cropSide = 640;
 
     /**
      * Конвертация YUV_420_888 -> RGB float32 NCHW ТОЛЬКО для окна 640x640.
@@ -133,7 +138,7 @@ public class MainActivity extends Activity {
         // (тикет "камерное зрение"): скопированный "такой же" цикл разъехался
         // бы на первой правке, и доказательство зрения перестало бы
         // относиться к боевому пути.
-        sink += Yuv.convert(im, cropOut, cropX, cropY, 640, cropStage);
+        sink += Yuv.crop(im, cropOut, cropX, cropY, cropSide, 640, cropStage);
         cropMs.add((System.nanoTime() - t0) / 1e6);
         cropDone.incrementAndGet();
     }
@@ -205,8 +210,11 @@ public class MainActivity extends Activity {
             StreamConfigurationMap map = cm.getCameraCharacteristics(id)
                     .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
             Size yuvMax = biggest(map.getOutputSizes(ImageFormat.YUV_420_888));
-            cropX = (yuvMax.getWidth() - 640) / 2;
-            cropY = (yuvMax.getHeight() - 640) / 2;
+            cropSide = getIntent().getIntExtra("crop_side", 640);
+            cropSide = Math.max(640, Math.min(cropSide,
+                        Math.min(yuvMax.getWidth(), yuvMax.getHeight())));
+            cropX = (yuvMax.getWidth() - cropSide) / 2;
+            cropY = (yuvMax.getHeight() - cropSide) / 2;
             Size jpegMax = biggest(map.getOutputSizes(ImageFormat.JPEG));
 
             videoDir = new File(dir, "rec_" + combo);
@@ -454,7 +462,7 @@ public class MainActivity extends Activity {
                         Float.isNaN(hr) ? "нет" : String.format(java.util.Locale.US, "%.3f", hr)));
                 StringBuilder pm = new StringBuilder("{\n  \"crop\": {\"from\": \""
                         + yuvSize.getWidth() + "x" + yuvSize.getHeight() + "\", \"at\": [" + cropX
-                        + ", " + cropY + "], \"size\": 640},\n  \"по_минутам\": [\n");
+                        + ", " + cropY + "], \"size\": " + cropSide + ", \"tensor\": 640},\n  \"по_минутам\": [\n");
                 boolean f1 = true;
                 for (Integer m : new java.util.TreeSet<>(byMinute.keySet())) {
                     double[] mi = arr(byMinute.get(m)), mt = arr(tickByMinute.get(m));
