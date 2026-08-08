@@ -87,6 +87,13 @@ static float    w_applied = 0.0f;   // что отдаётся мотору по
 static uint32_t last_rx_ms = 0;
 static bool     had_first_frame = false;
 static bool     crc_dropped = false;   // снимается следующим ответом
+// Сторожевой ЗАЩЁЛКИВАЕТСЯ. Сообщать "таймаут прямо сейчас" в ответе
+// невозможно по построению: ответ шлётся на пришедший кадр, а он таймаут и
+// снимает. Полезен другой смысл — "пока тебя не было, я остановился", и он
+// требует защёлки, которая держится до первого доклада.
+// Стартовое значение true: до первого кадра мотор действительно стоял, и
+// первый же ответ обязан об этом сказать.
+static bool     wd_latch = true;
 static bool     vel_clipped = false;
 static uint32_t loop_prev_us = 0;
 
@@ -109,7 +116,8 @@ static void rxShift() {
 static void sendReply(uint8_t seq) {
   float theta = sensor.getAngle();
   uint8_t st = 0;
-  if (!had_first_frame || (millis() - last_rx_ms) > WATCHDOG_MS) st |= ST_WATCHDOG;
+  if (wd_latch) st |= ST_WATCHDOG;
+  wd_latch = false;
   // Живость энкодера: длительность импульса в рабочем диапазоне. Оборванный
   // сигнал даёт 0 или выход за пределы; неподвижный вал — нет, поэтому
   // критерий не путает "стоит" с "молчит".
@@ -188,12 +196,21 @@ void loop() {
   loop_prev_us = now_us;
   if (dt < 0.0f || dt > 0.05f) dt = 0.0f;   // первый проход и переполнение
 
+  // Датчик обновляется ЯВНО. Раньше это делал loopFOC(), убранный вместе с
+  // обратной связью; без обновления getAngle() отдаёт кэш, и theta_enc
+  // приходит побитово одинаковой (замечено эхо-тестом: 500 одинаковых
+  // значений подряд).
+  sensor.update();
+
   pump();
 
   // Сторожевой: цель обнуляется, но применяемая скорость СВОДИТСЯ трапецией,
   // а не обрывается. До первого кадра телефона мотор тоже стоит.
   float goal = w_target;
-  if (!had_first_frame || (millis() - last_rx_ms) > WATCHDOG_MS) goal = 0.0f;
+  if (!had_first_frame || (millis() - last_rx_ms) > WATCHDOG_MS) {
+    goal = 0.0f;
+    wd_latch = true;
+  }
 
   vel_clipped = false;
   if (goal >  VEL_LIMIT) { goal =  VEL_LIMIT; vel_clipped = true; }
