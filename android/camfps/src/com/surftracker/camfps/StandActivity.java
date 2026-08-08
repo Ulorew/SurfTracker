@@ -152,6 +152,16 @@ public class StandActivity extends Activity {
             if (im == null) throw new RuntimeException("кадр не пришёл");
             j.append(",\"warmup_ms\":").append(warm);
 
+            // Блок Б тикета: профилирование кропа. Ветка стоит ЗДЕСЬ, на уже
+            // захваченном кадре, чтобы стоимость конвертации не смешивалась со
+            // стоимостью захвата — это разные статьи бюджета такта.
+            if (getIntent().getBooleanExtra("profile", false)) {
+                profile(im, j, W, H, cx, cy);
+                im.close();
+                j.append(",\"ok\":true");
+                return;   // finally допишет json и закроет камеру
+            }
+
             // 1. СЫРОЙ вход — до любой конвертации
             Yuv.dumpRaw(im, base);
             if (wantHist) {
@@ -209,6 +219,104 @@ public class StandActivity extends Activity {
             Log.i(TAG, "ГОТОВО " + base.getPath());
             finish();
         }
+    }
+
+    /** Приёмник аккумуляторов: без него JIT выбрасывает циклы стадий 1 и 2
+     *  целиком, и «чтение» с «конвертацией» оказываются бесплатными. */
+    volatile long sink;
+
+    /**
+     * Профиль кропа (тикет «камерное зрение», блок Б).
+     *
+     * Три стадии по отдельности (1 = выборка плоскостей, 2 = + конвертация
+     * YUV->RGB, 0 = + запись тензора) на развёртке по стороне окна S, в двух
+     * положениях (центр кадра и угол — эффекты stride), reps повторов на
+     * каждую точку.
+     *
+     * Замеряется путь С УМЕНЬШЕНИЕМ до 640: вход сети фиксирован, и только
+     * такой путь способен отдать сети то окно, которое просит петля. Нынешний
+     * путь без ресайза меряется отдельной строкой при S=640 — при больших S
+     * он не боевой (тензор S*S сеть не принимает), и мерить его там значило бы
+     * строить кривую того, чего никто не собирается делать.
+     *
+     * ОГОВОРКА, которую обязан знать читатель чисел: повторы идут по ОДНОМУ
+     * удержанному кадру, то есть кэш прогрет. В бою каждый такт приходит новый
+     * буфер. Поэтому рядом снимается контроль cold: по одному замеру на свежих
+     * кадрах (см. stand.py profile --cold).
+     */
+    void profile(Image im, StringBuilder j, int W, int H, int cx, int cy) {
+        int reps = getIntent().getIntExtra("reps", 50);
+        final int OUT = 640;
+        int[] sides = parseInts(getIntent().getStringExtra("sides"),
+                                 new int[]{640, 960, 1440, 2160, 3060});
+        ByteBuffer out = ByteBuffer.allocateDirect(4 * 3 * OUT * OUT).order(ByteOrder.nativeOrder());
+        j.append(",\"reps\":").append(reps).append(",\"out_side\":").append(OUT)
+         .append(",\"battery_c_before\":").append(batteryC()).append(",\"runs\":[");
+        boolean first = true;
+        for (int S : sides) {
+            if (S > Math.min(W, H)) continue;
+            for (int pi = 0; pi < 2; pi++) {
+                String pos = pi == 0 ? "center" : "corner";
+                int cropX = pi == 0 ? clamp(cx - S / 2, 0, W - S) : 0;
+                int cropY = pi == 0 ? clamp(cy - S / 2, 0, H - S) : 0;
+                for (int stage : new int[]{1, 2, 0}) {
+                    first = row(j, first, "scaled", S, pos, stage, cropX, cropY,
+                                 measure(im, out, cropX, cropY, S, OUT, stage, reps, true));
+                }
+            }
+        }
+        // Нынешний боевой путь: без ресайза, ровно 640 натурой.
+        ByteBuffer raw = ByteBuffer.allocateDirect(4 * 3 * 640 * 640).order(ByteOrder.nativeOrder());
+        int rx = clamp(cx - 320, 0, W - 640), ry = clamp(cy - 320, 0, H - 640);
+        for (int stage : new int[]{1, 2, 0}) {
+            first = row(j, first, "native640", 640, "center", stage, rx, ry,
+                         measure(im, raw, rx, ry, 640, 640, stage, reps, false));
+        }
+        j.append("],\"battery_c_after\":").append(batteryC())
+         .append(",\"sink\":").append(sink);
+    }
+
+    /** reps замеров одной точки + 3 прогрева (иначе первый замер меряет JIT). */
+    double[] measure(Image im, ByteBuffer out, int cropX, int cropY, int S, int OUT,
+                      int stage, int reps, boolean scaled) {
+        for (int r = 0; r < 3; r++)
+            sink += scaled ? Yuv.convertScaled(im, out, cropX, cropY, S, OUT, stage)
+                            : Yuv.convert(im, out, cropX, cropY, S, stage);
+        double[] ms = new double[reps];
+        for (int r = 0; r < reps; r++) {
+            long t0 = System.nanoTime();
+            sink += scaled ? Yuv.convertScaled(im, out, cropX, cropY, S, OUT, stage)
+                            : Yuv.convert(im, out, cropX, cropY, S, stage);
+            ms[r] = (System.nanoTime() - t0) / 1e6;
+        }
+        java.util.Arrays.sort(ms);
+        return new double[]{ms[reps / 2], ms[(int) (reps * 0.95)], ms[0], ms[reps - 1]};
+    }
+
+    boolean row(StringBuilder j, boolean first, String path, int S, String pos, int stage,
+                 int cropX, int cropY, double[] q) {
+        if (!first) j.append(",");
+        j.append("{\"path\":\"").append(path).append("\",\"side\":").append(S)
+         .append(",\"pos\":\"").append(pos).append("\",\"stage\":").append(stage)
+         .append(",\"crop_x\":").append(cropX).append(",\"crop_y\":").append(cropY)
+         .append(",\"p50\":").append(round3(q[0])).append(",\"p95\":").append(round3(q[1]))
+         .append(",\"min\":").append(round3(q[2])).append(",\"max\":").append(round3(q[3]))
+         .append("}");
+        return false;
+    }
+
+    static int[] parseInts(String csv, int[] def) {
+        if (csv == null || csv.isEmpty()) return def;
+        String[] p = csv.split(",");
+        int[] a = new int[p.length];
+        for (int i = 0; i < p.length; i++) a[i] = Integer.parseInt(p[i].trim());
+        return a;
+    }
+
+    double batteryC() {
+        android.content.Intent bi = registerReceiver(null,
+                new android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED));
+        return bi == null ? -1 : bi.getIntExtra("temperature", -1) / 10.0;
     }
 
     /** Выход [1][5][8400] -> список рамок выше порога, в пикселях КРОПА.

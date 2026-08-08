@@ -65,7 +65,8 @@ def open_window():
     cv2.setWindowProperty(WIN, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
 
-def capture(tag, cx=None, cy=None, hist=False, side=640):
+def capture(tag, cx=None, cy=None, hist=False, side=640, profile=False,
+             reps=None, sides=None):
     """Снимок на телефоне. cx/cy — точка наведения в пикселях СЕНСОРА."""
     cmd = ["shell", "am", "start", "-n", f"{PKG}/.StandActivity", "--es", "tag", tag,
            "--ei", "side", str(side)]
@@ -73,6 +74,12 @@ def capture(tag, cx=None, cy=None, hist=False, side=640):
         cmd += ["--ei", "cx", str(int(cx)), "--ei", "cy", str(int(cy))]
     if hist:
         cmd += ["--ez", "hist", "true"]
+    if profile:
+        cmd += ["--ez", "profile", "true"]
+        if reps is not None:
+            cmd += ["--ei", "reps", str(int(reps))]
+        if sides:
+            cmd += ["--es", "sides", ",".join(str(x) for x in sides)]
     # Удалить ПРЕЖНИЕ артефакты до съёмки. Без этого ожидание "файл появился"
     # выполняется мгновенно на файле с прошлого прогона, снимок не ждётся, и
     # забираются старые данные — а числа выглядят правдоподобно. Ровно это и
@@ -224,6 +231,70 @@ def cmd_shots():
     print("снято:", len(done))
 
 
+def cmd_profile():
+    """Блок Б: профиль кропа по стадиям и по стороне окна.
+
+    Сцена не важна для времени, но кадр всё равно показывается: пустой экран
+    дал бы почти однородный YUV, а на однородных данных ветвления и кэш ведут
+    себя не так, как на реальной картинке.
+
+    Считаются ДВА режима:
+      warm  — reps повторов по одному удержанному кадру (стадии различимы,
+              но кэш прогрет);
+      cold  — по одному замеру на СВЕЖИХ кадрах (как в бою), меньше точек.
+    Разница между ними и есть цена прогретого кэша; прятать её нельзя.
+    """
+    import glob
+    reps = 50
+    sides = [640, 960, 1440, 2160, 3060]
+    frames = json.load(open(os.path.join(HERE, "frames.json")))
+    calib = os.path.join(OUT, "calib.result.json")   # гомография, а не json снимка
+    aim = None
+    if os.path.exists(calib):
+        c = json.load(open(calib))
+        H = np.array(c["H"], dtype=float)
+        # наводим в центр монитора — там, где реально стоит цель
+        pt = cv2.perspectiveTransform(
+            np.array([[[OFF_X + FRAME_W / 2, OFF_Y + FRAME_H / 2]]], dtype=np.float64), H)[0][0]
+        aim = (pt[0], pt[1])
+        print(f"наведение по гомографии: ({aim[0]:.0f}, {aim[1]:.0f})")
+    else:
+        print("калибровки нет — наводим в центр сенсора (для ВРЕМЕНИ это не важно)")
+
+    open_window()
+    img = cv2.imread(os.path.join(IMG, frames[0]["file"]))
+    show(img)
+
+    print(f"профиль warm: reps={reps}, S={sides}")
+    capture("profile_warm", cx=aim[0] if aim else None, cy=aim[1] if aim else None,
+            profile=True, reps=reps, sides=sides)
+    pull("profile_warm")
+    d = json.load(open(os.path.join(OUT, "profile_warm.json")))
+    print(f"батарея {d.get('battery_c_before')} -> {d.get('battery_c_after')} °C")
+    print(f"{'путь':>10} {'S':>5} {'место':>7} {'стадия':>7} {'p50':>8} {'p95':>8}")
+    for r in d.get("runs", []):
+        st = {1: "чтение", 2: "+конв", 0: "+тензор"}[r["stage"]]
+        print(f"{r['path']:>10} {r['side']:>5} {r['pos']:>7} {st:>7} "
+              f"{r['p50']:8.2f} {r['p95']:8.2f}")
+
+    # cold: свежий кадр на каждый замер, по одной точке на S
+    print("\nпрофиль cold (свежий кадр на каждый замер):")
+    cold = {}
+    for S in sides:
+        tag = f"profile_cold_{S}"
+        capture(tag, cx=aim[0] if aim else None, cy=aim[1] if aim else None,
+                profile=True, reps=1, sides=[S])
+        pull(tag)
+        c = json.load(open(os.path.join(OUT, tag + ".json")))
+        rows = [r for r in c.get("runs", []) if r["path"] == "scaled"
+                and r["pos"] == "center" and r["stage"] == 0]
+        if rows:
+            cold[S] = rows[0]["p50"]
+            print(f"  S={S:>5}: {rows[0]['p50']:.2f} мс")
+    json.dump(cold, open(os.path.join(OUT, "profile_cold.json"), "w"), indent=1)
+    cv2.destroyAllWindows()
+
+
 if __name__ == "__main__":
     sys.path.insert(0, HERE)
     what = sys.argv[1] if len(sys.argv) > 1 else "help"
@@ -231,5 +302,7 @@ if __name__ == "__main__":
         cmd_calib()
     elif what == "shots":
         cmd_shots()
+    elif what == "profile":
+        cmd_profile()
     else:
         print(__doc__)

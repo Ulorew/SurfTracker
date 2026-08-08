@@ -69,6 +69,82 @@ public final class Yuv {
     }
 
     /**
+     * Кроп S x S С УМЕНЬШЕНИЕМ до OUT x OUT — то, чего в приложении не было.
+     *
+     * Зачем отдельно от convert(). Вход сети фиксирован 640, а петля просит
+     * окно медианой 823 px и p95 1152 (замер по матрице). Нынешний путь берёт
+     * ровно 640 натурой и потому показывает модели НЕ то поле зрения, которое
+     * петля запросила. Честное уменьшение — единственный способ отдать сети
+     * запрошенное окно.
+     *
+     * Билинейно, а не усреднением по площади: замер на 44 тактах ведения дал
+     * IoU топ-бокса p50 0.998 и min 0.959 против INTER_AREA при цене в разы
+     * меньше (6.8-10.0 мс против 38-84 на тех же S). Ближайший сосед не
+     * годится — тот же замер даёт IoU p05 = 0.000.
+     *
+     * Стоимость по построению ~ OUT^2, а не S^2: читаются только те точки,
+     * которые нужны выходу. Именно это и проверяет кривая кроп(S).
+     *
+     * @param stage 1 = только выборка Y/U/V, 2 = + конвертация, 0 = полный путь
+     */
+    public static long convertScaled(Image im, ByteBuffer out, int cropX, int cropY,
+                                      int S, int OUT, int stage) {
+        Image.Plane[] pl = im.getPlanes();
+        ByteBuffer yb = pl[0].getBuffer(), ub = pl[1].getBuffer(), vb = pl[2].getBuffer();
+        int yRow = pl[0].getRowStride();
+        int uRow = pl[1].getRowStride(), uPix = pl[1].getPixelStride();
+        int vRow = pl[2].getRowStride(), vPix = pl[2].getPixelStride();
+        final int PLANE = OUT * OUT;
+        // Отображение центров пикселей: out i -> src cropX + (i+0.5)*S/OUT - 0.5.
+        // Через 16.16 с фиксированной точкой — деления в внутреннем цикле нет.
+        final long scale = ((long) S << 16) / OUT;
+        final long half = (scale >> 1) - (1L << 15);
+        long acc = 0;
+        for (int j = 0; j < OUT; j++) {
+            long sy16 = (long) j * scale + half;
+            int sy = (int) (sy16 >> 16);
+            int fy = (int) (sy16 & 0xFFFF);
+            if (sy < 0) { sy = 0; fy = 0; }
+            int sy1 = sy + 1;
+            if (sy1 > S - 1 + cropY) sy1 = sy;
+            int yBase0 = (cropY + sy) * yRow;
+            int yBase1 = (cropY + sy1) * yRow;
+            int uvBase = ((cropY + sy) >> 1) * uRow;
+            int vvBase = ((cropY + sy) >> 1) * vRow;
+            for (int i = 0; i < OUT; i++) {
+                long sx16 = (long) i * scale + half;
+                int sx = (int) (sx16 >> 16);
+                int fx = (int) (sx16 & 0xFFFF);
+                if (sx < 0) { sx = 0; fx = 0; }
+                int sx1 = sx + 1;
+                if (sx1 > S - 1) sx1 = sx;
+                int p00 = yb.get(yBase0 + cropX + sx) & 0xFF;
+                int p01 = yb.get(yBase0 + cropX + sx1) & 0xFF;
+                int p10 = yb.get(yBase1 + cropX + sx) & 0xFF;
+                int p11 = yb.get(yBase1 + cropX + sx1) & 0xFF;
+                int top = p00 + (((p01 - p00) * fx) >> 16);
+                int bot = p10 + (((p11 - p10) * fx) >> 16);
+                int Y = top + (((bot - top) * fy) >> 16);
+                // Цветность вдвое реже пространственно — берём ближайшую:
+                // билинейная по U/V не окупается, парус различается яркостью.
+                int uvx = (cropX + sx) >> 1;
+                int U = (ub.get(uvBase + uvx * uPix) & 0xFF) - 128;
+                int V = (vb.get(vvBase + uvx * vPix) & 0xFF) - 128;
+                if (stage == 1) { acc += Y + U + V; continue; }
+                int R = Y + ((91881 * V) >> 16);
+                int G = Y - ((22554 * U + 46802 * V) >> 16);
+                int B = Y + ((116130 * U) >> 16);
+                if (stage == 2) { acc += R + G + B; continue; }
+                int idx = j * OUT + i;
+                out.putFloat(idx * 4, (R < 0 ? 0 : R > 255 ? 255 : R) / 255.0f);
+                out.putFloat((PLANE + idx) * 4, (G < 0 ? 0 : G > 255 ? 255 : G) / 255.0f);
+                out.putFloat((2 * PLANE + idx) * 4, (B < 0 ? 0 : B > 255 ? 255 : B) / 255.0f);
+            }
+        }
+        return acc;
+    }
+
+    /**
      * Сырые плоскости КАК ЕСТЬ + метаданные, ДО любой конвертации.
      *
      * Ровно то, чего не хватало прежнему «контролю честности»: он сохранял
