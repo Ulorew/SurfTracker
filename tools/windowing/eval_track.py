@@ -466,12 +466,19 @@ if __name__ == "__main__":
     ap.add_argument("--viz-dir", default=None)
     ap.add_argument("--viz-n", type=int, default=10)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--downscale", choices=["area", "linear"], default=None,
+                     help="интерполятор уменьшения окна. Обучение идёт на area; "
+                          "телефонный путь реализован линейным — этот флаг позволяет "
+                          "сверить их на размеченном наборе, а не поверить на слово")
     ap.add_argument("--no-window-ceiling", action="store_true",
                      help="отключить потолок стороны окна оценки короткой стороной кадра "
                           "(добавлен 07.08). Только для СВЕРКИ со старыми числами: без него "
                           "1.18% испытаний получают анизотропную вырезку")
     a = ap.parse_args()
 
+    if a.downscale:
+        config.DOWNSCALE_INTERPOLATION = (cv2.INTER_AREA if a.downscale == "area"
+                                           else cv2.INTER_LINEAR)
     report = evaluate_track(a.weights, a.images_dir, a.labels_dir, k=a.k,
                              jitter_frac=a.jitter_frac, seed=a.seed,
                              realizations=a.realizations,
