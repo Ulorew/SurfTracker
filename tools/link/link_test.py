@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""Эхо-тест протокола телефон↔STM32 по заведомо исправному транспорту.
+"""Эхо-тест протокола по любому байтовому транспорту.
+
+Клиент транспортно-независим ровно потому, что таков протокол: он читает и
+пишет байты, и ему всё равно, идут они по проводу или по Bluetooth. Отсюда
+прямая сопоставимость чисел.
+
+    провод:    --port /dev/ttyACM0
+    bluetooth: сначала связать и привязать rfcomm, потом --port /dev/rfcomm0
+
+        bluetoothctl --  scan on / pair <MAC> / trust <MAC>
+        sudo rfcomm bind 0 <MAC> 1
+
 
 Тикет «замыкание контура», ступень 2 требует эхо-тест с телефона. Но на
 телефоне сейчас нестабильна сама шина USB, и потери там мерили бы качество
@@ -65,7 +76,9 @@ def self_check():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="/dev/ttyACM0")
+    ap.add_argument("--port", default="/dev/ttyACM0",
+                     help="/dev/ttyACM0 — провод к Nucleo, /dev/rfcomm0 — "
+                          "Bluetooth к ESP32 (см. --help-bt)")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--hz", type=float, default=25.0)
     ap.add_argument("--seconds", type=float, default=60.0)
