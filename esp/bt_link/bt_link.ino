@@ -25,7 +25,7 @@
 
 #include "BluetoothSerial.h"
 
-#define STUB_MODE 1
+#define STUB_MODE 0
 
 // ---------------------- параметры (в лог по §3) ----------------------
 static const char*    BT_NAME   = "SurfTracker-Link";
