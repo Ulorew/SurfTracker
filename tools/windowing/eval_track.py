@@ -285,7 +285,15 @@ def evaluate_track(weights, images_dir, labels_dir, k=3.5, jitter_frac=0.15, see
                         kind, q = classify_detection(p, g, other_targets, ignore,
                                                       cthr, crit)
                         if kind == "primary":
-                            if m_conf is None or q > m_q:
+                            # СИЛЬНЕЙШАЯ из совпавших, а не ближайшая. Метрика
+                            # отвечает на вопрос "нашлась ли цель при пороге T",
+                            # то есть "есть ли ХОТЬ ОДНА совпавшая детекция с
+                            # conf >= T". Отбор по близости записывал сюда
+                            # уверенность ближней слабой детекции, и цель
+                            # считалась пропущенной при живой сильной рядом.
+                            # Порог от правки не съезжает: он садится на
+                            # уверенности ЛОЖНЫХ, а не совпавших.
+                            if m_conf is None or c > m_conf:
                                 m_conf, m_q = c, q
                         elif kind == "fp":
                             fps.append(c)

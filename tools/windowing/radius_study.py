@@ -37,6 +37,16 @@ from eval_track import build_track_square, preds_to_frame, split_target_ignore
 from geometry import resolve_placement
 
 
+def pct(sorted_vals, q):
+    """Перцентиль ближайшим рангом. Прежде стояло sorted[int(q*n)], что при
+    n=20 и q=0.95 даёт индекс 19 — то есть МАКСИМУМ, а не p95. Именно так в
+    отчёт попало 0.097 вместо 0.079 по узким целям."""
+    if not sorted_vals:
+        return float("nan")
+    k = max(0, min(len(sorted_vals) - 1, int(math.ceil(q * len(sorted_vals))) - 1))
+    return sorted_vals[k]
+
+
 def norm_dist(pred, gt):
     """Расстояние центров в долях размера истины (размер = большая сторона)."""
     px, py = box_center(pred)
@@ -101,7 +111,12 @@ def main():
                 rows.append({"name": n, "ti": ti, "size": box_size(g),
                               "bin": bin_name(box_size(g)), "found": False})
                 continue
-            # Лучшая по уверенности — то, что petля и метрика реально возьмут
+            # ВНИМАНИЕ: это ДРУГАЯ популяция, чем у метрики. Здесь берётся
+            # одна лучшая по уверенности детекция на цель, а eval_track
+            # смотрит любую совпавшую; петля же выбирает ближайшую к
+            # предсказанию и уверенность вообще не учитывает
+            # (track_logic.select_target). Поэтому выводы отсюда — про
+            # ГЕОМЕТРИЮ совпадений, а не про значения метрики.
             p, c = max(cand, key=lambda x: x[1])
             d_own = norm_dist(p, g)
             d_oth = min((norm_dist(p, o) * box_size(o) / max(box_size(g), 1e-9)

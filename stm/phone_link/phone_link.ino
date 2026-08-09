@@ -72,7 +72,13 @@ static const unsigned long SENS_MAX_US = 920;
 #endif
 
 MagneticSensorPWM sensor = MagneticSensorPWM(3, SENS_MIN_US, SENS_MAX_US);
-void doPWM() { sensor.handlePWM(); }
+// Счётчик фронтов датчика. Без него бит "энкодер жив" не может УПАСТЬ:
+// pulse_length_us пишется только в обработчике фронта, поэтому оборванный
+// провод оставляет последнее валидное значение навсегда, и проверка "в
+// диапазоне" тождественно истинна. Замечено эхо-тестом: на прогоне с
+// замороженным theta бит показывал 100% тактов.
+volatile uint32_t pwm_edges = 0;
+void doPWM() { pwm_edges++; sensor.handlePWM(); }
 
 #if MOTOR_ENABLED
 BLDCMotor      motor  = BLDCMotor(POLE_PAIRS);
@@ -142,7 +148,13 @@ static void sendReply(uint8_t seq) {
   // Живость энкодера: длительность импульса в рабочем диапазоне. Оборванный
   // сигнал даёт 0 или выход за пределы; неподвижный вал — нет, поэтому
   // критерий не путает "стоит" с "молчит".
-  if (sensor.pulse_length_us >= SENS_MIN_US &&
+  // Живость = длительность в допуске И новые фронты с прошлого ответа.
+  // Одного диапазона мало: он не отличает молчащий датчик от исправного.
+  static uint32_t edges_seen = 0;
+  uint32_t edges_now = pwm_edges;
+  bool fresh = (edges_now != edges_seen);
+  edges_seen = edges_now;
+  if (fresh && sensor.pulse_length_us >= SENS_MIN_US &&
       sensor.pulse_length_us <= SENS_MAX_US) st |= ST_ENC_OK;
   if (vel_clipped) st |= ST_VEL_CLIP;
   if (crc_dropped) st |= ST_CRC_DROP;

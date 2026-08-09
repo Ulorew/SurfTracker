@@ -144,11 +144,23 @@ def main():
 
         if got is None:
             lost += 1
-            rows.append({"i": i, "seq": seq, "ok": 0})
+            # t_send пишется и для потерянного такта: без него статистика
+            # периода выбрасывала ДВЕ выборки на каждую одиночную потерю и
+            # считалась по подвыборке удачных.
+            rows.append({"i": i, "seq": seq, "ok": 0, "t_send": t_send - t_start})
         else:
             rseq, theta, st = got
             if rseq != seq:
+                # Ответ на ЧУЖОЙ кадр. Раньше он засчитывался как успех, и на
+                # просроченной линии счётчик потерь показывал ноль: ответ кадра
+                # i приходил в окно кадра i+1 и закрывал его. Для контура такой
+                # ответ бесполезен — это потеря.
                 seq_mismatch += 1
+                lost += 1
+                rows.append({"i": i, "seq": seq, "rseq": rseq, "ok": 0,
+                              "t_send": t_send - t_start})
+                next_t += period
+                continue
             ok += 1
             rows.append({"i": i, "seq": seq, "rseq": rseq, "ok": 1,
                           "rtt_ms": (t_got - t_send) * 1e3,
@@ -156,9 +168,15 @@ def main():
                           "t_send": t_send - t_start})
         next_t += period
 
+    # Верхняя граница доли потерь по Клопперу-Пирсону при 0 событиях:
+    # 1 - alpha^(1/n). Без неё "потерь 0" читается как "потерь нет", тогда как
+    # 500 кадров дают квант 0.2% и не способны подтвердить допуск 0.1%.
+    loss_ub = (1 - 0.05 ** (1.0 / sent)) if sent and lost == 0 else None
     res = {"port": args.port, "baud": args.baud, "hz": args.hz,
             "seconds": args.seconds, "omega": args.omega,
-            "sent": sent, "ok": ok, "lost": lost, "seq_mismatch": seq_mismatch}
+            "sent": sent, "ok": ok, "lost": lost, "seq_mismatch": seq_mismatch,
+            "потери_верхняя_граница_95": loss_ub,
+            "разрешение_по_потерям": (1.0 / sent) if sent else None}
 
     periods = [rows[i]["t_send"] - rows[i - 1]["t_send"]
                for i in range(1, len(rows))
@@ -166,8 +184,17 @@ def main():
     rtts = sorted(r["rtt_ms"] for r in rows if r.get("ok"))
     if periods:
         ps = sorted(p * 1e3 for p in periods)
-        res["period_ms"] = {"p50": ps[len(ps) // 2], "p95": ps[int(0.95 * len(ps))],
-                             "max": ps[-1]}
+        # ЧЕСТНОЕ ИМЯ. Это период ОТПРАВКИ, и он ограничен сверху по
+        # построению: такт отправляется по расписанию, поэтому проверка
+        # "p95 < 50 мс" на нём тождественно истинна и не может провалиться.
+        res["период_отправки_ms_ТАВТОЛОГИЯ"] = {
+            "p50": ps[len(ps) // 2], "p95": ps[int(0.95 * len(ps))], "max": ps[-1]}
+    recv = sorted(r["t_send"] + r["rtt_ms"] / 1e3 for r in rows if r.get("ok"))
+    if len(recv) > 1:
+        rp = sorted((recv[i] - recv[i - 1]) * 1e3 for i in range(1, len(recv)))
+        # Вот это и есть джиттер линии: момент ПРИЁМА ничем не расписан.
+        res["период_приёма_ms"] = {"p50": rp[len(rp) // 2],
+                                    "p95": rp[int(0.95 * len(rp))], "max": rp[-1]}
     if rtts:
         res["rtt_ms"] = {"p50": rtts[len(rtts) // 2], "p95": rtts[int(0.95 * len(rtts))],
                           "max": rtts[-1]}

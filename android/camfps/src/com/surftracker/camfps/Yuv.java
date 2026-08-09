@@ -125,7 +125,12 @@ public final class Yuv {
             int fy = (int) (sy16 & 0xFFFF);
             if (sy < 0) { sy = 0; fy = 0; }
             int sy1 = sy + 1;
-            if (sy1 > S - 1 + cropY) sy1 = sy;
+            // Граница по S-1, БЕЗ cropY: sy отсчитывается от начала кропа, а
+            // не от начала кадра. С прибавлением cropY условие не срабатывало
+            // ни разу при S > OUT, и нижняя строка кропа читалась за пределами
+            // области — при cy >= 2740 это выход за ёмкость плоскости Y и
+            // IndexOutOfBoundsException, который гасился catch-ом стенда.
+            if (sy1 > S - 1) sy1 = sy;
             int yBase0 = (cropY + sy) * yRow;
             int yBase1 = (cropY + sy1) * yRow;
             int uvBase = ((cropY + sy) >> 1) * uRow;
