@@ -74,11 +74,53 @@ def self_check():
     print("контрольные векторы спецификации сошлись")
 
 
+class BtPort:
+    """RFCOMM-сокет с интерфейсом pyserial. Ровно три метода, которые нужны
+    замеру, — остальное клиенту неизвестно, и это правильно: он меряет
+    протокол, а не транспорт.
+
+    Сокет напрямую, а не через rfcomm bind: тот требует root, а здесь
+    достаточно обычных прав."""
+
+    def __init__(self, mac, channel=1):
+        import socket
+        self.s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM,
+                                socket.BTPROTO_RFCOMM)
+        self.s.settimeout(15.0)
+        self.s.connect((mac, channel))
+        self.s.setblocking(False)
+
+    def write(self, b):
+        try:
+            self.s.sendall(b)
+        except BlockingIOError:
+            pass
+        return len(b)
+
+    def read(self, n):
+        try:
+            return self.s.recv(n)
+        except (BlockingIOError, InterruptedError):
+            return b""
+
+    def reset_input_buffer(self):
+        while self.read(4096):
+            pass
+
+    def close(self):
+        self.s.close()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", default="/dev/ttyACM0",
                      help="/dev/ttyACM0 — провод к Nucleo, /dev/rfcomm0 — "
                           "Bluetooth к ESP32 (см. --help-bt)")
+    ap.add_argument("--bt", default=None,
+                     help="MAC устройства Bluetooth SPP вместо порта. Транспорт "
+                          "меняется, протокол и вся статистика — нет: в этом и "
+                          "смысл байтового протокола")
+    ap.add_argument("--bt-channel", type=int, default=1)
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--hz", type=float, default=25.0)
     ap.add_argument("--seconds", type=float, default=60.0)
@@ -93,8 +135,11 @@ def main():
 
     self_check()
 
-    import serial
-    ser = serial.Serial(args.port, args.baud, timeout=0.0)
+    if args.bt:
+        ser = BtPort(args.bt, args.bt_channel)
+    else:
+        import serial
+        ser = serial.Serial(args.port, args.baud, timeout=0.0)
     time.sleep(0.3)
     ser.reset_input_buffer()
 
@@ -106,6 +151,7 @@ def main():
     next_t = t_start
     sent = ok = lost = bad = 0
     seq_mismatch = 0
+    stale = 0            # ответы на прошедшие кадры: выброшены, не зачтены
 
     for i in range(n):
         # ждём момент такта, не проскакивая накопленное отставание
@@ -134,6 +180,16 @@ def main():
                         rx.pop(0)          # ресинхронизация по магику
                         continue
                     del rx[:RESP_LEN]
+                    if p[0] != seq:
+                        # Ответ на УЖЕ ПРОШЕДШИЙ кадр. Его нельзя ни принять
+                        # (для контура он бесполезен), ни оставить в буфере:
+                        # оставленный, он будет прочитан следующим тактом, и
+                        # каждое опоздание навсегда сдвинет очередь на кадр.
+                        # Прежняя версия так и делала — отставание росло
+                        # монотонно до 97 кадров за 120 секунд, и это
+                        # выглядело как отказ транспорта.
+                        stale += 1
+                        continue
                     got = p
                     break
                 if got:
@@ -150,7 +206,7 @@ def main():
             rows.append({"i": i, "seq": seq, "ok": 0, "t_send": t_send - t_start})
         else:
             rseq, theta, st = got
-            if rseq != seq:
+            if rseq != seq:   # сюда больше не попадаем: устаревшие выброшены выше
                 # Ответ на ЧУЖОЙ кадр. Раньше он засчитывался как успех, и на
                 # просроченной линии счётчик потерь показывал ноль: ответ кадра
                 # i приходил в окно кадра i+1 и закрывал его. Для контура такой
@@ -175,6 +231,7 @@ def main():
     res = {"port": args.port, "baud": args.baud, "hz": args.hz,
             "seconds": args.seconds, "omega": args.omega,
             "sent": sent, "ok": ok, "lost": lost, "seq_mismatch": seq_mismatch,
+            "устаревших_ответов_выброшено": stale,
             "потери_верхняя_граница_95": loss_ub,
             "разрешение_по_потерям": (1.0 / sent) if sent else None}
 
