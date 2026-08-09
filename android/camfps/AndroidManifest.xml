@@ -4,6 +4,8 @@
     android:versionCode="1" android:versionName="1.0">
   <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="35"/>
   <uses-permission android:name="android.permission.CAMERA"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"/>
   <uses-permission android:name="android.permission.RECORD_AUDIO"/>
   <uses-permission android:name="android.permission.WAKE_LOCK"/>
   <uses-feature android:name="android.hardware.camera" android:required="true"/>
@@ -17,5 +19,6 @@
     <!-- Стенд сквозной сверки зрения: один снимок по команде, наведённый
          кроп, сырой YUV на диск до конвертации (тикет "камерное зрение"). -->
     <activity android:name=".StandActivity" android:exported="true"/>
+    <activity android:name=".BtLinkActivity" android:exported="true"/>
   </application>
 </manifest>
