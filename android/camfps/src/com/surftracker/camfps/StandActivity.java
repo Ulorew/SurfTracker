@@ -272,8 +272,6 @@ public class StandActivity extends Activity {
                 for (int stage : new int[]{1, 2, 0}) {
                     first = row(j, first, "scaled", S, pos, stage, cropX, cropY,
                                  measure(im, out, cropX, cropY, S, OUT, stage, reps, 1));
-                    first = row(j, first, "block", S, pos, stage, cropX, cropY,
-                                 measure(im, out, cropX, cropY, S, OUT, stage, reps, 2));
                 }
             }
         }
@@ -289,12 +287,11 @@ public class StandActivity extends Activity {
     }
 
     /** reps замеров одной точки + 3 прогрева (иначе первый замер меряет JIT). */
-    /** mode: 0 — прямой путь без ресайза, 1 — билинейный, 2 — блочный. */
+    /** mode: 0 — прямой путь без ресайза, 1 — билинейный с уменьшением. */
     long one(int mode, Image im, ByteBuffer out, int cropX, int cropY,
               int S, int OUT, int stage) {
         if (mode == 0) return Yuv.convert(im, out, cropX, cropY, S, stage);
-        if (mode == 1) return Yuv.convertScaled(im, out, cropX, cropY, S, OUT, stage);
-        return Yuv.convertBlock(im, out, cropX, cropY, S, OUT, stage);
+        return Yuv.convertScaled(im, out, cropX, cropY, S, OUT, stage);
     }
 
     double[] measure(Image im, ByteBuffer out, int cropX, int cropY, int S, int OUT,
