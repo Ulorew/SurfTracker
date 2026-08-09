@@ -83,8 +83,19 @@ public final class Yuv {
      */
     public static long crop(Image im, ByteBuffer out, int cropX, int cropY,
                              int S, int OUT, int stage) {
-        return S == OUT ? convert(im, out, cropX, cropY, S, stage)
-                         : convertScaled(im, out, cropX, cropY, S, OUT, stage);
+        if (S == OUT) return convert(im, out, cropX, cropY, S, stage);
+        // Уменьшение вдвое и больше — блочным усреднением: билинейка там
+        // выбрасывает почти все исходные пиксели. Замер качества на сырых 4К:
+        // на факторе 4.8 билинейка даёт -0.031 медианной уверенности против
+        // полного INTER_AREA, блочный путь +0.003.
+        //
+        // ЦЕНА измерена на устройстве и растёт квадратично: 24 / 87 / 155 /
+        // 228 мс при S = 640 / 1750 / 2450 / 3060. С инференсом 141 мс верх
+        // диапазона в такт 333 мс НЕ ВЛЕЗАЕТ — отсюда потребуется потолок S
+        // (план Б, см. reports/УМЕНЬШЕНИЕ_ОКНА.md). Пока петли на телефоне
+        // нет, S приходит параметром запуска, и потолок ставить нечему.
+        if (S >= 2 * OUT) return convertBlock(im, out, cropX, cropY, S, OUT, stage);
+        return convertScaled(im, out, cropX, cropY, S, OUT, stage);
     }
 
     /**
@@ -166,6 +177,103 @@ public final class Yuv {
             }
         }
         return acc;
+    }
+
+    /** Промежуточный буфер блочного усреднения. Держится статически и
+     *  переиспользуется: 3*765*765 int это 7 МБ, выделять их на каждом такте
+     *  значило бы кормить сборщик мусора ровно в горячем пути. */
+    private static int[] blockAcc;
+
+    /**
+     * Окно S x S -> тензор OUT x OUT через БЛОЧНОЕ усреднение m x m с
+     * билинейным добором, m = floor(S/OUT).
+     *
+     * Зачем, если есть convertScaled. Билинейка читает четыре отсчёта на
+     * ВЫХОДНОЙ пиксель, то есть при уменьшении в 4.8 раза выбрасывает почти
+     * все исходные пиксели и вырождается в точечную выборку. Замер на сырых
+     * 4К (reports/УМЕНЬШЕНИЕ_ОКНА.md): парная медиана уверенности против
+     * полного INTER_AREA падает монотонно с фактором и на 4.8 даёт -0.031,
+     * тогда как этот путь даёт +0.003 — то есть неотличим от эталона.
+     *
+     * ЧЕСТНО О ЦЕНЕ: усреднение обязано прочитать все S^2 исходных пикселей,
+     * иначе это не усреднение. Стоимость растёт квадратично с S, и это не
+     * недоработка, а суть операции. Отсюда потолок S как план Б.
+     *
+     * Усреднение идёт по RGB, а не по YUV: ровно так считался офлайновый
+     * эталон, и менять порядок операций заодно с внедрением значило бы
+     * сравнивать не то, что проверено.
+     */
+    public static long convertBlock(Image im, ByteBuffer out, int cropX, int cropY,
+                                     int S, int OUT, int stage) {
+        int m = S / OUT;
+        if (m < 2) return convertScaled(im, out, cropX, cropY, S, OUT, stage);
+        final int k = S / m;                 // сторона промежуточного изображения
+        final int need = 3 * k * k;
+        if (blockAcc == null || blockAcc.length < need) blockAcc = new int[need];
+        final int[] acc = blockAcc;
+        java.util.Arrays.fill(acc, 0, need, 0);
+
+        Image.Plane[] pl = im.getPlanes();
+        ByteBuffer yb = pl[0].getBuffer(), ub = pl[1].getBuffer(), vb = pl[2].getBuffer();
+        int yRow = pl[0].getRowStride();
+        int uRow = pl[1].getRowStride(), uPix = pl[1].getPixelStride();
+        int vRow = pl[2].getRowStride(), vPix = pl[2].getPixelStride();
+        final int used = k * m;              // остаток отбрасывается, как в эталоне
+        long sum = 0;
+
+        for (int j = 0; j < used; j++) {
+            int sy = cropY + j;
+            int yBase = sy * yRow + cropX;
+            int uvBase = (sy >> 1) * uRow;
+            int vvBase = (sy >> 1) * vRow;
+            int rowOut = (j / m) * k;
+            for (int i = 0; i < used; i++) {
+                int Y = yb.get(yBase + i) & 0xFF;
+                int uvx = (cropX + i) >> 1;
+                int U = (ub.get(uvBase + uvx * uPix) & 0xFF) - 128;
+                int V = (vb.get(vvBase + uvx * vPix) & 0xFF) - 128;
+                if (stage == 1) { sum += Y + U + V; continue; }
+                int R = Y + ((91881 * V) >> 16);
+                int G = Y - ((22554 * U + 46802 * V) >> 16);
+                int B = Y + ((116130 * U) >> 16);
+                if (stage == 2) { sum += R + G + B; continue; }
+                int idx = 3 * (rowOut + i / m);
+                acc[idx]     += R < 0 ? 0 : (R > 255 ? 255 : R);
+                acc[idx + 1] += G < 0 ? 0 : (G > 255 ? 255 : G);
+                acc[idx + 2] += B < 0 ? 0 : (B > 255 ? 255 : B);
+            }
+        }
+        if (stage != 0) return sum;
+
+        // Билинейный добор k -> OUT по уже усреднённому изображению.
+        final int div = m * m;
+        final int PLANE = OUT * OUT;
+        final long scale = ((long) k << 16) / OUT;
+        final long half = (scale >> 1) - (1L << 15);
+        for (int j = 0; j < OUT; j++) {
+            long sy16 = (long) j * scale + half;
+            int sy = (int) (sy16 >> 16); int fy = (int) (sy16 & 0xFFFF);
+            if (sy < 0) { sy = 0; fy = 0; }
+            int sy1 = sy + 1; if (sy1 > k - 1) sy1 = sy;
+            int r0 = sy * k, r1 = sy1 * k;
+            for (int i = 0; i < OUT; i++) {
+                long sx16 = (long) i * scale + half;
+                int sx = (int) (sx16 >> 16); int fx = (int) (sx16 & 0xFFFF);
+                if (sx < 0) { sx = 0; fx = 0; }
+                int sx1 = sx + 1; if (sx1 > k - 1) sx1 = sx;
+                int idx = j * OUT + i;
+                for (int c = 0; c < 3; c++) {
+                    int p00 = acc[3 * (r0 + sx) + c] / div, p01 = acc[3 * (r0 + sx1) + c] / div;
+                    int p10 = acc[3 * (r1 + sx) + c] / div, p11 = acc[3 * (r1 + sx1) + c] / div;
+                    int top = p00 + (((p01 - p00) * fx) >> 16);
+                    int bot = p10 + (((p11 - p10) * fx) >> 16);
+                    int val = top + (((bot - top) * fy) >> 16);
+                    out.putFloat((c * PLANE + idx) * 4,
+                                  (val < 0 ? 0 : val > 255 ? 255 : val) / 255.0f);
+                }
+            }
+        }
+        return sum;
     }
 
     /**

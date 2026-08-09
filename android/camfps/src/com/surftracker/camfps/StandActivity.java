@@ -271,7 +271,9 @@ public class StandActivity extends Activity {
                 int cropY = pi == 0 ? clamp(cy - S / 2, 0, H - S) : 0;
                 for (int stage : new int[]{1, 2, 0}) {
                     first = row(j, first, "scaled", S, pos, stage, cropX, cropY,
-                                 measure(im, out, cropX, cropY, S, OUT, stage, reps, true));
+                                 measure(im, out, cropX, cropY, S, OUT, stage, reps, 1));
+                    first = row(j, first, "block", S, pos, stage, cropX, cropY,
+                                 measure(im, out, cropX, cropY, S, OUT, stage, reps, 2));
                 }
             }
         }
@@ -280,23 +282,29 @@ public class StandActivity extends Activity {
         int rx = clamp(cx - 320, 0, W - 640), ry = clamp(cy - 320, 0, H - 640);
         for (int stage : new int[]{1, 2, 0}) {
             first = row(j, first, "native640", 640, "center", stage, rx, ry,
-                         measure(im, raw, rx, ry, 640, 640, stage, reps, false));
+                         measure(im, raw, rx, ry, 640, 640, stage, reps, 0));
         }
         j.append("],\"battery_c_after\":").append(batteryC())
          .append(",\"sink\":").append(sink);
     }
 
     /** reps замеров одной точки + 3 прогрева (иначе первый замер меряет JIT). */
+    /** mode: 0 — прямой путь без ресайза, 1 — билинейный, 2 — блочный. */
+    long one(int mode, Image im, ByteBuffer out, int cropX, int cropY,
+              int S, int OUT, int stage) {
+        if (mode == 0) return Yuv.convert(im, out, cropX, cropY, S, stage);
+        if (mode == 1) return Yuv.convertScaled(im, out, cropX, cropY, S, OUT, stage);
+        return Yuv.convertBlock(im, out, cropX, cropY, S, OUT, stage);
+    }
+
     double[] measure(Image im, ByteBuffer out, int cropX, int cropY, int S, int OUT,
-                      int stage, int reps, boolean scaled) {
+                      int stage, int reps, int mode) {
         for (int r = 0; r < 3; r++)
-            sink += scaled ? Yuv.convertScaled(im, out, cropX, cropY, S, OUT, stage)
-                            : Yuv.convert(im, out, cropX, cropY, S, stage);
+            sink += one(mode, im, out, cropX, cropY, S, OUT, stage);
         double[] ms = new double[reps];
         for (int r = 0; r < reps; r++) {
             long t0 = System.nanoTime();
-            sink += scaled ? Yuv.convertScaled(im, out, cropX, cropY, S, OUT, stage)
-                            : Yuv.convert(im, out, cropX, cropY, S, stage);
+            sink += one(mode, im, out, cropX, cropY, S, OUT, stage);
             ms[r] = (System.nanoTime() - t0) / 1e6;
         }
         java.util.Arrays.sort(ms);
