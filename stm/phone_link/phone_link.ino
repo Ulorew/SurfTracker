@@ -67,14 +67,18 @@ static const unsigned long SENS_MAX_US = 920;
 #if LINK_ON_VCP
   #define LINK Serial
 #else
-  // Пины задаются setRx/setTx, а НЕ конструктором HardwareSerial. Причина
-  // не в красоте: в ядре STM32 3.0.0 HardwareSerial стал абстрактным, и
-  // конструктор с двумя пинами перестал существовать — сборка ломается.
-  // setRx/setTx есть и в 2.10.1, и в 3.0.0, поэтому скетч не зависит от
-  // того, какое ядро окажется установленным. Привязывать проект к версии
-  // ядра ради одной строки — плохой обмен: автообновление уже один раз
-  // сломало сборку.
-  #define LINK Serial1
+  // Своя переменная, а НЕ Serial1: предопределённые SerialN создаются
+  // ядром только при ENABLE_HWSERIAL_N, иначе линковка падает на
+  // "undefined reference to Serial1". Требовать флаг сборки — значит
+  // завести скрытое условие, о котором однажды забудут.
+  //
+  // ЯДРО: собирать ядром STM32 2.10.1. На 3.0.0 HardwareSerial стал
+  // абстрактным и этот конструктор исчезает; 2.10.1 — та версия, на
+  // которой собран и проверен работающий бинарник (эхо-тест 500/500).
+  // Автообновление ядра уже ломало сборку дважды: этим конструктором и
+  // несовместимостью SimpleFOC 2.3.5 с 3.0.0.
+  HardwareSerial LinkUart(LINK_RX_PIN, LINK_TX_PIN);
+  #define LINK LinkUart
 #endif
 
 MagneticSensorPWM sensor = MagneticSensorPWM(3, SENS_MIN_US, SENS_MAX_US);
@@ -204,10 +208,6 @@ static void pump() {
 
 // ============================ ЦИКЛ ============================
 void setup() {
-#if !LINK_ON_VCP
-  LINK.setRx(LINK_RX_PIN);
-  LINK.setTx(LINK_TX_PIN);
-#endif
   LINK.begin(BAUD);
 
   pinMode(LED_BUILTIN, OUTPUT);
