@@ -30,8 +30,14 @@
 // ---------------------- параметры (в лог по §3) ----------------------
 static const char*    BT_NAME   = "SurfTracker-Link";
 static const uint32_t UART_BAUD = 115200;   // как в спецификации
-static const int      PIN_RX    = 16;       // Serial2 RX  <- TX STM32
-static const int      PIN_TX    = 17;       // Serial2 TX  -> RX STM32
+// GPIO25/26, а НЕ 16/17. У модулей WROVER пины 16 и 17 заняты под внешнюю
+// PSRAM, и на такой плате мост молча не заработал бы — а по чипу
+// (ESP32-D0WD-V3) отличить WROOM от WROVER нельзя, PSRAM внешняя. 25 и 26
+// свободны на всех вариантах: не участвуют в загрузке, не заняты флешем,
+// не input-only. Цена выбора — ноль, цена ошибки — вечер отладки паяного
+// соединения.
+static const int      PIN_RX    = 25;       // Serial2 RX  <- TX STM32 (PB6, D10)
+static const int      PIN_TX    = 26;       // Serial2 TX  -> RX STM32 (PA10, D2)
 static const int      PIN_LED   = 2;
 
 // ---------------------- протокол ----------------------
