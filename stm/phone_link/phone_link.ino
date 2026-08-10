@@ -42,7 +42,13 @@ static const uint32_t EXTRAP_CAP_MS  = 150;    // потолок интегри�
 static const float    SETPOINT_LIMIT = 2.0f;   // рад/с, ~115 град/с
 static const float    HW_LIMIT       = 6.0f;   // рад/с, граница безопасности вала
 static const float    MAX_ACCEL      = 1.0f;   // рад/с^2, рампа
-static const float    VOLTAGE_LIMIT  = 1.5f;   // В
+// 2.0 В. История ручки такая: на 1.5 В тихо, но рябь скорости в разомкнутом
+// контуре 10.5% СКО от команды. На 2.5 В появился высокочастотный шум и
+// треск. Версия Hero — плохой контакт фазы, а не сама величина напряжения
+// (на замкнутом контуре 3 В шли тихо). 2.0 В взято как нижний край
+// диапазона: если виноват контакт, будет тихо; если колебания ротора без
+// демпфирования — шум вырастет плавно, и это будет видно.
+static const float    VOLTAGE_LIMIT  = 2.0f;   // В
 static const float    SUPPLY_V       = 12.0f;
 static const uint8_t  POLE_PAIRS     = 11;
 static const unsigned long SENS_MIN_US = 7;

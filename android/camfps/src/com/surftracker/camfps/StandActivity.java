@@ -199,12 +199,32 @@ public class StandActivity extends Activity {
             savePng(bin, NET, new File(base.getPath() + ".rgb.png"));
 
             // 4. Инференс на этом же тензоре
-            File model = new File(getExternalFilesDir(null), "surf_w8a32.tflite");
+            // Модель выбирается извне: -e model person_w8a32.tflite. По
+            // умолчанию сёрфовая — чтобы старые прогоны запускались без правок.
+            String mn = getIntent().getStringExtra("model");
+            if (mn == null) mn = "surf_w8a32.tflite";
+            File model = new File(getExternalFilesDir(null), mn);
+            j.append(",\"model\":\"").append(mn).append("\"");
             if (model.exists()) {
                 Interpreter.Options o = new Interpreter.Options();
                 o.setNumThreads(1);
                 Interpreter it = new Interpreter(model, o);
-                float[][][] out = new float[1][5][8400];
+                // Форма выхода СПРАШИВАЕТСЯ у модели, а не берётся константой.
+                // У сёрфовой это [1,5,8400] (4 координаты + одна уверенность),
+                // у COCO — [1,84,8400] (4 + 80 классов). Захардкоженная пятёрка
+                // на модели с 84 строками дала бы не ошибку, а тихо неверный
+                // разбор: буфер меньше выхода.
+                //
+                // Строка 4 в обоих случаях означает одно и то же. У сёрфовой это
+                // её единственный класс, у COCO — класс 0, то есть person.
+                // Проверено на кадре: bus.jpg даёт в строке 4 максимум 0.891 по
+                // людям, а автобус уходит в строку 9. Поэтому detections() ниже
+                // общий, и человек фильтруется самим выбором строки, а не
+                // отдельным проходом по 80 классам.
+                int[] osh = it.getOutputTensor(0).shape();
+                j.append(",\"out_shape\":\"").append(osh[0]).append("x")
+                 .append(osh[1]).append("x").append(osh[2]).append("\"");
+                float[][][] out = new float[1][osh[1]][osh[2]];
                 bin.rewind();
                 long t1 = System.nanoTime();
                 it.run(bin, out);
@@ -216,7 +236,7 @@ public class StandActivity extends Activity {
                 // из которых её сделали.
                 j.append(",\"detections\":").append(detections(out[0], Sc));
             } else {
-                j.append(",\"error_model\":\"нет surf_w8a32.tflite\"");
+                j.append(",\"error_model\":\"нет файла ").append(mn).append("\"");
             }
             j.append(",\"ok\":true");
         } catch (Throwable t) {
