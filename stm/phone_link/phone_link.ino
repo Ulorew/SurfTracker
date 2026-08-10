@@ -106,7 +106,14 @@ static bool     had_first = false;
 static float    w_ramp = 0.0f;                   // исполняемая команда
 static uint32_t loop_prev_us = 0;
 
-static bool     st_watchdog = true;   // до первого кадра мотор стоял
+// Watchdog ЗАЩЁЛКИВАЕТСЯ. Сообщать «таймаут прямо сейчас» в ответе
+// невозможно по построению: ответ шлётся на пришедший кадр, а он таймаут и
+// снимает. Полезен другой смысл — «пока тебя не было, я остановился», и он
+// требует защёлки, которая держится до первого доклада.
+// В v1 эта же ошибка была найдена эхо-тестом и исправлена; в v2 я повторил
+// её заново, и её снова нашёл тест, а не чтение кода.
+static bool     st_watchdog = true;   // текущее состояние
+static bool     wd_latch = true;      // было ли срабатывание с прошлого доклада
 static bool     st_extrap_cap = false;
 static bool     st_ramp_sat = false;
 static bool     st_clamp = false;
@@ -154,7 +161,8 @@ static float thetaFiltered() {
 
 static uint8_t statusByte() {
   uint8_t st = 0;
-  if (st_watchdog)   st |= proto::ST_WATCHDOG;
+  if (wd_latch) st |= proto::ST_WATCHDOG;
+  wd_latch = false;
   if (st_extrap_cap) st |= proto::ST_EXTRAP_CAP;
   if (st_ramp_sat)   st |= proto::ST_RAMP_SAT;
   // Живость энкодера: свежие фронты И длительность в допуске. Одного
@@ -283,6 +291,7 @@ void loop() {
     goal = 0.0f;
     if (!st_watchdog) slipReset();    // вход в watchdog сбрасывает интеграл
     st_watchdog = true;
+    wd_latch = true;
     st_extrap_cap = false;
   } else {
     uint32_t age = now - t_rx_ms;
