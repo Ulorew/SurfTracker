@@ -20,5 +20,6 @@
          кроп, сырой YUV на диск до конвертации (тикет "камерное зрение"). -->
     <activity android:name=".StandActivity" android:exported="true"/>
     <activity android:name=".BtLinkActivity" android:exported="true"/>
+    <activity android:name=".TrackActivity" android:exported="true"/>
   </application>
 </manifest>
