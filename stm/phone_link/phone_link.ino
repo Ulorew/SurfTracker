@@ -22,6 +22,7 @@
 
 #include <SimpleFOC.h>
 #include <proto_v2.h>
+#include <control_v2.h>
 
 // ============================ СБОРКА ============================
 #define MOTOR_ENABLED 1
@@ -147,45 +148,27 @@ BLDCDriver3PWM driver = BLDCDriver3PWM(9, 5, 6, 8);
 // ============================ СОСТОЯНИЕ ============================
 static uint8_t  rxbuf[proto::REQ_LEN];
 static uint8_t  rxn = 0;
-
-static float    w_pkt = 0.0f, wdot_pkt = 0.0f;   // последняя ПРИНЯТАЯ уставка
-static uint32_t t_rx_ms = 0;
-static uint8_t  last_seq = 0;
-static bool     had_first = false;
-
-static float    w_ramp = 0.0f;                   // исполняемая команда
 static uint32_t loop_prev_us = 0;
-
-// Watchdog ЗАЩЁЛКИВАЕТСЯ. Сообщать «таймаут прямо сейчас» в ответе
-// невозможно по построению: ответ шлётся на пришедший кадр, а он таймаут и
-// снимает. Полезен другой смысл — «пока тебя не было, я остановился», и он
-// требует защёлки, которая держится до первого доклада.
-// В v1 эта же ошибка была найдена эхо-тестом и исправлена; в v2 я повторил
-// её заново, и её снова нашёл тест, а не чтение кода.
-static bool     st_watchdog = true;   // текущее состояние
-static bool     wd_latch = true;      // было ли срабатывание с прошлого доклада
-static bool     st_extrap_cap = false;
-static bool     st_ramp_sat = false;
-static bool     st_clamp = false;
-static bool     st_slip = false;
 static uint8_t  crc_err_count = 0;    // по модулю 4, биты 6-7
 
-// кольцо детектора срыва: угол и накопленный интеграл команды
-static float    slip_theta[SLIP_N];
-static float    slip_integ[SLIP_N];
-static uint8_t  slip_i = 0;
-static bool     slip_full = false;
-static uint32_t slip_last_ms = 0;
-static float    integ_cmd = 0.0f;     // накопленный интеграл w_ramp
+// Весь закон управления — уставка, экстраполяция, пределы, рампа, сторож,
+// детектор срыва — живёт в control_v2.h. Здесь его НЕТ намеренно.
+//
+// Причина не в красоте. §9 спецификации требует, чтобы четыре мутации роняли
+// четыре названных теста. Пока логика жила в этом файле, каждая мутация
+// означала перепрошивку и прогон на железе — то есть тесты, которые никто не
+// станет гонять, и они действительно не гонялись. Вынесенная логика
+// проверяется на ноутбуке за миллисекунды (tools/link/control_tests.sh), и
+// проверяется ИМЕННО ТОТ код, который поедет.
+//
+// Первый же прогон этих тестов нашёл настоящий дефект: правило свежести не
+// работало вовсе. Разбор — в комментарии к Ctl::accept.
+static ctl::Ctl C;
 
 static float    med_buf[MED_N];
 static uint8_t  med_i = 0;
 static bool     med_full = false;
 static uint32_t med_last_ms = 0;
-
-static void slipReset() {
-  slip_i = 0; slip_full = false; integ_cmd = 0.0f; st_slip = false;
-}
 
 /** Медиана пяти без сортировки массива-источника: копия и три прохода
  *  выбором. На пяти элементах это дешевле любой библиотечной сортировки. */
@@ -210,11 +193,6 @@ static float thetaFiltered() {
 }
 
 static uint8_t statusByte() {
-  uint8_t st = 0;
-  if (wd_latch) st |= proto::ST_WATCHDOG;
-  wd_latch = false;
-  if (st_extrap_cap) st |= proto::ST_EXTRAP_CAP;
-  if (st_ramp_sat)   st |= proto::ST_RAMP_SAT;
   // Живость энкодера: свежие фронты И длительность в допуске. Одного
   // диапазона мало — pulse_length_us пишется только на фронте, поэтому
   // оборванный провод оставлял бы последнее валидное значение навсегда.
@@ -222,17 +200,19 @@ static uint8_t statusByte() {
   uint32_t e = pwm_edges;
   bool fresh = (e != edges_seen);
   edges_seen = e;
-  if (fresh && sensor.pulse_length_us >= SENS_MIN_US &&
-      sensor.pulse_length_us <= SENS_MAX_US) st |= proto::ST_ENC_OK;
-  if (st_clamp) st |= proto::ST_CLAMP;
-  if (st_slip)  st |= proto::ST_SLIP;
+  bool enc_ok = fresh && sensor.pulse_length_us >= SENS_MIN_US &&
+                 sensor.pulse_length_us <= SENS_MAX_US;
+
+  // Остальные биты — из закона управления. Защёлка сторожа снимается там же
+  // при чтении, см. §8.
+  uint8_t st = C.statusByte(enc_ok);
   st |= (uint8_t)((crc_err_count & 0x03) << proto::ST_CRC_SHIFT);
   return st;
 }
 
 static void sendTelemetry(uint8_t seq) {
   uint8_t out[proto::TEL_LEN];
-  proto::buildTel(out, seq, thetaFiltered(), w_ramp, statusByte());
+  proto::buildTel(out, seq, thetaFiltered(), C.w_ramp, statusByte());
   LINK.write(out, proto::TEL_LEN);
 }
 
@@ -270,20 +250,10 @@ static void pump() {
       continue;
     }
 
-    // Свежесть. Кадр вне окна (перезапуск телефона) принимается безусловно:
-    // рампа сгладит. Устаревший кадр пачки НЕ применяется, но ответ на него
-    // шлётся — иначе телефон не сможет сопоставить его по seq и посчитать.
-    bool fresh = !had_first || proto::isFresher(seq, last_seq);
-    bool out_of_window = had_first && !fresh &&
-                          ((uint8_t)((seq - last_seq) & 0x7F) > 64);
-    if (fresh || out_of_window) {
-      if (st_watchdog) slipReset();   // возобновление после watchdog
-      w_pkt = w; wdot_pkt = wd;
-      t_rx_ms = millis();
-      last_seq = seq;
-      had_first = true;
-      st_watchdog = false;
-    }
+    // Применить или отвергнуть решает закон управления. Ответ шлётся В ЛЮБОМ
+    // случае: иначе телефон не сможет сопоставить кадр по seq и посчитать
+    // потери, а устаревшие кадры выглядели бы для него как пропавшие.
+    C.accept(seq, w, wd, millis());
     sendTelemetry(seq);
   }
 }
@@ -309,9 +279,18 @@ void setup() {
   motor.init();
 #endif
 
+  ctl::Params cp = ctl::defaults();
+  cp.watchdog_ms    = WATCHDOG_MS;
+  cp.extrap_cap_ms  = EXTRAP_CAP_MS;
+  cp.setpoint_limit = SETPOINT_LIMIT;
+  cp.hw_limit       = HW_LIMIT;
+  cp.max_accel      = MAX_ACCEL;
+  cp.slip_threshold = SLIP_THRESHOLD;
+  cp.slip_window_ms = SLIP_WINDOW_MS;
+  cp.slip_step_ms   = SLIP_STEP_MS;
+  C.init(cp);
+
   loop_prev_us = millis() * 1000UL;
-  slip_last_ms = millis();
-  slipReset();
 }
 
 void loop() {
@@ -333,51 +312,7 @@ void loop() {
 
   pump();
 
-  uint32_t now = millis();
-
-  // --- уставка: экстраполяция по w_dot с потолком ---
-  float goal;
-  if (!had_first || (now - t_rx_ms) > WATCHDOG_MS) {
-    goal = 0.0f;
-    if (!st_watchdog) slipReset();    // вход в watchdog сбрасывает интеграл
-    st_watchdog = true;
-    wd_latch = true;
-    st_extrap_cap = false;
-  } else {
-    uint32_t age = now - t_rx_ms;
-    st_extrap_cap = age > EXTRAP_CAP_MS;
-    float t = (st_extrap_cap ? EXTRAP_CAP_MS : age) * 1e-3f;
-    goal = w_pkt + wdot_pkt * t;
-  }
-
-  // --- пределы: уставка, затем аппаратный ---
-  st_clamp = false;
-  if (goal >  SETPOINT_LIMIT) { goal =  SETPOINT_LIMIT; st_clamp = true; }
-  if (goal < -SETPOINT_LIMIT) { goal = -SETPOINT_LIMIT; st_clamp = true; }
-  if (goal >  HW_LIMIT) { goal =  HW_LIMIT; st_clamp = true; }
-  if (goal < -HW_LIMIT) { goal = -HW_LIMIT; st_clamp = true; }
-
-  // --- рампа: последний рубеж, активна всегда ---
-  float step = MAX_ACCEL * dt;
-  st_ramp_sat = fabsf(goal - w_ramp) > step && step > 0.0f;
-  if (w_ramp < goal) w_ramp = (w_ramp + step > goal) ? goal : w_ramp + step;
-  else if (w_ramp > goal) w_ramp = (w_ramp - step < goal) ? goal : w_ramp - step;
-
-  integ_cmd += w_ramp * dt;
-
-  // --- детектор срыва: угол против интеграла команды на окне 1 с ---
-  if (now - slip_last_ms >= SLIP_STEP_MS) {
-    slip_last_ms = now;
-    slip_theta[slip_i] = theta;
-    slip_integ[slip_i] = integ_cmd;
-    slip_i = (uint8_t)((slip_i + 1) % SLIP_N);
-    if (slip_i == 0) slip_full = true;
-    if (slip_full) {
-      float d_theta = theta - slip_theta[slip_i];      // slip_i — самый старый
-      float d_cmd   = integ_cmd - slip_integ[slip_i];
-      st_slip = fabsf(d_theta - d_cmd) > SLIP_THRESHOLD;
-    }
-  }
+  C.step(millis(), dt, theta);
 
 #if MOTOR_ENABLED
   // loopFOC() ОБЯЗАТЕЛЕН и в разомкнутом контуре — в SimpleFOC 2.4.0 именно
@@ -389,9 +324,9 @@ void loop() {
   // Симптом ошибки: driver.init()=1, motor.init()=1, enabled=1, shaft_angle
   // растёт ровно на заданной скорости, а на фазах 0 В и вал стоит.
   motor.loopFOC();
-  motor.move(w_ramp);
+  motor.move(C.w_ramp);
 #endif
 
-  bool alive = had_first && !st_watchdog;
-  digitalWrite(LED_BUILTIN, alive ? HIGH : ((now >> 8) & 1));
+  bool alive = C.had_first && !C.st_watchdog;
+  digitalWrite(LED_BUILTIN, alive ? HIGH : ((millis() >> 8) & 1));
 }
