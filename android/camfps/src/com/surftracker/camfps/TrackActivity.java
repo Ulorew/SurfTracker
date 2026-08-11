@@ -29,6 +29,7 @@ import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.FloatBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -159,6 +160,21 @@ public class TrackActivity extends Activity {
         int sign = getIntent().getIntExtra("sign", 1);
         boolean dry = getIntent().getBooleanExtra("dry", false);
 
+        // РЕЖИМ «ПОТОК»: камера как НЕЗАВИСИМЫЙ измеритель угла.
+        //
+        // Модель не запускается вовсе. Вместо неё между соседними кадрами
+        // считается горизонтальный сдвиг картинки, и он же есть истинный угол
+        // поворота: цена деления 0.038 град на пиксель против кванта энкодера
+        // 0.393 — вчетверо мельче.
+        //
+        // Зачем. Утверждение «врёт датчик, а вал идёт ровно» нельзя проверить
+        // самим датчиком. Нужен второй прибор для той же величины, и камера им
+        // является по построению — она физически сидит на том же валу.
+        // Разность «камера минус энкодер» и есть ошибка энкодера, измеренная
+        // напрямую, а не выведенная из реакции на напряжение.
+        boolean flow = getIntent().getBooleanExtra("flow", false);
+        float spinW = getIntent().getFloatExtra("spin", 0.15f);
+
         File dir = new File(getExternalFilesDir(null), "track");
         dir.mkdirs();
         File base = new File(dir, tag);
@@ -250,10 +266,22 @@ public class TrackActivity extends Activity {
             } catch (Throwable t) {
                 Log.e(TAG, "поле зрения не прочиталось, беру 60°: " + t);
             }
-            // Масштаб считается от ФАКТИЧЕСКОЙ ширины потока, поэтому смена
-            // разрешения не меняет ни ошибку в градусах, ни коэффициент K:
-            // меньше пикселей — крупнее градус на пиксель, произведение то же.
-            final double degPerPx = hfovDeg / (double) W;
+            // ФОКУС В ПИКСЕЛЯХ, а не «поле зрения делить на ширину».
+            //
+            // Для прямолинейного объектива x = f*tg(theta), связь угла и
+            // пикселя НЕ линейна: в центре кадра градус на пиксель меньше
+            // среднего по кадру, а к краям больше. Прежняя формула
+            // hfov/W давала среднее и занижала центральный масштаб на 16%
+            // (0.0380 против 0.0441 град/пикс при поле 72.9 и ширине 1920).
+            //
+            // Найдено сравнением с энкодером: камера «проходила» 1271 град там,
+            // где энкодер 1439. После поправки 1476 против 1439 — расхождение
+            // падает с 11.6% до 2.6%.
+            //
+            // Цена ошибки была не в отчёте, а в контуре: коэффициент петли
+            // слежения считался вокруг заниженного на 16% масштаба.
+            final double fPx = (W / 2.0) / Math.tan(Math.toRadians(hfovDeg / 2.0));
+            final double degPerPx = Math.toDegrees(1.0 / fPx);   // в центре кадра
 
             j.append("\"tag\":\"").append(tag).append("\",\"модель\":\"").append(mn)
              .append("\",\"сенсор\":\"").append(W).append("x").append(H)
@@ -308,7 +336,8 @@ public class TrackActivity extends Activity {
 
             // ---------- модель ----------
             File model = new File(getExternalFilesDir(null), mn);
-            if (!model.exists()) throw new RuntimeException("нет файла модели " + mn);
+            if (!flow && !model.exists()) throw new RuntimeException("нет файла модели " + mn);
+            if (flow) { j.append(",\"режим\":\"поток\",\"spin\":").append(fmt(spinW)); }
             // Число потоков и XNNPACK — ПАРАМЕТРЫ, а не константы. Четыре
             // потока с XNNPACK дали 550 мс на кадр, тогда как прежний рабочий
             // замер на этом же телефоне давал 183 мс на ОДНОМ потоке и без
@@ -318,6 +347,7 @@ public class TrackActivity extends Activity {
             boolean wantXnn = getIntent().getBooleanExtra("xnn", false);
             Interpreter.Options o = new Interpreter.Options();
             o.setNumThreads(threads);
+            if (flow) { /* интерпретатор не поднимаем: в потоке он не нужен */ }
             j.append(",\"потоков\":").append(threads);
             // XNNPACK ОБЯЗАТЕЛЕН. Без него w8a32 считается на медленных ядрах
             // по умолчанию: первый прогон дал 571 мс на кадр вместо ожидаемых
@@ -335,12 +365,23 @@ public class TrackActivity extends Activity {
                 }
             }
             j.append(",\"xnnpack\":").append(xnn);
-            interp = new Interpreter(model, o);
-            int[] osh = interp.getOutputTensor(0).shape();
+            int[] osh = new int[]{1, 5, 8400};
+            if (!flow) {
+                interp = new Interpreter(model, o);
+                osh = interp.getOutputTensor(0).shape();
+            }
             // Форма СПРАШИВАЕТСЯ, а не берётся константой: у сёрфовой модели
             // 5 строк, у COCO — 84, и захардкоженная пятёрка дала бы не
             // исключение, а тихо неверный разбор.
             float[][][] out = new float[1][osh[1]][osh[2]];
+            // Длина полосы, а НЕ полного кадра. Первая редакция оставляла
+            // массив длиной NET с нулями по краям, и корреляция при сдвиге
+            // совпадала нулями с нулями, залипая на нулевом лаге: камера
+            // «прошла» 79 град там, где энкодер 1439. Оконный срез обязан
+            // менять ДЛИНУ массива, а не обнулять его часть.
+            final int STRIP = NET / 3;
+            float[] colPrev = null, colCur = new float[STRIP];
+            double flowAccPx = 0;
             j.append(",\"выход\":\"").append(osh[0]).append("x").append(osh[1])
              .append("x").append(osh[2]).append("\"");
 
@@ -461,7 +502,31 @@ public class TrackActivity extends Activity {
 
                 bin.rewind();
                 long ti = System.nanoTime();
-                interp.run(bin, out);
+                double shiftPx = 0;
+                if (flow) {
+                    // Проекция кадра на горизонталь: суммируем по столбцам.
+                    // Для чистой панорамы этого достаточно, а двумерная
+                    // корреляция стоила бы в 640 раз дороже без выигрыша.
+                    // Берём только ЦЕНТРАЛЬНУЮ треть по горизонтали. Дисторсия
+                    // объектива меняет цену деления к краям, и корреляция по
+                    // всей ширине смешала бы разные масштабы в одно число.
+                    // В центральной трети (±12 град) отличие от центрального
+                    // масштаба меньше 2%.
+                    java.util.Arrays.fill(colCur, 0f);
+                    FloatBuffer fb = bin.asFloatBuffer();
+                    final int x0 = NET / 3;
+                    for (int c = 0; c < 3; c++)
+                        for (int y = NET / 4; y < 3 * NET / 4; y++) {
+                            int row0 = (c * NET + y) * NET;
+                            for (int x = 0; x < STRIP; x++) colCur[x] += fb.get(row0 + x0 + x);
+                        }
+                    if (colPrev != null) shiftPx = xcorr(colPrev, colCur, 40);
+                    float[] tmp = colPrev; colPrev = colCur;
+                    colCur = (tmp != null) ? tmp : new float[STRIP];
+                    flowAccPx += shiftPx;
+                } else {
+                    interp.run(bin, out);
+                }
                 double infMs = (System.nanoTime() - ti) / 1e6;
 
                 // Лучшая детекция по строке 4. Для COCO это класс 0 = person;
@@ -473,16 +538,26 @@ public class TrackActivity extends Activity {
                     float c = o0[4][a];
                     if (c > bestC) { bestC = c; bcx = o0[0][a]; bcy = o0[1][a]; }
                 }
-                boolean hit = bestC >= CONF_MIN;
+                if (flow) { bestC = 0; }
+                boolean hit = flow ? true : (bestC >= CONF_MIN);
                 double errDeg = 0; double w = 0;
                 double cxSensor = winCx;
-                if (hit) {
+                if (flow) {
+                    // Уставка постоянна: меряем ВРАЩЕНИЕ, а не слежение.
+                    w = spinW;
+                    // «ошибка» в этом режиме — накопленный угол по КАМЕРЕ.
+                    errDeg = flowAccPx * degPerPx * (Sc / (double) NET);
+                    cxSensor = shiftPx;
+                    hits++;
+                } else if (hit) {
                     // Координаты выхода НОРМИРОВАНЫ: умножать на сторону сети,
                     // потом на масштаб кропа. Забыть об этом — значит собрать
                     // все рамки в левом верхнем углу.
                     cxSensor = cropX + (bcx * NET) * (Sc / (double) NET);
                     double cySensor = cropY + (bcy * NET) * (Sc / (double) NET);
-                    errDeg = (cxSensor - W / 2.0) * degPerPx;
+                    // Через арктангенс, а не умножением: на краю кадра
+                    // (±36 град) линейное приближение врёт на четверть.
+                    errDeg = Math.toDegrees(Math.atan((cxSensor - W / 2.0) / fPx));
                     w = sign * K * Math.toRadians(errDeg);
                     winCx = (int) cxSensor; winCy = (int) cySensor;
                     hits++;
@@ -567,6 +642,38 @@ public class TrackActivity extends Activity {
             Log.i(TAG, "ГОТОВО " + base.getPath());
             finish();
         }
+    }
+
+    /**
+     * Горизонтальный сдвиг между двумя проекциями, в пикселях.
+     *
+     * Максимум взаимной корреляции с параболическим уточнением по трём точкам:
+     * без него разрешение упёрлось бы в целый пиксель (0.038 град), а нам надо
+     * различать доли этого. Профили центрируются перед корреляцией — иначе
+     * общий уровень яркости даст ложный максимум на нулевом сдвиге.
+     */
+    static double xcorr(float[] a, float[] b, int maxLag) {
+        int n = a.length;
+        double ma = 0, mb = 0;
+        for (int i = 0; i < n; i++) { ma += a[i]; mb += b[i]; }
+        ma /= n; mb /= n;
+        double best = -1e300; int bestLag = 0;
+        double[] c = new double[2 * maxLag + 1];
+        for (int lag = -maxLag; lag <= maxLag; lag++) {
+            double s = 0; int cnt = 0;
+            int i0 = Math.max(0, -lag), i1 = Math.min(n, n - lag);
+            for (int i = i0; i < i1; i++) { s += (a[i] - ma) * (b[i + lag] - mb); cnt++; }
+            if (cnt > 0) s /= cnt;
+            c[lag + maxLag] = s;
+            if (s > best) { best = s; bestLag = lag; }
+        }
+        int k = bestLag + maxLag;
+        if (k <= 0 || k >= 2 * maxLag) return bestLag;
+        double y0 = c[k - 1], y1 = c[k], y2 = c[k + 1];
+        double d = 2 * (2 * y1 - y0 - y2);
+        double sub = (d != 0) ? (y2 - y0) / d : 0;
+        if (sub < -1 || sub > 1) sub = 0;
+        return bestLag + sub;
     }
 
     static int bit(int st, int m) { return (st & m) != 0 ? 1 : 0; }
