@@ -94,6 +94,28 @@ public class BtLinkActivity extends Activity {
     }
 
     void run() {
+        // Частичный wake lock: держит ПРОЦЕССОР, а не экран.
+        //
+        // Без него прогон умирает молча. Телефон уходит в дозу, система
+        // объявляет приложение фоновым и замораживает поток — в логе не
+        // остаётся ни строки, даже ошибки, потому что finally не выполняется
+        // тоже. Выглядит это как повисший Bluetooth, и я потратил на такую
+        // диагностику два прогона.
+        //
+        // FLAG_KEEP_SCREEN_ON тут бессилен: он действует, только если экран
+        // уже горит. `adb shell svc power stayon true` тоже — он держит экран
+        // лишь при подключённом зарядном.
+        android.os.PowerManager.WakeLock wl = null;
+        try {
+            android.os.PowerManager pm =
+                (android.os.PowerManager) getSystemService(POWER_SERVICE);
+            wl = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK,
+                                 "surftracker:btlink");
+            wl.acquire(20 * 60 * 1000L);   // потолок на случай, если release не дойдёт
+        } catch (Throwable t) {
+            Log.e(TAG, "wake lock: " + t);
+        }
+
         String tag = getIntent().getStringExtra("tag");
         if (tag == null) tag = "btlink";
         String mac = getIntent().getStringExtra("mac");
@@ -277,6 +299,7 @@ public class BtLinkActivity extends Activity {
              .append(String.valueOf(t).replace('"', '\'')).append("\"");
         } finally {
             try { if (sock != null) sock.close(); } catch (Throwable ignored) {}
+            try { if (wl != null && wl.isHeld()) wl.release(); } catch (Throwable ignored) {}
             try {
                 write(new File(base.getPath() + ".json"), j.append("}").toString());
                 write(new File(base.getPath() + ".csv"), csv.toString());
