@@ -71,8 +71,16 @@ static const float    MAX_ACCEL      = 1.0f;   // рад/с^2, рампа
 static const float    VOLTAGE_LIMIT  = 2.0f;   // В
 static const float    SUPPLY_V       = 12.0f;
 static const uint8_t  POLE_PAIRS     = 11;
-static const unsigned long SENS_MIN_US = 7;
-static const unsigned long SENS_MAX_US = 920;
+// Окно длительности импульса AS5048. ИЗМЕРЕНО на этом экземпляре, а не
+// взято из даташита: полный оборот рукой дал 3..919 мкс при периоде 921 мкс.
+// Сходится с устройством датчика — кадр 4119 тактов, минимум около 16 тактов.
+//
+// Прежнее значение 7 приехало со старого стенда и было неверным: по этим
+// границам MagneticSensorPWM линейно отображает импульс в угол, так что
+// задранная вдвое нижняя граница смещала ВЕСЬ масштаб. Ошибка тихая —
+// показания остаются правдоподобными.
+static const unsigned long SENS_MIN_US = 3;
+static const unsigned long SENS_MAX_US = 919;
 
 // Детектор срыва: расхождение угла с интегралом команды на окне 1 с.
 static const float    SLIP_THRESHOLD = 3.0f * PI / 180.0f;   // 3 градуса
