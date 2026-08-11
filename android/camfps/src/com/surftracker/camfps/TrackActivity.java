@@ -74,6 +74,16 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class TrackActivity extends Activity {
     static final String TAG = "track";
+
+    // Последняя вычисленная уставка. Пишет поток зрения, читает поток
+    // отправки. volatile достаточно: одно значение, атомарная запись float,
+    // и терять промежуточные значения не страшно — свежее всегда лучше.
+    volatile float wCmd = 0.0f;
+    volatile boolean running = true;
+    volatile int lastStatus = 0;
+    volatile float lastTheta = 0, lastWRamp = 0;
+    volatile int telCount = 0;
+    volatile int bWd = 0, bCap = 0, bRamp = 0, bEnc = 0, bClamp = 0, bSlip = 0;
     static final UUID SPP = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
     static final int NET = 640;
     static final float CONF_MIN = 0.35f;
@@ -353,9 +363,7 @@ public class TrackActivity extends Activity {
 
             // ---------- цикл ----------
             ByteBuffer bin = ByteBuffer.allocateDirect(4 * 3 * NET * NET).order(ByteOrder.nativeOrder());
-            byte[] req = new byte[ProtoV2.REQ_LEN];
             byte[] rx = new byte[4096];
-            int rxn = 0;
             long[] sendNs = new long[128];
             int seq = 0, frames = 0, hits = 0, misses = 0;
             // Окно слежения: центр — последняя уверенная детекция. При потере
@@ -365,8 +373,81 @@ public class TrackActivity extends Activity {
             int Sc = Math.min(side, Math.min(W, H));
             long t0 = System.nanoTime();
             long lastLoop = t0;
+
+
             List<Double> lat = new ArrayList<>();
-            int stWd = 0, stCap = 0, stRamp = 0, stEnc = 0, stClamp = 0, stSlip = 0, telN = 0;
+
+            // ---------- отправка на РОВНЫХ 10 Гц, отдельным потоком ----------
+            //
+            // Зрение идёт 5 Гц, и первая редакция слала уставку прямо из его
+            // цикла. Замер показал бит потолка экстраполяции в 202 кадрах из
+            // 203: приёмник получал уставку раз в 200 мс при потолке 150 и
+            // стороже 300. Практического вреда не было только потому, что ω̇
+            // нулевое, но бит перестал что-либо означать, а до срабатывания
+            // сторожа оставалось 100 мс — один пропущенный кадр останавливал
+            // вал. Сторож и сработал один раз за сорок секунд.
+            //
+            // Развязка: частота КАНАЛА не обязана совпадать с частотой ЗРЕНИЯ.
+            // Между кадрами повторяется последняя уставка — приёмник видит
+            // ровный поток, запас до сторожа втрое, а потолок снова означает
+            // настоящую задержку, а не расписание.
+            final OutputStream fos = os;
+            final InputStream fis = is;
+            final boolean fdry = dry;
+            final List<Double> flat = lat;
+            Thread sender = new Thread(() -> {
+                byte[] sreq = new byte[ProtoV2.REQ_LEN];
+                byte[] buf = new byte[4096];
+                int bn = 0;
+                int sq = 0;
+                long next = System.nanoTime();
+                while (running) {
+                    try {
+                        if (!fdry) {
+                            int q = sq & 0x7F;
+                            ProtoV2.buildReq(sreq, q, wCmd, 0.0f);
+                            sendNs[q] = System.nanoTime();
+                            fos.write(sreq); fos.flush();
+                            sq++;
+                            int av = fis.available();
+                            if (av > 0) {
+                                int g = fis.read(buf, bn, Math.min(av, buf.length - bn));
+                                if (g > 0) bn += g;
+                                int p = 0;
+                                while (bn - p >= ProtoV2.TEL_LEN) {
+                                    ProtoV2.Tel t = ProtoV2.parseTel(buf, p);
+                                    if (t == null) { p++; continue; }
+                                    long snt = sendNs[t.seq];
+                                    if (snt != 0) {
+                                        synchronized (flat) { flat.add((System.nanoTime() - snt) / 1e6); }
+                                        sendNs[t.seq] = 0;
+                                    }
+                                    lastStatus = t.status; lastTheta = t.theta; lastWRamp = t.wRamp;
+                                    telCount++;
+                                    int stt = t.status;
+                                    if ((stt & ProtoV2.ST_WATCHDOG) != 0) bWd++;
+                                    if ((stt & ProtoV2.ST_EXTRAP_CAP) != 0) bCap++;
+                                    if ((stt & ProtoV2.ST_RAMP_SAT) != 0) bRamp++;
+                                    if ((stt & ProtoV2.ST_ENC_OK) != 0) bEnc++;
+                                    if ((stt & ProtoV2.ST_CLAMP) != 0) bClamp++;
+                                    if ((stt & ProtoV2.ST_SLIP) != 0) bSlip++;
+                                    p += ProtoV2.TEL_LEN;
+                                }
+                                if (p > 0) { System.arraycopy(buf, p, buf, 0, bn - p); bn -= p; }
+                            }
+                        }
+                        next += 100_000_000L;
+                        long sl = next - System.nanoTime();
+                        if (sl > 0) Thread.sleep(sl / 1_000_000L, (int) (sl % 1_000_000L));
+                        else next = System.nanoTime();
+                    } catch (Throwable t) {
+                        Log.e(TAG, "поток отправки: " + t);
+                        break;
+                    }
+                }
+            });
+            sender.start();
+
 
             while ((System.nanoTime() - t0) / 1e9 < seconds) {
                 Image im = latest.getAndSet(null);
@@ -413,40 +494,11 @@ public class TrackActivity extends Activity {
                     misses++;
                 }
 
-                float wf = (float) w;
-                int st = 0; float th = 0, wr = 0; boolean gotTel = false;
-                if (!dry) {
-                    int sq = seq & 0x7F;
-                    ProtoV2.buildReq(req, sq, wf, 0.0f);   // ω̇ = 0, см. шапку
-                    sendNs[sq] = System.nanoTime();
-                    os.write(req); os.flush();
-                    seq++;
-                    int av = is.available();
-                    if (av > 0) {
-                        int g = is.read(rx, rxn, Math.min(av, rx.length - rxn));
-                        if (g > 0) rxn += g;
-                        int p = 0;
-                        while (rxn - p >= ProtoV2.TEL_LEN) {
-                            ProtoV2.Tel t = ProtoV2.parseTel(rx, p);
-                            if (t == null) { p++; continue; }
-                            long snt = sendNs[t.seq];
-                            if (snt != 0) {
-                                lat.add((System.nanoTime() - snt) / 1e6);
-                                sendNs[t.seq] = 0;
-                            }
-                            st = t.status; th = t.theta; wr = t.wRamp; gotTel = true;
-                            telN++;
-                            if ((st & ProtoV2.ST_WATCHDOG) != 0) stWd++;
-                            if ((st & ProtoV2.ST_EXTRAP_CAP) != 0) stCap++;
-                            if ((st & ProtoV2.ST_RAMP_SAT) != 0) stRamp++;
-                            if ((st & ProtoV2.ST_ENC_OK) != 0) stEnc++;
-                            if ((st & ProtoV2.ST_CLAMP) != 0) stClamp++;
-                            if ((st & ProtoV2.ST_SLIP) != 0) stSlip++;
-                            p += ProtoV2.TEL_LEN;
-                        }
-                        if (p > 0) { System.arraycopy(rx, p, rx, 0, rxn - p); rxn -= p; }
-                    }
-                }
+                // Уставка только ОБНОВЛЯЕТСЯ. Отправкой занят отдельный поток на
+                // ровных 10 Гц — см. ниже, зачем.
+                wCmd = (float) w;
+                int st = lastStatus; float th = lastTheta, wr = lastWRamp;
+                boolean gotTel = telCount > 0;
 
                 long now = System.nanoTime();
                 double loopMs = (now - lastLoop) / 1e6;
@@ -468,24 +520,29 @@ public class TrackActivity extends Activity {
                 frames++;
             }
 
+            running = false;
+            try { sender.join(500); } catch (Throwable ignored) {}
             // Остановить вал ЯВНО. Полагаться на сторож нельзя: он сработает,
             // но через 300 мс и с поднятым битом, то есть штатный выход
             // выглядел бы как отказ связи.
-            if (!dry) for (int i = 0; i < 5; i++) {
-                ProtoV2.buildReq(req, (seq + i) & 0x7F, 0.0f, 0.0f);
-                os.write(req); os.flush();
-                Thread.sleep(60);
+            if (!dry) {
+                byte[] stopReq = new byte[ProtoV2.REQ_LEN];
+                for (int i = 0; i < 5; i++) {
+                    ProtoV2.buildReq(stopReq, i & 0x7F, 0.0f, 0.0f);
+                    os.write(stopReq); os.flush();
+                    Thread.sleep(60);
+                }
             }
 
             java.util.Collections.sort(lat);
             j.append(",\"кадров\":").append(frames).append(",\"с_целью\":").append(hits)
              .append(",\"без_цели\":").append(misses)
              .append(",\"доля_с_целью\":").append(frames > 0 ? fmt(hits / (double) frames) : "0")
-             .append(",\"телеметрии\":").append(telN)
-             .append(",\"биты\":{\"watchdog\":").append(stWd)
-             .append(",\"потолок\":").append(stCap).append(",\"рампа\":").append(stRamp)
-             .append(",\"энкодер\":").append(stEnc).append(",\"кламп\":").append(stClamp)
-             .append(",\"срыв\":").append(stSlip).append("}");
+             .append(",\"телеметрии\":").append(telCount)
+             .append(",\"биты\":{\"watchdog\":").append(bWd)
+             .append(",\"потолок\":").append(bCap).append(",\"рампа\":").append(bRamp)
+             .append(",\"энкодер\":").append(bEnc).append(",\"кламп\":").append(bClamp)
+             .append(",\"срыв\":").append(bSlip).append("}");
             if (!lat.isEmpty())
                 j.append(",\"rtt_ms\":{\"p50\":").append(fmt(lat.get(lat.size() / 2)))
                  .append(",\"p95\":").append(fmt(lat.get((int) (0.95 * (lat.size() - 1)))))
@@ -496,6 +553,7 @@ public class TrackActivity extends Activity {
             j.append(",\"ok\":false,\"ошибка\":\"")
              .append(String.valueOf(t).replace('"', '\'')).append("\"");
         } finally {
+            running = false;
             try { if (interp != null) interp.close(); } catch (Throwable ignored) {}
             try { if (sock != null) sock.close(); } catch (Throwable ignored) {}
             try { if (dev != null) dev.close(); } catch (Throwable ignored) {}
