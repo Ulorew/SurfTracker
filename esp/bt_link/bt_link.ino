@@ -1,10 +1,19 @@
 /*
  * ESP32: мост Bluetooth <-> UART для контура телефон -> мотор.
  *
- * Протокол не меняется ни на байт: docs/ПРОТОКОЛ_ТЕЛЕФОН_STM32.md. Он
- * байтовый, с магиком и CRC, и ничего не знает про транспорт — поэтому
- * смена USB на BT не требует правок ни в прошивке STM32, ни в спецификации,
- * ни в клиенте.
+ * Протокол: docs/ПРОТОКОЛ_ТЕЛЕФОН_STM32.md, версия 2. Он байтовый, с магиком
+ * и CRC, и ничего не знает про транспорт — поэтому смена USB на BT не
+ * потребовала правок ни в прошивке STM32, ни в спецификации, ни в клиенте.
+ * По той же причине переезд с Nucleo-F411RE на B-G431B-ESC1 прошёл мимо этого
+ * файла целиком.
+ *
+ * Кадрирование и CRC берутся из stm/libraries/SurfProtoV2 — ОДНОГО заголовка
+ * на обе прошивки. Своя копия здесь однажды уже разошлась бы: v1 и v2
+ * отличаются полиномом CRC (0x07 против отражённого 0x31), и заглушка на
+ * старом полиноме молча отвергала бы каждый кадр.
+ *
+ * Сборка: arduino-cli compile -b esp32:esp32:esp32 \
+ *             --libraries ../stm/libraries bt_link
  *
  * Плата: ESP32-D0WD-V3 (классический ESP32, есть BT Classic). Мост сделан на
  * SPP, а не на BLE: Android поддерживает SPP штатно как последовательный
@@ -24,6 +33,7 @@
  */
 
 #include "BluetoothSerial.h"
+#include <proto_v2.h>   // ТОТ ЖЕ заголовок, что у STM32: stm/libraries/SurfProtoV2
 
 #define STUB_MODE 0
 
@@ -36,37 +46,14 @@ static const uint32_t UART_BAUD = 115200;   // как в спецификаци�
 // свободны на всех вариантах: не участвуют в загрузке, не заняты флешем,
 // не input-only. Цена выбора — ноль, цена ошибки — вечер отладки паяного
 // соединения.
-static const int      PIN_RX    = 25;       // Serial2 RX  <- TX STM32 (PB6, D10)
-static const int      PIN_TX    = 26;       // Serial2 TX  -> RX STM32 (PA10, D2)
+static const int      PIN_RX    = 25;       // Serial2 RX  <- TX STM32 (PB6 на ESC1)
+static const int      PIN_TX    = 26;       // Serial2 TX  -> RX STM32 (PB7 на ESC1)
 static const int      PIN_LED   = 2;
-
-// ---------------------- протокол ----------------------
-static const uint8_t MAGIC    = 0xA5;
-static const uint8_t REQ_LEN  = 7;
-static const uint8_t RESP_LEN = 8;
-
-static const uint8_t ST_WATCHDOG = 1 << 0;
-static const uint8_t ST_ENC_OK   = 1 << 1;
-static const uint8_t ST_VEL_CLIP = 1 << 2;
-static const uint8_t ST_CRC_DROP = 1 << 3;
-
-static const uint32_t WATCHDOG_MS = 300;
-static const float    VEL_LIMIT   = 20.0f;
 
 BluetoothSerial SerialBT;
 
-static uint8_t crc8(const uint8_t *d, uint8_t n) {
-  uint8_t c = 0x00;
-  while (n--) {
-    c ^= *d++;
-    for (uint8_t i = 0; i < 8; i++)
-      c = (c & 0x80) ? (uint8_t)((c << 1) ^ 0x07) : (uint8_t)(c << 1);
-  }
-  return c;
-}
-
 #if STUB_MODE
-static uint8_t  rxbuf[REQ_LEN];
+static uint8_t  rxbuf[proto::REQ_LEN];
 static uint8_t  rxn = 0;
 static uint32_t last_rx_ms = 0;
 static bool     had_first = false;
@@ -77,7 +64,7 @@ static float    w_target = 0.0f;
 static void rxShift() {
   for (uint8_t i = 1; i < rxn; i++) rxbuf[i - 1] = rxbuf[i];
   rxn--;
-  while (rxn > 0 && rxbuf[0] != MAGIC) {
+  while (rxn > 0 && rxbuf[0] != proto::MAGIC_REQ) {
     for (uint8_t i = 1; i < rxn; i++) rxbuf[i - 1] = rxbuf[i];
     rxn--;
   }
@@ -89,39 +76,40 @@ static void reply(uint8_t seq) {
   // найденных проводным эхо-тестом.
   float theta = sinf(millis() * 0.001f) * 0.5f;
   uint8_t st = 0;
-  if (wd_latch) st |= ST_WATCHDOG;
+  if (wd_latch) st |= proto::ST_WATCHDOG;
   wd_latch = false;
   // ST_ENC_OK НЕ выставляется: энкодера здесь нет, и врать про него нельзя —
   // иначе заглушка будет выглядеть исправнее настоящего железа.
-  if (fabsf(w_target) > VEL_LIMIT) st |= ST_VEL_CLIP;
-  if (crc_dropped) st |= ST_CRC_DROP;
+  if (fabsf(w_target) > VEL_LIMIT) st |= proto::ST_CLAMP;
+  if (crc_dropped) st |= (uint8_t)(1 << proto::ST_CRC_SHIFT);
   crc_dropped = false;
 
-  uint8_t out[RESP_LEN];
-  out[0] = MAGIC;
-  out[1] = seq;
-  memcpy(&out[2], &theta, 4);
-  out[6] = st;
-  out[7] = crc8(out, RESP_LEN - 1);
-  SerialBT.write(out, RESP_LEN);
+  uint8_t out[proto::TEL_LEN];
+  // w_ramp у заглушки равен уставке: рампы здесь нет и быть не должно —
+  // заглушка мерит транспорт, а не поведение вала.
+  proto::buildTel(out, seq, theta, w_target, st);
+  SerialBT.write(out, proto::TEL_LEN);
 }
 
 static void pump() {
   while (SerialBT.available() > 0) {
     uint8_t b = (uint8_t)SerialBT.read();
-    if (rxn == 0 && b != MAGIC) continue;
+    if (rxn == 0 && b != proto::MAGIC_REQ) continue;
     rxbuf[rxn++] = b;
-    if (rxn < REQ_LEN) continue;
-    if (crc8(rxbuf, REQ_LEN - 1) != rxbuf[REQ_LEN - 1]) {
+    if (rxn < proto::REQ_LEN) continue;
+    uint8_t seq = 0, ver = 0;
+    float w = 0.0f, wd = 0.0f;
+    if (!proto::parseReq(rxbuf, &seq, &w, &wd, &ver)) {
       crc_dropped = true;
       rxShift();
       continue;
     }
-    memcpy(&w_target, &rxbuf[2], 4);
+    rxn = 0;
+    if (ver != proto::VERSION) continue;   // чужая версия — молчим
+    w_target = w;
     last_rx_ms = millis();
     had_first = true;
-    reply(rxbuf[1]);
-    rxn = 0;
+    reply(seq);
   }
 }
 #endif

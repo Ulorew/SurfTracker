@@ -12,55 +12,67 @@ import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
 
 /**
- * Мост телефон ↔ STM32 поверх Bluetooth SPP (тикет «замыкание контура»,
- * ступень 2) и он же измеритель линии.
+ * Мост телефон ↔ STM32 поверх Bluetooth SPP, протокол v2.
  *
- * Протокол — тот же, что по проводу: docs/ПРОТОКОЛ_ТЕЛЕФОН_STM32.md. Он
- * байтовый и про транспорт ничего не знает, поэтому переход с USB на BT не
- * потребовал в нём ни одной правки.
+ * Спецификация: docs/ПРОТОКОЛ_ТЕЛЕФОН_STM32.md. Протокол байтовый и про
+ * транспорт ничего не знает — переход с USB на BT не потребовал в нём ни одной
+ * правки, и смена платы с F411 на G431 тоже.
  *
- * ЗАЧЕМ ОТДЕЛЬНЫЙ ЗАМЕР С ТЕЛЕФОНА. Цена Bluetooth уже измерена ноутбуком
- * (RTT p50 39.6 мс, p95 59.8), но хостом в бою будет телефон, и стек у него
- * свой. Переносить чужие числа на другую машину — ровно то, чего в этом
- * проекте стараются не делать.
+ * ЧТО ИЗМЕНИЛОСЬ ПРОТИВ v1, кроме длин кадров:
  *
- * СОПОСТАВЛЕНИЕ ПО seq, А НЕ ОЖИДАНИЕ В ТАКТЕ. Ответ по BT приходит в
- * среднем через целый период, поэтому ждать его в такте бессмысленно.
- * Просроченные ответы ВЫБРАСЫВАЮТСЯ: оставленный в буфере, такой ответ
- * читается следующим тактом, и каждое опоздание навсегда сдвигает очередь.
- * На ноутбуке этот дефект дал отставание в 97 кадров за 120 секунд и выглядел
- * как отказ транспорта.
+ *   - CRC ДРУГОЙ. v1 — 0x07 без отражения, v2 — 0x31 отражённый (0x8C при
+ *     счёте с младшего бита). Реализации внешне похожи, и перепутать их легко:
+ *     кадр соберётся, уедет и будет молча отвергнут приёмником. Контрольное
+ *     значение CRC("123456789") = 0xA1 проверяется здесь же на старте, до
+ *     первого кадра, — дешевле, чем искать причину тишины в эфире.
+ *   - МАГИКИ РАЗНЫЕ у запроса и телеметрии: 0xA5 против 0x5A. Ресинхронизация
+ *     приёмника ищет 0x5A. Байты зеркальные, и подставить один вместо другого
+ *     не заметив — вопрос одной опечатки.
+ *   - seq СЕМИБИТНЫЙ, старший бит кадра уставки занят версией. Маска 0x7F
+ *     обязательна и при отправке, и при сопоставлении ответа.
+ *
+ * СОПОСТАВЛЕНИЕ ПО seq, А НЕ ОЖИДАНИЕ В ТАКТЕ. Ответ по BT приходит в среднем
+ * через целый период, поэтому ждать его в такте бессмысленно. Просроченные
+ * ответы ВЫБРАСЫВАЮТСЯ: оставленный в буфере, такой ответ читается следующим
+ * тактом, и каждое опоздание навсегда сдвигает очередь. На ноутбуке этот
+ * дефект дал отставание в 97 кадров за 120 секунд и выглядел как отказ
+ * транспорта.
+ *
+ * РЕЖИМЫ:
+ *   zero — уставка ноль. Мерится ЛИНИЯ, и результат не зависит от того, что
+ *          делает мотор.
+ *   sine — уставка синус (ступень 3 тикета: проверка контура без зрения).
+ *          ω̇ считается аналитически, а не разностью: разность по шумному
+ *          времени телефона дала бы дребезг в поле, которым приёмник
+ *          экстраполирует, и мы мерили бы свой же шум.
  *
  *   am start -n com.surftracker.camfps/.BtLinkActivity \
- *       --es mac 38:18:2B:30:7D:86 --ei hz 10 --ei seconds 60 [--es tag bt1]
+ *       --es mac 38:18:2B:30:7D:86 --ei hz 10 --ei seconds 60 \
+ *       [--es tag bt1] [--es mode sine] [--ef amp 0.3] [--ef period 8]
  */
 public class BtLinkActivity extends Activity {
     static final String TAG = "btlink";
     static final UUID SPP = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
-    static final int REQ_LEN = 7, RESP_LEN = 8;
-    static final byte MAGIC = (byte) 0xA5;
 
-    static byte crc8(byte[] d, int n) {
-        int c = 0;
-        for (int i = 0; i < n; i++) {
-            c ^= d[i] & 0xFF;
-            for (int b = 0; b < 8; b++)
-                c = ((c & 0x80) != 0) ? ((c << 1) ^ 0x07) & 0xFF : (c << 1) & 0xFF;
-        }
-        return (byte) c;
-    }
+    // Кадрирование и CRC живут в ProtoV2 — ОДНА реализация, та же, что
+    // проверяется векторами на ноутбуке (tools/link/java_vectors.sh). Копия
+    // здесь проверялась бы тестом копии.
+    static final int TEL_LEN = ProtoV2.TEL_LEN;
+    static final int REQ_LEN = ProtoV2.REQ_LEN;
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
         runOnUiThread(() -> {
             android.widget.TextView tv = new android.widget.TextView(this);
-            tv.setText("мост BT");
+            tv.setText("мост BT v2");
             setContentView(tv);
             getWindow().addFlags(
                     android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
@@ -85,6 +97,10 @@ public class BtLinkActivity extends Activity {
         String tag = getIntent().getStringExtra("tag");
         if (tag == null) tag = "btlink";
         String mac = getIntent().getStringExtra("mac");
+        String mode = getIntent().getStringExtra("mode");
+        if (mode == null) mode = "zero";
+        float amp = getIntent().getFloatExtra("amp", 0.3f);
+        float per = getIntent().getFloatExtra("period", 8.0f);
         int hz = getIntent().getIntExtra("hz", 10);
         int seconds = getIntent().getIntExtra("seconds", 60);
         File dir = new File(getExternalFilesDir(null), "link");
@@ -92,8 +108,25 @@ public class BtLinkActivity extends Activity {
         File base = new File(dir, tag);
         StringBuilder j = new StringBuilder("{");
         BluetoothSocket sock = null;
-        StringBuilder csv = new StringBuilder("i,seq,t_send_ns,rtt_ms,theta,status,ok\n");
+
+        // Поля лога по §3 спецификации, плюс разобранные биты статуса
+        // отдельными колонками: читать лог глазами по числу 0x2A невозможно,
+        // а именно глазами его и читают, когда что-то пошло не так.
+        StringBuilder csv = new StringBuilder(
+            "i,seq,t_отпр_ns,t_приёма_ns,rtt_ms,θ_enc,ω_ramp,статус,"
+            + "watchdog,потолок,рампа,энкодер,кламп,срыв,crc_счёт\n");
+
         try {
+            // Самопроверка CRC ДО эфира: перепутанный полином даёт кадры,
+            // которые уходят и молча отвергаются, а выглядит это как мёртвая
+            // линия. Отличить одно от другого в эфире дороже, чем проверить
+            // здесь.
+            byte[] chk = "123456789".getBytes("US-ASCII");
+            int got = ProtoV2.crc8(chk, chk.length) & 0xFF;
+            if (got != 0xA1)
+                throw new RuntimeException("CRC не тот: ожидалось 0xA1, вышло 0x"
+                                            + Integer.toHexString(got));
+
             BluetoothAdapter ad = BluetoothAdapter.getDefaultAdapter();
             if (ad == null || !ad.isEnabled()) throw new RuntimeException("Bluetooth выключен");
             BluetoothDevice dev = null;
@@ -102,21 +135,24 @@ public class BtLinkActivity extends Activity {
                     if ("SurfTracker-Link".equals(d.getName())) dev = d;
             if (dev == null) throw new RuntimeException("устройство не найдено");
 
-            // Небезопасный сокет: у заглушки нет ни PIN, ни шифрования, и
-            // требовать сопряжения ради замера линии незачем.
             sock = dev.createInsecureRfcommSocketToServiceRecord(SPP);
             ad.cancelDiscovery();
             sock.connect();
             OutputStream os = sock.getOutputStream();
             InputStream is = sock.getInputStream();
 
-            j.append("\"tag\":\"").append(tag).append("\",\"mac\":\"")
-             .append(dev.getAddress()).append("\",\"hz\":").append(hz)
-             .append(",\"seconds\":").append(seconds);
+            j.append("\"tag\":\"").append(tag).append("\",\"версия_протокола\":2")
+             .append(",\"mac\":\"").append(dev.getAddress()).append("\",\"hz\":").append(hz)
+             .append(",\"seconds\":").append(seconds).append(",\"режим\":\"").append(mode).append("\"");
+            if ("sine".equals(mode))
+                j.append(",\"амплитуда\":").append(fmt(amp)).append(",\"период_с\":").append(fmt(per));
 
             final long period = 1_000_000_000L / hz;
             int n = hz * seconds;
-            long[] sendNs = new long[256];
+            // 128, а не 256: seq семибитный. Массив на 256 работал бы, но
+            // половина его никогда не заполнялась бы, и это сбивало бы с толку
+            // при чтении кода.
+            long[] sendNs = new long[128];
             java.util.Arrays.fill(sendNs, 0L);
             byte[] req = new byte[REQ_LEN];
             byte[] rx = new byte[4096];
@@ -124,6 +160,7 @@ public class BtLinkActivity extends Activity {
             List<Double> rtts = new ArrayList<>();
             List<Long> recvNs = new ArrayList<>();
             int okN = 0, stale = 0, badCrc = 0;
+            int cWd = 0, cCap = 0, cRamp = 0, cEnc = 0, cClamp = 0, cSlip = 0;
             long t0 = System.nanoTime();
             long next = t0;
 
@@ -131,11 +168,17 @@ public class BtLinkActivity extends Activity {
                 long now = System.nanoTime();
                 if (next > now) Thread.sleep((next - now) / 1_000_000L,
                                               (int) ((next - now) % 1_000_000L));
-                int seq = i & 0xFF;
-                req[0] = MAGIC; req[1] = (byte) seq;
-                // omega = 0: замер линии не должен зависеть от того, что делает мотор
-                req[2] = req[3] = req[4] = req[5] = 0;
-                req[6] = crc8(req, REQ_LEN - 1);
+                int seq = i & 0x7F;
+
+                float w = 0.0f, wdot = 0.0f;
+                if ("sine".equals(mode)) {
+                    double t = (System.nanoTime() - t0) / 1e9;
+                    double k = 2 * Math.PI / per;
+                    w    = (float) (amp * Math.sin(k * t));
+                    wdot = (float) (amp * k * Math.cos(k * t));
+                }
+                ProtoV2.buildReq(req, seq, w, wdot);
+
                 long ts = System.nanoTime();
                 sendNs[seq] = ts;
                 os.write(req);
@@ -148,32 +191,50 @@ public class BtLinkActivity extends Activity {
                 while (System.nanoTime() < deadline) {
                     int av = is.available();
                     if (av <= 0) { Thread.sleep(1); continue; }
-                    int got = is.read(rx, rxn, Math.min(av, rx.length - rxn));
-                    if (got > 0) rxn += got;
+                    int g = is.read(rx, rxn, Math.min(av, rx.length - rxn));
+                    if (g > 0) rxn += g;
                     int p = 0;
-                    while (rxn - p >= RESP_LEN) {
-                        if (rx[p] != MAGIC) { p++; continue; }
-                        byte[] f = java.util.Arrays.copyOfRange(rx, p, p + RESP_LEN);
-                        if (crc8(f, RESP_LEN - 1) != f[RESP_LEN - 1]) { p++; badCrc++; continue; }
-                        int rseq = f[1] & 0xFF;
-                        long st = sendNs[rseq];
-                        long tgot = System.nanoTime();
-                        if (st != 0) {
-                            double rtt = (tgot - st) / 1e6;
-                            rtts.add(rtt);
-                            recvNs.add(tgot);
-                            sendNs[rseq] = 0;
-                            okN++;
-                            float th = java.nio.ByteBuffer.wrap(f, 2, 4)
-                                    .order(java.nio.ByteOrder.LITTLE_ENDIAN).getFloat();
-                            csv.append(i).append(',').append(rseq).append(',').append(st)
-                               .append(',').append(String.format(java.util.Locale.US, "%.3f", rtt))
-                               .append(',').append(th).append(',').append(f[6] & 0xFF)
-                               .append(",1\n");
-                        } else {
-                            stale++;      // ответ на кадр, который уже закрыт
+                    while (rxn - p >= TEL_LEN) {
+                        ProtoV2.Tel tel = ProtoV2.parseTel(rx, p);
+                        if (tel == null) {
+                            // Магик не тот или CRC не сошлось — сдвигаемся на
+                            // байт и ищем дальше. Выравнивание по ДЛИНЕ здесь
+                            // залипло бы навсегда после потери одного байта.
+                            if (rx[p] == ProtoV2.MAGIC_TEL) badCrc++;
+                            p++;
+                            continue;
                         }
-                        p += RESP_LEN;
+                        long st = sendNs[tel.seq];
+                        long tgot = System.nanoTime();
+                        if (st == 0) { stale++; p += TEL_LEN; continue; }
+
+                        double rtt = (tgot - st) / 1e6;
+                        rtts.add(rtt);
+                        recvNs.add(tgot);
+                        sendNs[tel.seq] = 0;
+                        okN++;
+
+                        int stt = tel.status;
+                        if ((stt & ProtoV2.ST_WATCHDOG)   != 0) cWd++;
+                        if ((stt & ProtoV2.ST_EXTRAP_CAP) != 0) cCap++;
+                        if ((stt & ProtoV2.ST_RAMP_SAT)   != 0) cRamp++;
+                        if ((stt & ProtoV2.ST_ENC_OK)     != 0) cEnc++;
+                        if ((stt & ProtoV2.ST_CLAMP)      != 0) cClamp++;
+                        if ((stt & ProtoV2.ST_SLIP)       != 0) cSlip++;
+
+                        csv.append(i).append(',').append(tel.seq).append(',')
+                           .append(st).append(',').append(tgot).append(',')
+                           .append(fmt(rtt)).append(',')
+                           .append(fmt(tel.theta)).append(',').append(fmt(tel.wRamp)).append(',')
+                           .append(stt).append(',')
+                           .append(bit(stt, ProtoV2.ST_WATCHDOG)).append(',')
+                           .append(bit(stt, ProtoV2.ST_EXTRAP_CAP)).append(',')
+                           .append(bit(stt, ProtoV2.ST_RAMP_SAT)).append(',')
+                           .append(bit(stt, ProtoV2.ST_ENC_OK)).append(',')
+                           .append(bit(stt, ProtoV2.ST_CLAMP)).append(',')
+                           .append(bit(stt, ProtoV2.ST_SLIP)).append(',')
+                           .append((stt >> ProtoV2.ST_CRC_SHIFT) & 0x03).append('\n');
+                        p += TEL_LEN;
                     }
                     if (p > 0) {
                         System.arraycopy(rx, p, rx, 0, rxn - p);
@@ -182,25 +243,32 @@ public class BtLinkActivity extends Activity {
                 }
                 next += period;
             }
+
             double[] r = new double[rtts.size()];
             for (int i = 0; i < r.length; i++) r[i] = rtts.get(i);
             java.util.Arrays.sort(r);
             j.append(",\"sent\":").append(n).append(",\"ok\":").append(okN)
              .append(",\"lost\":").append(n - okN).append(",\"stale\":").append(stale)
              .append(",\"bad_crc\":").append(badCrc);
+            j.append(",\"биты\":{\"watchdog\":").append(cWd)
+             .append(",\"потолок\":").append(cCap)
+             .append(",\"рампа\":").append(cRamp)
+             .append(",\"энкодер\":").append(cEnc)
+             .append(",\"кламп\":").append(cClamp)
+             .append(",\"срыв\":").append(cSlip).append("}");
             if (r.length > 0)
                 j.append(",\"rtt_ms\":{\"p50\":").append(fmt(r[r.length / 2]))
                  .append(",\"p95\":").append(fmt(r[(int) (0.95 * (r.length - 1))]))
                  .append(",\"max\":").append(fmt(r[r.length - 1])).append("}");
             Collections.sort(recvNs);
             if (recvNs.size() > 1) {
-                double[] per = new double[recvNs.size() - 1];
+                double[] pe = new double[recvNs.size() - 1];
                 for (int i = 1; i < recvNs.size(); i++)
-                    per[i - 1] = (recvNs.get(i) - recvNs.get(i - 1)) / 1e6;
-                java.util.Arrays.sort(per);
-                j.append(",\"период_приёма_ms\":{\"p50\":").append(fmt(per[per.length / 2]))
-                 .append(",\"p95\":").append(fmt(per[(int) (0.95 * (per.length - 1))]))
-                 .append(",\"max\":").append(fmt(per[per.length - 1])).append("}");
+                    pe[i - 1] = (recvNs.get(i) - recvNs.get(i - 1)) / 1e6;
+                java.util.Arrays.sort(pe);
+                j.append(",\"период_приёма_ms\":{\"p50\":").append(fmt(pe[pe.length / 2]))
+                 .append(",\"p95\":").append(fmt(pe[(int) (0.95 * (pe.length - 1))]))
+                 .append(",\"max\":").append(fmt(pe[pe.length - 1])).append("}");
             }
             j.append(",\"ok_flag\":true");
         } catch (Throwable t) {
@@ -218,12 +286,14 @@ public class BtLinkActivity extends Activity {
         }
     }
 
+    static int bit(int status, int mask) { return (status & mask) != 0 ? 1 : 0; }
+
     static String fmt(double v) {
         return String.format(java.util.Locale.US, "%.3f", v);
     }
 
     static void write(File f, String s) throws Exception {
-        try (OutputStreamWriter w = new OutputStreamWriter(new FileOutputStream(f))) {
+        try (OutputStreamWriter w = new OutputStreamWriter(new FileOutputStream(f), "UTF-8")) {
             w.write(s);
         }
     }
