@@ -30,10 +30,30 @@
 // 0 — на USART1, к ESP32. VCP свободен, но говорить по нему нельзя.
 #define LINK_ON_VCP 0
 
-// НЕ PA9/PA10: PA9 это D8, занят под enable драйвера BLDCDriver3PWM(9,5,6,8).
-// Альтернативная пара того же USART1, оба пина шилд не использует.
-#define LINK_RX_PIN PA10   // D2
-#define LINK_TX_PIN PB6    // D10
+// ==================== ПРОФИЛЬ ПЛАТЫ ====================
+//
+// Один скетч на две платы, а не две копии: копии расходятся, и через неделю
+// уже не сказать, в какой из них живёт исправление.
+//
+// B-G431B-ESC1: силовая часть на самой плате, межплатных проводов нет.
+// Наружу выведены ровно три сигнала общего назначения — hall-разъём PB6, PB7,
+// PB8, — и они закрывают ровно наши три потребности: две на UART к ESP32,
+// одна на вход датчика. Запаса нет; следующий свободный пин был бы уже на
+// CAN-разъёме.
+#if defined(ARDUINO_B_G431B_ESC1)
+  #define LINK_RX_PIN PB7    // A_HALL2, USART1_RX  <- TX ESP32
+  #define LINK_TX_PIN PB6    // A_HALL1, USART1_TX  -> RX ESP32
+  #define SENSOR_PIN  PB8    // A_HALL3, PWM-выход AS5048
+  // Карта пинов USART1 добавляется файлом uart_pinmap_g431.c — в варианте
+  // платы её нет, см. пояснение там.
+#else
+  // Nucleo-F411RE + SimpleFOCShield. НЕ PA9/PA10: PA9 это D8, занят под enable
+  // драйвера BLDCDriver3PWM(9,5,6,8). Альтернативная пара того же USART1, оба
+  // пина шилд не использует.
+  #define LINK_RX_PIN PA10   // D2
+  #define LINK_TX_PIN PB6    // D10
+  #define SENSOR_PIN  3
+#endif
 
 // ==================== ПАРАМЕТРЫ (в лог по §3) ====================
 static const uint32_t BAUD           = 115200;
@@ -84,13 +104,22 @@ static const uint16_t MED_STEP_MS = 20;
 // предела уставки и от бага моста, а не участвует в обычном цикле.
 
 // ============================ ЖЕЛЕЗО ============================
-MagneticSensorPWM sensor = MagneticSensorPWM(3, SENS_MIN_US, SENS_MAX_US);
+MagneticSensorPWM sensor = MagneticSensorPWM(SENSOR_PIN, SENS_MIN_US, SENS_MAX_US);
 volatile uint32_t pwm_edges = 0;
 void doPWM() { pwm_edges++; sensor.handlePWM(); }
 
 #if MOTOR_ENABLED
 BLDCMotor      motor  = BLDCMotor(POLE_PAIRS);
+// На ESC1 ключи управляются шестью сигналами (верх и низ каждой стойки
+// раздельно), на шилде — тремя. Это разные классы драйвера, а не разная
+// раскладка: подставить одни пины в другой конструктор нельзя.
+#if defined(ARDUINO_B_G431B_ESC1)
+BLDCDriver6PWM driver = BLDCDriver6PWM(A_PHASE_UH, A_PHASE_UL,
+                                       A_PHASE_VH, A_PHASE_VL,
+                                       A_PHASE_WH, A_PHASE_WL);
+#else
 BLDCDriver3PWM driver = BLDCDriver3PWM(9, 5, 6, 8);
+#endif
 #endif
 
 #if LINK_ON_VCP
