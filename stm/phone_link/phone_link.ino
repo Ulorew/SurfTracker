@@ -89,6 +89,17 @@ static const float    MAX_ACCEL      = 1.0f;   // рад/с^2, рампа
 // Модуляция SpaceVector против Sine не даёт ничего — кривые совпадают.
 static const float    VOLTAGE_LIMIT  = 2.5f;   // В
 static const float    SUPPLY_V       = 12.0f;
+
+// ОБЕСТОЧИВАНИЕ НА ПРОСТОЕ.
+//
+// В разомкнутом контуре поле держится под напряжением и при НУЛЕВОЙ уставке:
+// мотор греется всё время, пока работает прошивка, а не только когда крутится.
+// За вечер стенд нагрелся до «горячо» без единого прогона между замерами.
+//
+// Держать момент на простое незачем и в изделии: камера стоит на месте сама,
+// её удерживает трение, а не поле. При появлении уставки драйвер просыпается
+// за один цикл.
+static const uint32_t IDLE_OFF_MS = 4000;
 static const uint8_t  POLE_PAIRS     = 11;
 // Окно длительности импульса AS5048. ИЗМЕРЕНО на этом экземпляре, а не
 // взято из даташита: полный оборот рукой дал 3..919 мкс при периоде 921 мкс.
@@ -326,6 +337,16 @@ void loop() {
   C.step(millis(), dt, theta);
 
 #if MOTOR_ENABLED
+  // Простой: команда ноль дольше IDLE_OFF_MS -> снимаем питание с фаз.
+  static uint32_t nonzero_ms = 0;
+  static bool motor_on = true;
+  if (fabsf(C.w_ramp) > 1e-3f) nonzero_ms = millis();
+  bool want_on = (millis() - nonzero_ms) < IDLE_OFF_MS;
+  if (want_on != motor_on) {
+    motor_on = want_on;
+    if (motor_on) motor.enable(); else motor.disable();
+  }
+
   // loopFOC() ОБЯЗАТЕЛЕН и в разомкнутом контуре — в SimpleFOC 2.4.0 именно
   // он считает электрический угол для open-loop и подаёт напряжение на фазы,
   // тогда как move() лишь обновляет shaft_angle и вычисляет current_sp.
@@ -334,8 +355,10 @@ void loop() {
   //
   // Симптом ошибки: driver.init()=1, motor.init()=1, enabled=1, shaft_angle
   // растёт ровно на заданной скорости, а на фазах 0 В и вал стоит.
-  motor.loopFOC();
-  motor.move(C.w_ramp);
+  if (motor_on) {
+    motor.loopFOC();
+    motor.move(C.w_ramp);
+  }
 #endif
 
   bool alive = C.had_first && !C.st_watchdog;

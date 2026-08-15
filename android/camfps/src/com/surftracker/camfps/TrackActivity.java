@@ -762,6 +762,15 @@ public class TrackActivity extends Activity {
             final int ScNarrow = Math.min(side, Math.min(W, H));
             final int ScWide = Math.min(W, H);
             int Sc = ScNarrow;
+            // Петля слежения — перенос замороженного офлайн-трекера
+            // (tracking-v1-frozen). Сличён с оригиналом на синтетическом
+            // сценарии: tools/windowing/port_check/check.py.
+            Tracker trk = new Tracker(W, H);
+            final int MAX_DET = 16;
+            float[][] dets = new float[MAX_DET][3];
+            double[][] detsPx = new double[MAX_DET][3];
+            long prevTickNs = 0;
+
             int scanPos = 0;               // фаза пилы обзора при долгой потере
             double lastGoodW = 0;          // последняя команда при живой цели
             long lastGoodNs = 0;           // когда цель видели последний раз
@@ -955,17 +964,47 @@ public class TrackActivity extends Activity {
                 // Лучшая детекция по строке 4. Для COCO это класс 0 = person;
                 // строки 5..83 не читаются вовсе, поэтому фильтр по классу
                 // достаётся бесплатно.
-                float bestC = 0; float bcx = 0, bcy = 0, bw = 0, bh = 0;
+                // Все кандидаты, а не сильнейший: выбор делает трекер по
+                // близости к предсказанию, и ему нужно из чего выбирать.
                 float[][] o0 = out[0];
-                for (int a = 0; a < o0[0].length; a++) {
-                    float c = o0[4][a];
-                    if (c > bestC) {
-                        bestC = c; bcx = o0[0][a]; bcy = o0[1][a];
-                        bw = o0[2][a]; bh = o0[3][a];   // строки 2 и 3 — ширина и высота
+                int nDet = flow ? 0 : Tracker.nms(o0, o0[0].length, dets, MAX_DET);
+                float bestC = 0; float bcx = 0, bcy = 0, bw = 0, bh = 0;
+                for (int a = 0; a < o0[0].length; a++) if (o0[4][a] > bestC) bestC = o0[4][a];
+                if (flow) { bestC = 0; }
+                // Такт трекера: перевод детекций в пиксели сенсора, план окна,
+                // выбор ближайшего к предсказанию.
+                long nowTickNs = System.nanoTime();
+                double dtTick = (prevTickNs == 0) ? 0.2 : (nowTickNs - prevTickNs) / 1e9;
+                prevTickNs = nowTickNs;
+                if (dtTick <= 0 || dtTick > 2.0) dtTick = 0.2;
+                int chosenDet = -1;
+                if (!flow && nDet > 0) {
+                    double scale = Sc / (double) NET;
+                    for (int q = 0; q < nDet; q++) {
+                        detsPx[q][0] = cropX + dets[q][0] * NET * scale;
+                        detsPx[q][1] = cropY + dets[q][1] * NET * scale;
+                        detsPx[q][2] = dets[q][2] * NET * scale;
+                    }
+                    if (!trk.initialized) {
+                        // Затравка: цели ещё нет, брать по близости не к чему.
+                        // Берём сильнейшую — единственный случай, когда
+                        // уверенность участвует в выборе.
+                        int b = 0;
+                        for (int q = 1; q < nDet; q++)
+                            if (dets[q][2] > dets[b][2]) b = q;
+                        if (bestC >= CONF_MIN) {
+                            trk.seed(detsPx[b][0], detsPx[b][1], detsPx[b][2]);
+                            chosenDet = b;
+                        }
+                    } else {
+                        double side0 = trk.windowSide();
+                        double pcx = trk.planCx(dtTick, side0), pcy = trk.planCy(dtTick, side0);
+                        chosenDet = trk.selectTarget(detsPx, nDet, pcx, pcy, side0);
+                        if (chosenDet >= 0) trk.update(detsPx[chosenDet][0], detsPx[chosenDet][1], dtTick, detsPx[chosenDet][2]);
                     }
                 }
-                if (flow) { bestC = 0; }
-                boolean hit = flow ? true : (bestC >= CONF_MIN);
+                if (!flow && chosenDet < 0 && trk.initialized) trk.advance(dtTick);
+                boolean hit = flow ? true : (chosenDet >= 0);
                 double errDeg = 0; double w = 0;
                 double cxSensor = winCx;
                 if (flow) {
@@ -979,35 +1018,20 @@ public class TrackActivity extends Activity {
                     // Координаты выхода НОРМИРОВАНЫ: умножать на сторону сети,
                     // потом на масштаб кропа. Забыть об этом — значит собрать
                     // все рамки в левом верхнем углу.
-                    cxSensor = cropX + (bcx * NET) * (Sc / (double) NET);
-                    double cySensor = cropY + (bcy * NET) * (Sc / (double) NET);
+                    cxSensor = detsPx[chosenDet][0];
+                    double cySensor = detsPx[chosenDet][1];
                     // Через арктангенс, а не умножением: на краю кадра
                     // (±36 град) линейное приближение врёт на четверть.
                     errDeg = Math.toDegrees(Math.atan((cxSensor - W / 2.0) / fPx));
                     w = sign * K * Math.toRadians(errDeg);
-                    winCx = (int) cxSensor; winCy = (int) cySensor;
+                    // Окно ведёт ТРЕКЕР: центр — предсказание, сторона — из
+                    // фильтра размера. Прежняя телефонная версия ставила окно
+                    // по последней детекции, то есть на такт позади цели.
+                    double sideNext = trk.windowSide();
+                    winCx = (int) trk.planCx(dtTick, sideNext);
+                    winCy = (int) trk.planCy(dtTick, sideNext);
+                    Sc = (int) Math.round(sideNext);
 
-                    // ОКНО СЛЕДУЕТ ЗА РАЗМЕРОМ ЦЕЛИ.
-                    //
-                    // Фиксированное окно ломается вблизи: кадр потери показал
-                    // торс во весь экран — ни головы, ни силуэта. Детектор
-                    // людей ищет человеческую фигуру и фрагмент туловища не
-                    // узнаёт, причём совершенно правильно.
-                    //
-                    // Множитель 2.5 к большей стороне рамки: цель занимает
-                    // около 40% окна, вокруг остаётся контекст, по которому
-                    // фигура и опознаётся. Меньше — теряем силуэт вблизи,
-                    // больше — вдали цель схлопывается в несколько пикселей
-                    // после уменьшения до 640.
-                    double boxSensor = Math.max(bw, bh) * NET * (Sc / (double) NET);
-                    if (boxSensor > 1) {
-                        int want = (int) Math.round(2.5 * boxSensor);
-                        want = Math.max(ScNarrow, Math.min(ScWide, want));
-                        // Плавно, а не скачком: резкая смена окна меняет и
-                        // масштаб, и содержимое сразу, и следующая детекция
-                        // приходит в другой системе координат.
-                        Sc = (int) Math.round(0.7 * Sc + 0.3 * want);
-                    }
                     hits++;
                     lastGoodW = w; lastGoodNs = System.nanoTime();
                     Sc = ScNarrow;
