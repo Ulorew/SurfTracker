@@ -996,6 +996,11 @@ public class TrackActivity extends Activity {
                 if (dtTick <= 0 || dtTick > 2.0) dtTick = 0.2;
                 int chosenDet = -1;
                 double distToPred = Double.NaN, gateNow = 0;
+                boolean stepped = false;
+                // Сколько длится потеря — нужно ЗДЕСЬ, до решения трекера:
+                // затравка после долгой потери открывается по этому же числу.
+                double lostSecNow = (lastGoodNs == 0) ? 0
+                        : (System.nanoTime() - lastGoodNs) / 1e9;
                 if (!flow && nDet > 0) {
                     double scale = Sc / (double) NET;
                     for (int q = 0; q < nDet; q++) {
@@ -1003,32 +1008,47 @@ public class TrackActivity extends Activity {
                         detsPx[q][1] = cropY + dets[q][1] * NET * scale;
                         detsPx[q][2] = dets[q][2] * NET * scale;
                     }
-                    if (!trk.initialized) {
+                    // Затравка открывается заново после ДОЛГОЙ потери.
+                    //
+                    // Без этого потеря — поглощающее состояние: приём навсегда
+                    // заперт в круге вокруг последнего предсказания, и цель,
+                    // полностью видимая в кадре, но вне этого круга, не
+                    // принимается никогда. Тот же дефект уже был найден в
+                    // питоновском трекере и описан отдельным отчётом.
+                    boolean mayReseed = !trk.initialized
+                            || (trk.status == Tracker.LOST && lostSecNow > relost);
+                    if (mayReseed) {
                         // Затравка: цели ещё нет, брать по близости не к чему.
                         // Берём сильнейшую — единственный случай, когда
                         // уверенность участвует в выборе.
+                        // Индекс 0: nms сортирует по УБЫВАНИЮ уверенности, и
+                        // первый элемент — самый уверенный.
+                        //
+                        // Прежняя строка сравнивала dets[q][2], а это РАЗМЕР:
+                        // в dets уверенности нет вовсе, nms кладёт только
+                        // центр и размер. То есть затравка бралась по самому
+                        // КРУПНОМУ объекту в кропе, а комментарий рядом
+                        // утверждал «берём сильнейшую».
                         int b = 0;
-                        for (int q = 1; q < nDet; q++)
-                            if (dets[q][2] > dets[b][2]) b = q;
                         if (bestC >= CONF_MIN) {
                             trk.seed(detsPx[b][0], detsPx[b][1], detsPx[b][2]);
                             chosenDet = b;
                         }
                     } else {
-                        double side0 = trk.windowSide();
-                        double pcx = trk.planCx(dtTick, side0), pcy = trk.planCy(dtTick, side0);
-                        chosenDet = trk.selectTarget(detsPx, nDet, pcx, pcy, side0);
-                        // Расстояние — до ПРЕДСКАЗАНИЯ и ДО обновления фильтра:
-                        // после update() состояние уже подтянуто к этой самой
-                        // детекции, и число мало по построению.
-                        distToPred = (chosenDet >= 0)
-                                ? Math.hypot(detsPx[chosenDet][0] - pcx, detsPx[chosenDet][1] - pcy)
-                                : Double.NaN;
-                        gateNow = Tracker.SELECT_MAX_DIST_FRAC * side0;
-                        if (chosenDet >= 0) trk.update(detsPx[chosenDet][0], detsPx[chosenDet][1], dtTick, detsPx[chosenDet][2]);
+                        // Весь такт — одним вызовом. Расстояние и радиус приёма
+                        // приходят ОТТУДА ЖЕ, где принималось решение: пока их
+                        // считали здесь, два диагностических столбца успели
+                        // разойтись с логикой и врали в отчёт.
+                        Tracker.Tick tk = trk.step(detsPx, nDet, dtTick);
+                        chosenDet = tk.chosen;
+                        distToPred = tk.dist;
+                        gateNow = tk.gate;
+                        stepped = true;
                     }
                 }
-                if (!flow && chosenDet < 0 && trk.initialized) trk.advance(dtTick);
+                // advance только если такт НЕ прошёл через step(): внутри него
+                // промах уже обработан, второй вызов сдвинул бы убеждение дважды.
+                if (!flow && !stepped && chosenDet < 0 && trk.initialized) trk.advance(dtTick);
                 boolean hit = flow ? true : (chosenDet >= 0);
                 double errDeg = 0; double w = 0;
                 double cxSensor = winCx;
