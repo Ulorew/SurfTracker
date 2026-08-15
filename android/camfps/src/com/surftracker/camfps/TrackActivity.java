@@ -580,15 +580,54 @@ public class TrackActivity extends Activity {
                 // 5.1 -> 3.97 к/с) и роняет удержание цели с 98% до 77%.
                 // Для разбора поведения 1080p достаточно, а слежение при нём
                 // остаётся на своей частоте.
+                // ТРИ НЕЗАВИСИМЫЕ ОСИ, а не одна ступенчатая ручка.
+                //
+                // Кодировщик грузится произведением «пиксели × кадры/с», и
+                // разрешение — лишь один сомножитель. Ступени 4K/1080/720
+                // прыгают вчетверо по площади и не дают ничего между; между
+                // тем частота кадров у нас избыточна (камера ведёт цель
+                // плавно, 24 к/с для просмотра не хуже 30, а стоит на пятую
+                // часть меньше), а битрейт влияет на запись в память, но не на
+                // счёт.
+                //
+                //   quality  2160 | 1440 | 1080 | 720   — площадь кадра
+                //   fps      число                      — нагрузка линейно
+                //   mbps     число                      — только ввод-вывод
+                //
+                // Профиль всё равно берётся у устройства и лишь правится:
+                // назначать параметры целиком руками уже пробовали, дорожка
+                // падала на девятой секунде.
                 String q = getIntent().getStringExtra("quality");
-                int qid = "1080".equals(q) ? android.media.CamcorderProfile.QUALITY_1080P
-                        : "720".equals(q) ? android.media.CamcorderProfile.QUALITY_720P
-                        : android.media.CamcorderProfile.QUALITY_2160P;
+                int qid;
+                if ("720".equals(q))       qid = android.media.CamcorderProfile.QUALITY_720P;
+                else if ("1080".equals(q)) qid = android.media.CamcorderProfile.QUALITY_1080P;
+                else if ("1440".equals(q)) qid = android.media.CamcorderProfile.QUALITY_QHD;
+                else                        qid = android.media.CamcorderProfile.QUALITY_2160P;
+                // Откат ВНИЗ по лестнице до первого поддержанного. Не вверх:
+                // если запрошенное качество аппарат не тянет, подниматься выше
+                // тем более незачем.
+                if (!android.media.CamcorderProfile.hasProfile(0, qid)) {
+                    int[] ladder = { android.media.CamcorderProfile.QUALITY_2160P,
+                                     android.media.CamcorderProfile.QUALITY_QHD,
+                                     android.media.CamcorderProfile.QUALITY_1080P,
+                                     android.media.CamcorderProfile.QUALITY_720P };
+                    int start = 0;
+                    for (int i = 0; i < ladder.length; i++) if (ladder[i] == qid) start = i;
+                    int chosen = android.media.CamcorderProfile.QUALITY_HIGH;
+                    for (int i = start; i < ladder.length; i++)
+                        if (android.media.CamcorderProfile.hasProfile(0, ladder[i])) { chosen = ladder[i]; break; }
+                    Log.w(TAG, "профиль " + q + " не поддержан, откат вниз");
+                    qid = chosen;
+                }
                 android.media.CamcorderProfile prof =
                         android.media.CamcorderProfile.hasProfile(0, qid)
                         ? android.media.CamcorderProfile.get(0, qid)
                         : android.media.CamcorderProfile.get(0,
                                 android.media.CamcorderProfile.QUALITY_HIGH);
+                int wantFps = getIntent().getIntExtra("fps", 0);
+                if (wantFps > 0) prof.videoFrameRate = wantFps;
+                int wantMbps = getIntent().getIntExtra("mbps", 0);
+                if (wantMbps > 0) prof.videoBitRate = wantMbps * 1000000;
                 File vf = new File(dir, tag + ".mp4");
                 recorder.setOutputFormat(prof.fileFormat);
                 recorder.setOutputFile(vf.getAbsolutePath());
