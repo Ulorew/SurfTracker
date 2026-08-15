@@ -80,11 +80,23 @@ public class TrackActivity extends Activity {
     // отправки. volatile достаточно: одно значение, атомарная запись float,
     // и терять промежуточные значения не страшно — свежее всегда лучше.
     volatile float wCmd = 0.0f;
+    // Момент последней ЗАПИСИ уставки. Без него развязка отправки от зрения
+    // создаёт худший отказ, чем чинит: если цикл зрения умрёт МОЛЧА (камеру
+    // отнял звонок, приложение ушло в фон, слушатель кадров проглотил
+    // исключение), поток отправки продолжит слать последнюю команду 10 раз в
+    // секунду. Сторож приёмника её не поймает — кадры свежие, seq растёт, —
+    // и вал уедет вслепую до конца сеанса.
+    //
+    // Асимметрия: ШУМНЫЙ отказ безопасен (исключение уводит в finally, сокет
+    // закрывается, сторож роняет вал за 300 мс), опасен ровно тот путь, где
+    // никто ничего не бросает.
+    volatile long wCmdNs = 0;
     volatile boolean running = true;
     volatile int lastStatus = 0;
     volatile float lastTheta = 0, lastWRamp = 0;
     volatile int telCount = 0;
     volatile int bWd = 0, bCap = 0, bRamp = 0, bEnc = 0, bClamp = 0, bSlip = 0;
+    volatile int staleZeros = 0;   // сколько раз слали ноль из-за протухания
     static final UUID SPP = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
     static final int NET = 640;
     static final float CONF_MIN = 0.35f;
@@ -138,6 +150,24 @@ public class TrackActivity extends Activity {
         new Thread(this::run).start();
     }
 
+    /**
+     * Уход в фон ОСТАНАВЛИВАЕТ прогон.
+     *
+     * Звонок, разблокировка по лицу или чужое приложение камеры отбирают поток
+     * кадров, но не трогают ни поток зрения, ни поток отправки: слушатель
+     * ImageReader просто перестаёт вызываться, цикл видит null и спит дальше.
+     * Без этой остановки уставка протухнет (см. wCmdNs) и вал встанет — но
+     * лучше остановиться явно и записать причину, чем полагаться на страховку.
+     */
+    @Override protected void onPause() {
+        super.onPause();
+        if (running) {
+            running = false;
+            wCmd = 0.0f; wCmdNs = System.nanoTime();
+            Log.i(TAG, "уход в фон: прогон остановлен");
+        }
+    }
+
     void run() {
         // Частичный wake lock: без него телефон уходит в дозу и поток
         // замирает молча, не оставив в логе даже ошибки.
@@ -172,6 +202,36 @@ public class TrackActivity extends Activity {
         // является по построению — она физически сидит на том же валу.
         // Разность «камера минус энкодер» и есть ошибка энкодера, измеренная
         // напрямую, а не выведенная из реакции на напряжение.
+        // ВЫБЕГ ПРИ ПОТЕРЕ ЦЕЛИ. Мгновенный ноль правилен для комнаты и
+        // сомнителен для поля: сёрфер уходит за волну, в брызги, за край
+        // кадра — и возвращается. Останавливаться на каждое такое пропадание
+        // значит терять цель окончательно там, где она пропала на полсекунды.
+        //
+        // Держим последнюю команду coast секунд, затем линейно гасим за столько
+        // же. Держать ДОЛЬШЕ нельзя: слепое вращение уезжает от цели тем
+        // дальше, чем дольше её нет, и это ровно тот отказ, который делает
+        // возврат невозможным.
+        float coast = getIntent().getFloatExtra("coast", 0.4f);
+
+        // РАСШИРЕНИЕ ОКНА ПРИ ДОЛГОЙ ПОТЕРЕ. Окно слежения сужает поле зрения
+        // ради разрешения; когда цели нет давно, разрешение уже не нужно, нужен
+        // охват. Возвращаем узкое окно сразу после захвата.
+        float relost = getIntent().getFloatExtra("relost", 1.5f);
+
+        // ПРЕДЕЛ ДЛИТЕЛЬНОЙ СКОРОСТИ. Развёртка для глаза показала две полосы
+        // раскачки: 0.20-0.30 и 0.45-0.50 рад/с, где гармоники привода
+        // пересекают резонанс. Транзит через них безопасен, ЗАДЕРЖКА — нет
+        // (гистерезис: заход снизу возбуждает, заход сверху нет).
+        //
+        // Поэтому ограничивается не мгновенная команда, а СГЛАЖЕННАЯ: короткие
+        // броски проходят, длительное сидение в полосе — нет.
+        float dwell = getIntent().getFloatExtra("dwell", 0.18f);
+
+        // ВОЗВРАТ В ИСХОДНОЕ. После сеанса камера остаётся там, куда доехала,
+        // и следующий сеанс начинается с наведения в пустоту. На стенде это
+        // уже стоило одного потерянного прогона.
+        boolean home = getIntent().getBooleanExtra("home", true);
+
         boolean flow = getIntent().getBooleanExtra("flow", false);
         float spinW = getIntent().getFloatExtra("spin", 0.15f);
 
@@ -289,6 +349,10 @@ public class TrackActivity extends Activity {
              .append(",\"град_на_пиксель\":").append(String.format(java.util.Locale.US, "%.5f", degPerPx))
              .append(",\"K\":").append(fmt(K)).append(",\"знак\":").append(sign)
              .append(",\"окно\":").append(side).append(",\"секунд\":").append(seconds)
+             .append(",\"выбег\":").append(fmt(coast))
+             .append(",\"расширение\":").append(fmt(relost))
+             .append(",\"предел_задержки\":").append(fmt(dwell))
+             .append(",\"возврат\":").append(home)
              .append(",\"сухой_прогон\":").append(dry);
 
             // Очередь на 4 кадра, а не на 2. При двух возникает гонка: один
@@ -411,7 +475,14 @@ public class TrackActivity extends Activity {
             // НЕ расширяется: расширение прячет потерю и мешает увидеть, как
             // часто она случается. Для первого прогона важнее честность.
             int winCx = W / 2, winCy = H / 2;
-            int Sc = Math.min(side, Math.min(W, H));
+            final int ScNarrow = Math.min(side, Math.min(W, H));
+            final int ScWide = Math.min(W, H);
+            int Sc = ScNarrow;
+            int scanPos = 0;               // фаза пилы обзора при долгой потере
+            double lastGoodW = 0;          // последняя команда при живой цели
+            long lastGoodNs = 0;           // когда цель видели последний раз
+            double wSmooth = 0;            // сглаженная команда для предела задержки
+            float homeTheta = Float.NaN;   // угол вала на старте сеанса
             long t0 = System.nanoTime();
             long lastLoop = t0;
 
@@ -561,17 +632,75 @@ public class TrackActivity extends Activity {
                     w = sign * K * Math.toRadians(errDeg);
                     winCx = (int) cxSensor; winCy = (int) cySensor;
                     hits++;
+                    lastGoodW = w; lastGoodNs = System.nanoTime();
+                    Sc = ScNarrow;
                 } else {
-                    // Цель потеряна — уставка НОЛЬ, а не последняя команда.
-                    // Продолжать крутить вслепую значит уезжать от цели тем
-                    // дальше, чем дольше её нет.
-                    w = 0;
                     misses++;
+                    double lost = (lastGoodNs == 0) ? 1e9
+                                  : (System.nanoTime() - lastGoodNs) / 1e9;
+                    if (lost <= coast) {
+                        w = lastGoodW;                       // выбег: держим
+                    } else if (lost <= 2 * coast) {
+                        w = lastGoodW * (1.0 - (lost - coast) / coast);  // гасим
+                    } else {
+                        w = 0;
+                    }
+                    // Долгая потеря — окно обязано ХОДИТЬ, а не просто
+                    // расширяться.
+                    //
+                    // Расширение само по себе оказалось тождественной
+                    // операцией: при потоке 1920x1080 min(side=1280, 1080) и
+                    // min(W,H)=1080 — одно и то же число. Но даже когда оно
+                    // работает (4:3), квадратное окно накрывает максимум
+                    // min(W,H)/W = 56% ширины, и цель, ушедшая вбок, остаётся
+                    // снаружи навсегда: winCx в ветке промаха не менялся, и
+                    // потеря становилась ПОГЛОЩАЮЩИМ состоянием.
+                    //
+                    // Тот же дефект уже описан в проекте для питоновского
+                    // трекера (reports/КРИТИЧЕСКИЙ_ДЕФЕКТ_ОКНО.md), и здесь он
+                    // был повторён заново.
+                    if (lost > relost) {
+                        Sc = ScWide;
+                        int span = Math.max(1, W - Sc);
+                        scanPos = (scanPos + Sc / 2) % (2 * span);
+                        winCx = Sc / 2 + (scanPos <= span ? scanPos : 2 * span - scanPos);
+                        winCy = H / 2;
+                    }
                 }
 
                 // Уставка только ОБНОВЛЯЕТСЯ. Отправкой занят отдельный поток на
                 // ровных 10 Гц — см. ниже, зачем.
-                wCmd = (float) w;
+                // Предел ДЛИТЕЛЬНОЙ скорости. Три дефекта первой редакции,
+                // каждый из которых по отдельности отключал механизм:
+                //
+                // 1. Сглаживание шло ПО КАДРАМ (коэффициент 0.1 на такт), а не
+                //    по времени. При такте 200 мс это постоянная около 2 с
+                //    вместо заявленных 0.5, и она плыла с загрузкой телефона.
+                //    Теперь по dt.
+                // 2. Сглаживалась команда СО ЗНАКОМ. Проводка туда-обратно
+                //    давала среднее около нуля, и при качании ±0.38 сглаженная
+                //    не поднималась выше 0.174 — предел не срабатывал НИ РАЗУ.
+                //    Теперь сглаживается модуль.
+                // 3. Ужатие было ПРОПОРЦИОНАЛЬНЫМ: выход получался всегда не
+                //    меньше dwell, и вал вели сверху вниз ЧЕРЕЗ всю запретную
+                //    полосу 0.20-0.30. Теперь клип.
+                //
+                // И снятие предела при большой ошибке: при 0.18 рад/с догнать
+                // цель, требующую 0.25-0.40, невозможно по построению, так что
+                // на большой ошибке плавность уступает захвату.
+                double dtLoop = (System.nanoTime() - lastLoop) / 1e9;
+                if (dtLoop <= 0 || dtLoop > 1.0) dtLoop = 0.2;
+                double aSm = Math.min(1.0, dtLoop / 0.5);
+                wSmooth += (Math.abs(w) - wSmooth) * aSm;
+                double shrink = 1.0;
+                if (dwell > 0 && wSmooth > dwell && Math.abs(w) > dwell
+                        && Math.abs(errDeg) < 12.0) {
+                    double lim = Math.copySign(dwell, w);
+                    shrink = Math.abs(lim) / Math.abs(w);
+                    w = lim;
+                }
+                wCmd = (float) w; wCmdNs = System.nanoTime();
+                if (Float.isNaN(homeTheta) && telCount > 0) homeTheta = lastTheta;
                 int st = lastStatus; float th = lastTheta, wr = lastWRamp;
                 boolean gotTel = telCount > 0;
 
@@ -591,8 +720,51 @@ public class TrackActivity extends Activity {
                    .append(bit(st, ProtoV2.ST_ENC_OK)).append(',')
                    .append(bit(st, ProtoV2.ST_CLAMP)).append(',')
                    .append(bit(st, ProtoV2.ST_SLIP)).append(',')
-                   .append(fmt(infMs)).append(',').append(fmt(loopMs)).append('\n');
+                   .append(fmt(infMs)).append(',').append(fmt(loopMs)).append(',')
+                   .append(Sc).append(',').append(winCx).append(',')
+                   .append(fmt(wSmooth)).append(',').append(fmt(shrink)).append('\n');
                 frames++;
+            }
+
+            // ВОЗВРАТ В ИСХОДНОЕ. Простой П-регулятор по углу: ошибка берётся
+            // из телеметрии, команда ограничена как обычная уставка. Идём
+            // медленно (0.12 рад/с) — ниже полосы раскачки 0.20-0.30.
+            if (home && !dry && !Float.isNaN(homeTheta)) {
+                // ВОРОТА. Возврат ведёт вал вслепую по телеметрии, поэтому он
+                // обязан прерываться, как только телеметрии верить нельзя.
+                // Отдельно — БЮДЖЕТ ПУТИ: он единственный закрывает перезапуск
+                // STM32, где все биты чистые, а точка отсчёта уже другая.
+                long th0 = System.nanoTime();
+                double err = 0, travel = 0, err0 = homeTheta - lastTheta;
+                String hstat = "ок";
+                long prevNs = System.nanoTime();
+                int telAt = telCount;
+                long telSeenNs = System.nanoTime();
+                while ((System.nanoTime() - th0) / 1e9 < 25.0) {
+                    if (telCount != telAt) { telAt = telCount; telSeenNs = System.nanoTime(); }
+                    if ((System.nanoTime() - telSeenNs) > 300_000_000L) { hstat = "нет_телеметрии"; break; }
+                    if ((lastStatus & ProtoV2.ST_ENC_OK) == 0) { hstat = "энкодер_молчит"; break; }
+                    if ((lastStatus & ProtoV2.ST_SLIP) != 0)   { hstat = "срыв"; break; }
+                    err = homeTheta - lastTheta;
+                    // Порог 0.05 рад, а не 0.02: собственный шум theta около
+                    // 0.08 рад, и 0.02 лежит НИЖЕ него — цикл крутился бы до
+                    // таймаута, гоняя вал по шуму.
+                    if (Math.abs(err) < 0.05) break;
+                    double wh = Math.max(-0.12, Math.min(0.12, 0.5 * err));
+                    long now2 = System.nanoTime();
+                    travel += Math.abs(wh) * (now2 - prevNs) / 1e9;
+                    prevNs = now2;
+                    if (travel > Math.abs(err0) + 0.17) { hstat = "бюджет_пути"; break; }
+                    wCmd = (float) wh; wCmdNs = now2;
+                    Thread.sleep(20);
+                }
+                if (hstat.equals("ок") && (System.nanoTime() - th0) / 1e9 >= 25.0) hstat = "таймаут";
+                wCmd = 0.0f; wCmdNs = System.nanoTime();
+                Thread.sleep(300);
+                j.append(",\"возврат_статус\":\"").append(hstat).append("\"")
+                 .append(",\"возврат_путь_рад\":").append(fmt(travel))
+                 .append(",\"возврат_ошибка_град\":")
+                 .append(hstat.equals("ок") ? fmt(Math.toDegrees(err)) : "null");
             }
 
             running = false;
@@ -614,6 +786,7 @@ public class TrackActivity extends Activity {
              .append(",\"без_цели\":").append(misses)
              .append(",\"доля_с_целью\":").append(frames > 0 ? fmt(hits / (double) frames) : "0")
              .append(",\"телеметрии\":").append(telCount)
+             .append(",\"протухших_нулей\":").append(staleZeros)
              .append(",\"биты\":{\"watchdog\":").append(bWd)
              .append(",\"потолок\":").append(bCap).append(",\"рампа\":").append(bRamp)
              .append(",\"энкодер\":").append(bEnc).append(",\"кламп\":").append(bClamp)
