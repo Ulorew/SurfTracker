@@ -596,6 +596,22 @@ public class TrackActivity extends Activity {
             // менять ДЛИНУ массива, а не обнулять его часть.
             final int STRIP = NET / 3;
             float[] colPrev = null, colCur = new float[STRIP];
+
+            // КАДРЫ МОМЕНТА ПОТЕРИ.
+            //
+            // Лог говорит, ЧТО произошло (уверенность упала, скорость была
+            // такая-то), но не говорит ПОЧЕМУ: смазало движением, вышел за
+            // край, заслонило, попал в контровый свет. Ответ на «почему» есть
+            // только в самом кадре.
+            //
+            // Пишем не видео, а кольцо из последних кадров: при переходе
+            // «цель есть» -> «цели нет» выгружаются три кадра до и три после.
+            // Полная запись потребовала бы отсматривать десятки секунд ради
+            // полусекунды события, а кодек ещё и отобрал бы такт у модели.
+            final int RING_N = 3;
+            byte[][] ring = new byte[RING_N][];
+            int ringAt = 0, dumpLeft = 0, lossIdx = 0;
+            boolean prevHit = false;
             double flowAccPx = 0;
             j.append(",\"выход\":\"").append(osh[0]).append("x").append(osh[1])
              .append("x").append(osh[2]).append("\"");
@@ -648,17 +664,17 @@ public class TrackActivity extends Activity {
                 {"32","Стойте. Прогон закончен"}};
             else if (scen.equals("выбег")) script = new String[][]{
                 {"0","Стойте на месте"},
-                {"6","Идите поперёк кадра"},
-                {"14","Спрячьтесь на две секунды и выйдите там же"},
-                {"20","Идите дальше"},
-                {"26","Стойте на месте"},
-                {"30","Спрячьтесь на две секунды и выйдите там же"},
-                {"36","Стойте. Прогон закончен"}};
+                {"5","Идите поперёк кадра"},
+                {"6","Спрячьтесь на две секунды и выйдите там же"},
+                {"5","Идите дальше"},
+                {"5","Стойте на месте"},
+                {"4","Спрячьтесь на две секунды и выйдите там же"},
+                {"5","Стойте. Прогон закончен"}};
             else if (scen.equals("окно")) script = new String[][]{
                 {"0","Стойте в центре"},
-                {"8","Уйдите из кадра и не показывайтесь"},
-                {"20","Выйдите в другом конце комнаты"},
-                {"32","Стойте. Прогон закончен"}};
+                {"6","Уйдите из кадра и не показывайтесь"},
+                {"12","Не спеша выйдите в другом конце комнаты"},
+                {"10","Стойте. Прогон закончен"}};
             else if (scen.equals("знак")) script = new String[][]{
                 // РЕШАЮЩИЙ ТЕСТ ЗНАКА. Цель неподвижна и смещена от центра:
                 // верный знак обязан свести ошибку к нулю монотонно, неверный
@@ -672,6 +688,19 @@ public class TrackActivity extends Activity {
             else script = new String[0][];
             int scriptAt = 0;
             StringBuilder cues = new StringBuilder();
+            // Время в сценарии считается ОТ КОНЦА предыдущей реплики, а не от
+            // начала прогона.
+            //
+            // Реплика звучит две-три секунды, и всё это время наблюдатель ещё
+            // слушает, а не действует. При отсчёте от начала прогона у него на
+            // действие остаётся на столько же меньше, и он не успевает —
+            // ровно это и произошло в сценарии «окно», где Hero не успел
+            // переползти в другой конец комнаты.
+            //
+            // Длительность речи оценивается по длине фразы: точного сигнала
+            // окончания у TextToSpeech без слушателя нет, а слушатель здесь
+            // не окупается.
+            double cueBase = 0;
 
             long t0 = System.nanoTime();
             long lastLoop = t0;
@@ -754,7 +783,7 @@ public class TrackActivity extends Activity {
             while ((System.nanoTime() - t0) / 1e9 < seconds) {
                 double tsec = (System.nanoTime() - t0) / 1e9;
                 while (scriptAt < script.length
-                        && tsec >= Double.parseDouble(script[scriptAt][0])) {
+                        && tsec >= cueBase + Double.parseDouble(script[scriptAt][0])) {
                     say(script[scriptAt][1]);
                     // Копим в отдельный буфер и дописываем ОДИН раз в конце:
                     // прежняя редакция открывала массив в JSON и закрывала его
@@ -764,6 +793,8 @@ public class TrackActivity extends Activity {
                     if (cues.length() > 0) cues.append(",");
                     cues.append("{\"t\":").append(fmt(tsec)).append(",\"текст\":\"")
                         .append(script[scriptAt][1]).append("\"}");
+                    // Следующая реплика отсчитывается от конца этой.
+                    cueBase = tsec + 0.06 * script[scriptAt][1].length() + 0.6;
                     scriptAt++;
                 }
                 Image im = latest.getAndSet(null);
@@ -807,11 +838,14 @@ public class TrackActivity extends Activity {
                 // Лучшая детекция по строке 4. Для COCO это класс 0 = person;
                 // строки 5..83 не читаются вовсе, поэтому фильтр по классу
                 // достаётся бесплатно.
-                float bestC = 0; float bcx = 0, bcy = 0;
+                float bestC = 0; float bcx = 0, bcy = 0, bw = 0, bh = 0;
                 float[][] o0 = out[0];
                 for (int a = 0; a < o0[0].length; a++) {
                     float c = o0[4][a];
-                    if (c > bestC) { bestC = c; bcx = o0[0][a]; bcy = o0[1][a]; }
+                    if (c > bestC) {
+                        bestC = c; bcx = o0[0][a]; bcy = o0[1][a];
+                        bw = o0[2][a]; bh = o0[3][a];   // строки 2 и 3 — ширина и высота
+                    }
                 }
                 if (flow) { bestC = 0; }
                 boolean hit = flow ? true : (bestC >= CONF_MIN);
@@ -835,6 +869,28 @@ public class TrackActivity extends Activity {
                     errDeg = Math.toDegrees(Math.atan((cxSensor - W / 2.0) / fPx));
                     w = sign * K * Math.toRadians(errDeg);
                     winCx = (int) cxSensor; winCy = (int) cySensor;
+
+                    // ОКНО СЛЕДУЕТ ЗА РАЗМЕРОМ ЦЕЛИ.
+                    //
+                    // Фиксированное окно ломается вблизи: кадр потери показал
+                    // торс во весь экран — ни головы, ни силуэта. Детектор
+                    // людей ищет человеческую фигуру и фрагмент туловища не
+                    // узнаёт, причём совершенно правильно.
+                    //
+                    // Множитель 2.5 к большей стороне рамки: цель занимает
+                    // около 40% окна, вокруг остаётся контекст, по которому
+                    // фигура и опознаётся. Меньше — теряем силуэт вблизи,
+                    // больше — вдали цель схлопывается в несколько пикселей
+                    // после уменьшения до 640.
+                    double boxSensor = Math.max(bw, bh) * NET * (Sc / (double) NET);
+                    if (boxSensor > 1) {
+                        int want = (int) Math.round(2.5 * boxSensor);
+                        want = Math.max(ScNarrow, Math.min(ScWide, want));
+                        // Плавно, а не скачком: резкая смена окна меняет и
+                        // масштаб, и содержимое сразу, и следующая детекция
+                        // приходит в другой системе координат.
+                        Sc = (int) Math.round(0.7 * Sc + 0.3 * want);
+                    }
                     hits++;
                     lastGoodW = w; lastGoodNs = System.nanoTime();
                     Sc = ScNarrow;
@@ -913,6 +969,33 @@ public class TrackActivity extends Activity {
                 int st = lastStatus; float th = lastTheta, wr = lastWRamp;
                 boolean gotTel = telCount > 0;
 
+                // Кольцо кадров: держим последние RING_N в сыром виде тензора.
+                if (!flow) {
+                    if (ring[ringAt] == null) ring[ringAt] = new byte[NET * NET * 3 * 4];
+                    bin.rewind();
+                    bin.get(ring[ringAt]);
+                    bin.rewind();
+                    ringAt = (ringAt + 1) % RING_N;
+                }
+                if (prevHit && !hit) {          // МОМЕНТ ПОТЕРИ
+                    lossIdx++;
+                    for (int q = 0; q < RING_N; q++) {
+                        int idx = (ringAt + q) % RING_N;
+                        if (ring[idx] == null) continue;
+                        dumpTensor(ring[idx], new File(dir,
+                                tag + "_потеря" + lossIdx + "_до" + (RING_N - q) + ".png"));
+                    }
+                    dumpLeft = RING_N;
+                } else if (dumpLeft > 0 && !flow) {
+                    bin.rewind();
+                    byte[] cur = new byte[NET * NET * 3 * 4];
+                    bin.get(cur); bin.rewind();
+                    dumpTensor(cur, new File(dir,
+                            tag + "_потеря" + lossIdx + "_после" + (RING_N - dumpLeft + 1) + ".png"));
+                    dumpLeft--;
+                }
+                prevHit = hit;
+
                 long now = System.nanoTime();
                 double loopMs = (now - lastLoop) / 1e6;
                 lastLoop = now;
@@ -939,6 +1022,15 @@ public class TrackActivity extends Activity {
             // из телеметрии, команда ограничена как обычная уставка. Идём
             // медленно (0.12 рад/с) — ниже полосы раскачки 0.20-0.30.
             if (home && !dry && !Float.isNaN(homeTheta)) {
+                // Пауза перед возвратом. Главный цикл кончился, команда упала в
+                // ноль, но вал ещё катится по инерции — и детектор срыва видит
+                // расхождение угла с интегралом команды. Это штатный
+                // переходный процесс, а в прогоне «окно» он сорвал возврат,
+                // потому что ворота приняли его за аварию.
+                //
+                // Ждём дольше окна детектора (1 с), держа нулевую команду.
+                wCmd = 0.0f; wCmdNs = System.nanoTime();
+                Thread.sleep(1400);
                 // ВОРОТА. Возврат ведёт вал вслепую по телеметрии, поэтому он
                 // обязан прерываться, как только телеметрии верить нельзя.
                 // Отдельно — БЮДЖЕТ ПУТИ: он единственный закрывает перезапуск
@@ -960,7 +1052,9 @@ public class TrackActivity extends Activity {
                     if ((lastStatus & ProtoV2.ST_ENC_OK) == 0) badEnc++; else badEnc = 0;
                     if ((lastStatus & ProtoV2.ST_SLIP) != 0)   badSlip++; else badSlip = 0;
                     if (badEnc >= 3)  { hstat = "энкодер_молчит"; break; }
-                    if (badSlip >= 3) { hstat = "срыв"; break; }
+                    // Срыв — по пяти подряд: возврат идёт на 0.12 рад/с, и
+                    // единичные срабатывания там ничего не значат.
+                    if (badSlip >= 5) { hstat = "срыв"; break; }
                     err = homeTheta - lastTheta;
                     // Порог 0.05 рад, а не 0.02: собственный шум theta около
                     // 0.08 рад, и 0.02 лежит НИЖЕ него — цикл крутился бы до
@@ -1067,6 +1161,30 @@ public class TrackActivity extends Activity {
         double sub = (d != 0) ? (y2 - y0) / d : 0;
         if (sub < -1 || sub > 1) sub = 0;
         return bestLag + sub;
+    }
+
+    /** Тензор NCHW float32 [0..1] -> PNG. Ошибки глушатся: диагностика не
+     *  имеет права уронить прогон. */
+    static void dumpTensor(byte[] raw, File f) {
+        if (raw == null || f == null) return;
+        try {
+            java.nio.FloatBuffer fb = java.nio.ByteBuffer.wrap(raw)
+                    .order(ByteOrder.nativeOrder()).asFloatBuffer();
+            int[] px = new int[NET * NET];
+            int plane = NET * NET;
+            for (int i = 0; i < plane; i++) {
+                int r = (int) (Math.max(0, Math.min(1, fb.get(i))) * 255);
+                int g = (int) (Math.max(0, Math.min(1, fb.get(plane + i))) * 255);
+                int b2 = (int) (Math.max(0, Math.min(1, fb.get(2 * plane + i))) * 255);
+                px[i] = 0xFF000000 | (r << 16) | (g << 8) | b2;
+            }
+            android.graphics.Bitmap bm = android.graphics.Bitmap.createBitmap(
+                    px, NET, NET, android.graphics.Bitmap.Config.ARGB_8888);
+            try (FileOutputStream os2 = new FileOutputStream(f)) {
+                bm.compress(android.graphics.Bitmap.CompressFormat.PNG, 90, os2);
+            }
+            bm.recycle();
+        } catch (Throwable t) { Log.e(TAG, "кадр потери: " + t); }
     }
 
     static int bit(int st, int m) { return (st & m) != 0 ? 1 : 0; }
