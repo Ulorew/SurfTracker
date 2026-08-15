@@ -12,6 +12,11 @@ import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.Image;
 import android.media.ImageReader;
+import android.media.MediaRecorder;
+import android.graphics.SurfaceTexture;
+import android.hardware.camera2.CameraCaptureSession;
+import android.hardware.camera2.params.OutputConfiguration;
+import android.hardware.camera2.params.SessionConfiguration;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -165,6 +170,9 @@ public class TrackActivity extends Activity {
     static final float CONF_MIN = 0.35f;
 
     ImageReader reader;      // сильная ссылка: иначе финализатор закроет поток
+    MediaRecorder recorder;
+    Surface recSurface, previewSurface;
+    SurfaceTexture previewTexture;
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -372,6 +380,10 @@ public class TrackActivity extends Activity {
         // JPEG, а не PNG: при 5 кадрах в секунду сжатие PNG отняло бы у цикла
         // больше, чем стоит разница в качестве для разбора.
         boolean rec = getIntent().getBooleanExtra("rec", false);
+        // ПОЛНОЦЕННАЯ ЗАПИСЬ — то, ради чего изделие и делается: видео с
+        // камеры, которая ведёт цель. Кадры модели (rec) отвечают на вопрос
+        // «почему потеряла», а это — собственно результат.
+        boolean video = getIntent().getBooleanExtra("video", false);
 
         boolean flow = getIntent().getBooleanExtra("flow", false);
         float spinW = getIntent().getFloatExtra("spin", 0.15f);
@@ -546,23 +558,74 @@ public class TrackActivity extends Activity {
             dev = open(cm, id);
             List<Surface> targets = new ArrayList<>();
             targets.add(reader.getSurface());
-            final android.hardware.camera2.CameraCaptureSession[] box =
-                new android.hardware.camera2.CameraCaptureSession[1];
+
+            // Запись: превью + рекордер + анализ. Превью в наборе обязательно —
+            // это проверенная на этом аппарате комбинация потоков (см.
+            // reports/ТЕЛЕФОН.md, «PRIV 1080p + PRIV 4K + YUV max»), и без
+            // него сессия на части устройств не собирается.
+            if (video) {
+                previewTexture = new SurfaceTexture(0);
+                previewTexture.setDefaultBufferSize(1920, 1080);
+                previewSurface = new Surface(previewTexture);
+                targets.add(previewSurface);
+
+                recorder = new MediaRecorder();
+                recorder.setVideoSource(MediaRecorder.VideoSource.SURFACE);
+                // Параметры ИЗ ПРОФИЛЯ УСТРОЙСТВА, а не назначенные руками:
+                // заданные вручную 3840x2160 на 40 Мбит/с давали ошибку
+                // дорожки на девятой секунде и вешали весь конвейер.
+                // Производитель знает про свой кодировщик больше.
+                // Качество выбирается, а не берётся максимальным. Замер:
+                // запись 4K съедает четверть такта слежения (196 -> 252 мс,
+                // 5.1 -> 3.97 к/с) и роняет удержание цели с 98% до 77%.
+                // Для разбора поведения 1080p достаточно, а слежение при нём
+                // остаётся на своей частоте.
+                String q = getIntent().getStringExtra("quality");
+                int qid = "1080".equals(q) ? android.media.CamcorderProfile.QUALITY_1080P
+                        : "720".equals(q) ? android.media.CamcorderProfile.QUALITY_720P
+                        : android.media.CamcorderProfile.QUALITY_2160P;
+                android.media.CamcorderProfile prof =
+                        android.media.CamcorderProfile.hasProfile(0, qid)
+                        ? android.media.CamcorderProfile.get(0, qid)
+                        : android.media.CamcorderProfile.get(0,
+                                android.media.CamcorderProfile.QUALITY_HIGH);
+                File vf = new File(dir, tag + ".mp4");
+                recorder.setOutputFormat(prof.fileFormat);
+                recorder.setOutputFile(vf.getAbsolutePath());
+                recorder.setVideoEncoder(prof.videoCodec);
+                recorder.setVideoSize(prof.videoFrameWidth, prof.videoFrameHeight);
+                recorder.setVideoFrameRate(prof.videoFrameRate);
+                recorder.setVideoEncodingBitRate(prof.videoBitRate);
+                recorder.setOnErrorListener((mr, what, extra) ->
+                        Log.e(TAG, "рекордер ОШИБКА what=" + what + " extra=" + extra));
+                recorder.prepare();
+                recSurface = recorder.getSurface();
+                targets.add(recSurface);
+                j.append(",\"запись\":\"").append(prof.videoFrameWidth).append("x")
+                 .append(prof.videoFrameHeight).append("@").append(prof.videoFrameRate)
+                 .append("\"");
+            }
+            final CameraCaptureSession[] box = new CameraCaptureSession[1];
             CountDownLatch cfg = new CountDownLatch(1);
-            dev.createCaptureSession(targets,
-                new android.hardware.camera2.CameraCaptureSession.StateCallback() {
-                    public void onConfigured(android.hardware.camera2.CameraCaptureSession s) {
-                        box[0] = s; cfg.countDown();
-                    }
-                    public void onConfigureFailed(android.hardware.camera2.CameraCaptureSession s) {
-                        cfg.countDown();
-                    }
-                }, h);
-            if (!cfg.await(8, TimeUnit.SECONDS) || box[0] == null)
+            List<OutputConfiguration> cfgs = new ArrayList<>();
+            for (Surface sf : targets) cfgs.add(new OutputConfiguration(sf));
+            dev.createCaptureSession(new SessionConfiguration(
+                    SessionConfiguration.SESSION_REGULAR, cfgs, r -> h.post(r),
+                    new CameraCaptureSession.StateCallback() {
+                        public void onConfigured(CameraCaptureSession s2) { box[0] = s2; cfg.countDown(); }
+                        public void onConfigureFailed(CameraCaptureSession s2) { cfg.countDown(); }
+                    }));
+            if (!cfg.await(10, TimeUnit.SECONDS) || box[0] == null)
                 throw new RuntimeException("сессия не собралась");
-            CaptureRequest.Builder rq = dev.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+            CaptureRequest.Builder rq = dev.createCaptureRequest(
+                    video ? CameraDevice.TEMPLATE_RECORD : CameraDevice.TEMPLATE_PREVIEW);
             rq.addTarget(reader.getSurface());
+            if (video) { rq.addTarget(previewSurface); rq.addTarget(recSurface); }
             box[0].setRepeatingRequest(rq.build(), null, h);
+            if (video) {
+                recorder.start();
+                Log.i(TAG, "запись пошла");
+            }
 
             // ---------- модель ----------
             File model = new File(getExternalFilesDir(null), mn);
@@ -1139,16 +1202,43 @@ public class TrackActivity extends Activity {
             running = false;
             try { if (interp != null) interp.close(); } catch (Throwable ignored) {}
             try { if (sock != null) sock.close(); } catch (Throwable ignored) {}
+            // Рекордер останавливается ДО камеры: иначе кодировщик остаётся
+            // без входа и файл выходит без хвоста, а иногда и без индекса.
+            try { if (recorder != null) { recorder.stop(); recorder.release(); } }
+            catch (Throwable t) { Log.e(TAG, "остановка записи: " + t); }
             try { if (dev != null) dev.close(); } catch (Throwable ignored) {}
+            try { if (previewSurface != null) previewSurface.release(); } catch (Throwable ignored) {}
+            try { if (previewTexture != null) previewTexture.release(); } catch (Throwable ignored) {}
             try { if (reader != null) reader.close(); } catch (Throwable ignored) {}
             ht.quitSafely();
             try { if (tts != null) { tts.stop(); tts.shutdown(); } } catch (Throwable ignored) {}
-            try { if (tone != null) tone.release(); } catch (Throwable ignored) {}
+            // tone НЕ освобождается здесь: сигнал окончания играет ниже, в
+            // этом же блоке. Освобождённый генератор молчит без единой ошибки —
+            // ровно тот отказ, который не заметен ни в логе, ни в коде при
+            // беглом чтении.
             try { if (wl != null && wl.isHeld()) wl.release(); } catch (Throwable ignored) {}
             try {
                 write(new File(base.getPath() + ".json"), j.append("}").toString());
                 write(new File(base.getPath() + ".csv"), csv.toString());
             } catch (Throwable ignored) {}
+            // Звук окончания. Наблюдатель стоит в кадре и не видит ни экрана,
+            // ни лога: без сигнала он не знает, когда можно расходиться, и
+            // либо стоит лишнее, либо уходит раньше времени.
+            //
+            // Сигнал ОТЛИЧАЕТСЯ от реплик суфлёра: две восходящие ноты вместо
+            // речи. Речь можно принять за очередной пункт сценария, а конец
+            // прогона должен читаться однозначно.
+            try {
+                if (tone == null)
+                    tone = new android.media.ToneGenerator(
+                            android.media.AudioManager.STREAM_MUSIC, 100);
+                tone.startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 200);
+                Thread.sleep(260);
+                tone.startTone(android.media.ToneGenerator.TONE_PROP_BEEP2, 500);
+                Thread.sleep(560);
+            } catch (Throwable t) { Log.e(TAG, "звук окончания: " + t); }
+            try { if (tone != null) tone.release(); } catch (Throwable ignored) {}
+
             RUNNING_ONE.set(false);
             Log.i(TAG, "ГОТОВО " + base.getPath());
             finish();
