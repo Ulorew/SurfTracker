@@ -407,11 +407,11 @@ public class TrackActivity extends Activity {
             // близок к предсказанию. Без них нельзя отличить «вёл того же»
             // от «в кадре был только один» — а именно это и проверяется на
             // сценарии с двумя людьми.
-            + "кандидатов,до_предсказания,состояние,промахов,"
+            + "кандидатов,до_предсказания,порог,состояние,промахов,"
             // Рамка в координатах ТЕНЗОРА (0..640): именно её надо рисовать
             // поверх записанного кадра, а пересчёт в сенсорные пиксели для
             // этого пришлось бы обращать.
-            + "bx,by,bw,bh\n");
+            + "bx,by,размер_детекции,размер_фильтра\n");
 
         CameraDevice dev = null;
         BluetoothSocket sock = null;
@@ -995,6 +995,7 @@ public class TrackActivity extends Activity {
                 prevTickNs = nowTickNs;
                 if (dtTick <= 0 || dtTick > 2.0) dtTick = 0.2;
                 int chosenDet = -1;
+                double distToPred = Double.NaN, gateNow = 0;
                 if (!flow && nDet > 0) {
                     double scale = Sc / (double) NET;
                     for (int q = 0; q < nDet; q++) {
@@ -1017,6 +1018,13 @@ public class TrackActivity extends Activity {
                         double side0 = trk.windowSide();
                         double pcx = trk.planCx(dtTick, side0), pcy = trk.planCy(dtTick, side0);
                         chosenDet = trk.selectTarget(detsPx, nDet, pcx, pcy, side0);
+                        // Расстояние — до ПРЕДСКАЗАНИЯ и ДО обновления фильтра:
+                        // после update() состояние уже подтянуто к этой самой
+                        // детекции, и число мало по построению.
+                        distToPred = (chosenDet >= 0)
+                                ? Math.hypot(detsPx[chosenDet][0] - pcx, detsPx[chosenDet][1] - pcy)
+                                : Double.NaN;
+                        gateNow = Tracker.SELECT_MAX_DIST_FRAC * side0;
                         if (chosenDet >= 0) trk.update(detsPx[chosenDet][0], detsPx[chosenDet][1], dtTick, detsPx[chosenDet][2]);
                     }
                 }
@@ -1051,7 +1059,13 @@ public class TrackActivity extends Activity {
 
                     hits++;
                     lastGoodW = w; lastGoodNs = System.nanoTime();
-                    Sc = ScNarrow;
+                    // Sc здесь НЕ трогается: окном владеет трекер. Прежняя
+                    // строка Sc = ScNarrow осталась от правки выбега и шла
+                    // ПОСЛЕ присвоения из трекера — каждый такт выбрасывала
+                    // верно посчитанное окно 1440 и возвращала минимальное 640.
+                    // Порог приёма при этом считался от верного окна, а кроп от
+                    // затёртого: цель заполняла кадр модели целиком, соседи в
+                    // него не помещались, и трекеру было не из чего выбирать.
                 } else {
                     misses++;
                     double lost = (lastGoodNs == 0) ? 1e9
@@ -1181,12 +1195,14 @@ public class TrackActivity extends Activity {
                    .append(Sc).append(',').append(winCx).append(',')
                    .append(fmt(wSmooth)).append(',').append(fmt(shrink)).append(',')
                    .append(nDet).append(',')
-                   .append(chosenDet >= 0 ? fmt(Math.hypot(detsPx[chosenDet][0] - trk.cx,
-                                                            detsPx[chosenDet][1] - trk.cy)) : "")
+                   .append(Double.isNaN(distToPred) ? "" : fmt(distToPred))
+                   .append(',').append(fmt(gateNow))
                    .append(',').append(trk.status == Tracker.TRACKING ? "вед" : "потеря")
                    .append(',').append(trk.missCount).append(',')
-                   .append(fmt(bcx * NET)).append(',').append(fmt(bcy * NET)).append(',')
-                   .append(fmt(bw * NET)).append(',').append(fmt(bh * NET)).append('\n');
+                   .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][0]) : "").append(',')
+                   .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][1]) : "").append(',')
+                   .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][2]) : "").append(',')
+                   .append(fmt(trk.filteredSize)).append('\n');
                 frames++;
             }
 
