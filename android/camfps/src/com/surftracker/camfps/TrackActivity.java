@@ -90,8 +90,20 @@ public class TrackActivity extends Activity {
     volatile boolean ttsReady = false;
     android.media.ToneGenerator tone;
 
+    // Экран показывает ТЕКУЩУЮ реплику. Звук может не пройти (движок синтеза
+    // не выбран, громкость снята, наушники), и тогда экран остаётся
+    // единственным каналом. Дублирование здесь не избыточность: канал, у
+    // которого нет запасного, отказывает молча.
+    volatile android.widget.TextView statusView;
+    // Защёлка старта: прогон не начинается, пока наблюдатель не нажал кнопку.
+    // Так согласование момента уходит из переписки в приложение — Hero жмёт,
+    // когда встал, а не когда прочитал сообщение.
+    final CountDownLatch startGate = new CountDownLatch(1);
+
     void say(String phrase) {
         Log.i(TAG, "СУФЛЁР: " + phrase);
+        final android.widget.TextView sv = statusView;
+        if (sv != null) runOnUiThread(() -> sv.setText(phrase));
         boolean spoken = false;
         try {
             if (ttsReady && tts != null) {
@@ -177,10 +189,45 @@ public class TrackActivity extends Activity {
         } catch (Throwable t) {
             Log.e(TAG, "разбудить экран не вышло: " + t);
         }
+        final boolean auto = getIntent().getBooleanExtra("auto", false);
         runOnUiThread(() -> {
+            android.widget.LinearLayout root = new android.widget.LinearLayout(this);
+            root.setOrientation(android.widget.LinearLayout.VERTICAL);
+            root.setPadding(40, 80, 40, 40);
+
             android.widget.TextView tv = new android.widget.TextView(this);
-            tv.setText("слежение");
-            setContentView(tv);
+            tv.setTextSize(26);
+            tv.setText(auto ? "слежение" : "нажмите СТАРТ, когда встанете в кадр");
+            statusView = tv;
+
+            android.widget.Button go = new android.widget.Button(this);
+            go.setTextSize(34);
+            go.setText("СТАРТ");
+            go.setOnClickListener(v -> {
+                go.setEnabled(false);
+                go.setText("...");
+                // Отсчёт вслух: наблюдателю нужно время отойти от телефона и
+                // встать в кадр. Без него первая реплика застаёт его у экрана.
+                new Thread(() -> {
+                    try {
+                        // Восемь секунд, а не три: наблюдателю надо отойти от
+                        // телефона и ВСТАТЬ В КАДР. При трёх он ещё в движении
+                        // у края кадра, ошибка наведения на старте выходит под
+                        // тридцать градусов, и контур начинает с рывка.
+                        say("Отойдите и встаньте в кадр"); Thread.sleep(4000);
+                        say("Пять"); Thread.sleep(1000);
+                        say("Четыре"); Thread.sleep(1000);
+                        say("Три"); Thread.sleep(1000);
+                        say("Два"); Thread.sleep(1000);
+                        say("Один"); Thread.sleep(1000);
+                    } catch (Throwable ignored) {}
+                    startGate.countDown();
+                }).start();
+            });
+            root.addView(go, new android.widget.LinearLayout.LayoutParams(
+                    android.widget.LinearLayout.LayoutParams.MATCH_PARENT, 320));
+            root.addView(tv);
+            setContentView(root);
             getWindow().addFlags(
                     android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
                     | android.view.WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
@@ -255,7 +302,19 @@ public class TrackActivity extends Activity {
         int seconds = getIntent().getIntExtra("seconds", 60);
         int side = getIntent().getIntExtra("side", 1280);
         float K = getIntent().getFloatExtra("k", 1.2f);
-        int sign = getIntent().getIntExtra("sign", 1);
+        // ЗНАК ПО УМОЛЧАНИЮ -1, и это исправление ошибки.
+        //
+        // Прогон 15 августа: ошибка -22.3 град, команда -0.466, вал пошёл в
+        // минус — и ошибка стала -22.4, -23.2, -27.2, -31.7. Она РОСЛА, пока
+        // камера крутилась; через секунду цель ушла из кадра. Это
+        // положительная обратная связь.
+        //
+        // Почему не поймали раньше: знак «подтвердили» счётом 43 против 28
+        // (шестьдесят процентов против сорока — на грани случайности), и при
+        // K=0.6 со старым масштабом расхождение шло медленно, а наблюдатель
+        // своим движением возвращался в кадр сам. Рост коэффициента вдвое и
+        // масштаба на четверть сделал дефект явным.
+        int sign = getIntent().getIntExtra("sign", -1);
         boolean dry = getIntent().getBooleanExtra("dry", false);
 
         // РЕЖИМ «ПОТОК»: камера как НЕЗАВИСИМЫЙ измеритель угла.
@@ -323,6 +382,20 @@ public class TrackActivity extends Activity {
         ht.start();
         Handler h = new Handler(ht.getLooper());
         Interpreter interp = null;
+
+        // Ждём кнопку. Камера и мотор не трогаются до неё вовсе: прежняя
+        // схема стартовала сразу после команды с ноутбука, и наблюдателю
+        // приходилось успевать встать в кадр по сообщению в переписке.
+        if (!getIntent().getBooleanExtra("auto", false)) {
+            try {
+                if (!startGate.await(180, TimeUnit.SECONDS)) {
+                    Log.i(TAG, "старт не нажат за три минуты — выходим");
+                    RUNNING_ONE.set(false);
+                    finish();
+                    return;
+                }
+            } catch (Throwable ignored) {}
+        }
 
         try {
             // Режим БЕЗ КАМЕРЫ: интерпретатор в тесном цикле на нулевом буфере.
@@ -577,6 +650,16 @@ public class TrackActivity extends Activity {
                 {"8","Уйдите из кадра и не показывайтесь"},
                 {"20","Выйдите в другом конце комнаты"},
                 {"32","Стойте. Прогон закончен"}};
+            else if (scen.equals("знак")) script = new String[][]{
+                // РЕШАЮЩИЙ ТЕСТ ЗНАКА. Цель неподвижна и смещена от центра:
+                // верный знак обязан свести ошибку к нулю монотонно, неверный
+                // — увести её в рост. Никакой статистики по долям не нужно,
+                // ответ виден за две секунды.
+                //
+                // Ровно этого теста не было в первый раз, и вместо него знак
+                // «подтверждали» счётом 43 против 28.
+                {"0","Встаньте сбоку от центра и не двигайтесь"},
+                {"18","Готово, можно расслабиться"}};
             else script = new String[0][];
             int scriptAt = 0;
             StringBuilder cues = new StringBuilder();
@@ -805,7 +888,12 @@ public class TrackActivity extends Activity {
                 double aSm = Math.min(1.0, dtLoop / 0.5);
                 wSmooth += (Math.abs(w) - wSmooth) * aSm;
                 double shrink = 1.0;
-                if (dwell > 0 && wSmooth > dwell && Math.abs(w) > dwell
+                // ТОЛЬКО ПРИ ЖИВОЙ ЦЕЛИ. При потере errDeg обнуляется, предел
+                // считает ошибку малой, включается и обрезает выбег: в прогоне
+                // 15 августа команда после потери держалась -0.180 вместо
+                // последней -0.663. Два механизма мешали друг другу, и выбег
+                // делал вчетверо меньше задуманного.
+                if (hit && dwell > 0 && wSmooth > dwell && Math.abs(w) > dwell
                         && Math.abs(errDeg) < 12.0) {
                     double lim = Math.copySign(dwell, w);
                     shrink = Math.abs(lim) / Math.abs(w);
@@ -849,14 +937,21 @@ public class TrackActivity extends Activity {
                 long th0 = System.nanoTime();
                 double err = 0, travel = 0, err0 = homeTheta - lastTheta;
                 String hstat = "ок";
+                int badEnc = 0, badSlip = 0;
                 long prevNs = System.nanoTime();
                 int telAt = telCount;
                 long telSeenNs = System.nanoTime();
                 while ((System.nanoTime() - th0) / 1e9 < 25.0) {
                     if (telCount != telAt) { telAt = telCount; telSeenNs = System.nanoTime(); }
                     if ((System.nanoTime() - telSeenNs) > 300_000_000L) { hstat = "нет_телеметрии"; break; }
-                    if ((lastStatus & ProtoV2.ST_ENC_OK) == 0) { hstat = "энкодер_молчит"; break; }
-                    if ((lastStatus & ProtoV2.ST_SLIP) != 0)   { hstat = "срыв"; break; }
+                    // Ворота срабатывают по ТРЁМ подряд плохим кадрам, а не по
+                    // одному. В прогоне 15 августа возврат прервался по
+                    // «энкодер молчит», хотя энкодер был жив в 469 кадрах из
+                    // 473: одного случайного кадра хватило, чтобы убить возврат.
+                    if ((lastStatus & ProtoV2.ST_ENC_OK) == 0) badEnc++; else badEnc = 0;
+                    if ((lastStatus & ProtoV2.ST_SLIP) != 0)   badSlip++; else badSlip = 0;
+                    if (badEnc >= 3)  { hstat = "энкодер_молчит"; break; }
+                    if (badSlip >= 3) { hstat = "срыв"; break; }
                     err = homeTheta - lastTheta;
                     // Порог 0.05 рад, а не 0.02: собственный шум theta около
                     // 0.08 рад, и 0.02 лежит НИЖЕ него — цикл крутился бы до
