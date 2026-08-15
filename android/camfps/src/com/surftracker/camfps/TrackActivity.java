@@ -76,6 +76,41 @@ import java.util.concurrent.atomic.AtomicReference;
 public class TrackActivity extends Activity {
     static final String TAG = "track";
 
+    // ГОЛОСОВОЙ СУФЛЁР.
+    //
+    // Прогоны с участием человека нельзя строить на инструкции «в такую-то
+    // секунду сделайте то-то»: держать отсчёт в голове невозможно, и Hero
+    // прямо сказал, что не сможет. Экран телефона смотрит ОТ наблюдателя
+    // (камера-то направлена на него), поэтому единственный доступный канал —
+    // звук.
+    //
+    // Тон-сигналы отвергнуты: они требуют помнить код, то есть переносят ту же
+    // нагрузку в другое место. Речь не требует ничего.
+    android.speech.tts.TextToSpeech tts;
+    volatile boolean ttsReady = false;
+    android.media.ToneGenerator tone;
+
+    void say(String phrase) {
+        Log.i(TAG, "СУФЛЁР: " + phrase);
+        boolean spoken = false;
+        try {
+            if (ttsReady && tts != null) {
+                tts.speak(phrase, android.speech.tts.TextToSpeech.QUEUE_FLUSH, null, "p");
+                spoken = true;
+            }
+        } catch (Throwable t) { Log.e(TAG, "речь: " + t); }
+        // Запасной канал: если речь недоступна, хотя бы отбить внимание.
+        // Молчаливый суфлёр хуже отсутствующего — наблюдатель будет ждать.
+        if (!spoken) {
+            try {
+                if (tone == null)
+                    tone = new android.media.ToneGenerator(
+                            android.media.AudioManager.STREAM_MUSIC, 100);
+                tone.startTone(android.media.ToneGenerator.TONE_PROP_BEEP2, 400);
+            } catch (Throwable t) { Log.e(TAG, "сигнал: " + t); }
+        }
+    }
+
     // Последняя вычисленная уставка. Пишет поток зрения, читает поток
     // отправки. volatile достаточно: одно значение, атомарная запись float,
     // и терять промежуточные значения не страшно — свежее всегда лучше.
@@ -91,6 +126,22 @@ public class TrackActivity extends Activity {
     // закрывается, сторож роняет вал за 300 мс), опасен ровно тот путь, где
     // никто ничего не бросает.
     volatile long wCmdNs = 0;
+
+    /**
+     * Ровно ОДИН прогон на процесс одновременно.
+     *
+     * Найдено ухом: каждая реплика суфлёра прозвучала дважды, и в логе видно
+     * два разных потока. Активность создаётся повторно (пробуждение экрана,
+     * снятие блокировки, смена конфигурации), и каждый экземпляр запускает
+     * свой run(): свою камеру, свой сокет, свой поток отправки уставок.
+     *
+     * На сухом прогоне это эхо. В боевом — ДВА независимых отправителя,
+     * гоняющих мотор наперегонки, каждый со своим представлением о цели.
+     * Ни один тест этого не показал бы: оба прогона пишут в один файл, и
+     * последний закрывшийся затирает первого.
+     */
+    static final java.util.concurrent.atomic.AtomicBoolean RUNNING_ONE =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
     volatile boolean running = true;
     volatile int lastStatus = 0;
     volatile float lastTheta = 0, lastWRamp = 0;
@@ -135,6 +186,18 @@ public class TrackActivity extends Activity {
                     | android.view.WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
                     | android.view.WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED);
         });
+        try {
+            tts = new android.speech.tts.TextToSpeech(this, st -> {
+                if (st == android.speech.tts.TextToSpeech.SUCCESS) {
+                    try {
+                        tts.setLanguage(new java.util.Locale("ru", "RU"));
+                        tts.setSpeechRate(0.95f);
+                        ttsReady = true;
+                    } catch (Throwable t) { Log.e(TAG, "язык: " + t); }
+                }
+            });
+        } catch (Throwable t) { Log.e(TAG, "tts: " + t); }
+
         String[] need = {"android.permission.CAMERA",
                           "android.permission.BLUETOOTH_CONNECT",
                           "android.permission.BLUETOOTH_SCAN"};
@@ -169,6 +232,11 @@ public class TrackActivity extends Activity {
     }
 
     void run() {
+        if (!RUNNING_ONE.compareAndSet(false, true)) {
+            Log.i(TAG, "прогон уже идёт — этот экземпляр завершается");
+            finish();
+            return;
+        }
         // Частичный wake lock: без него телефон уходит в дозу и поток
         // замирает молча, не оставив в логе даже ошибки.
         android.os.PowerManager.WakeLock wl = null;
@@ -231,6 +299,11 @@ public class TrackActivity extends Activity {
         // и следующий сеанс начинается с наведения в пустоту. На стенде это
         // уже стоило одного потерянного прогона.
         boolean home = getIntent().getBooleanExtra("home", true);
+
+        // СЦЕНАРИЙ СУФЛЁРА. Один прогон — один механизм: так и выполнимо для
+        // наблюдателя, и при отказе видно, ЧТО именно отказало.
+        String scen = getIntent().getStringExtra("scen");
+        if (scen == null) scen = "";
 
         boolean flow = getIntent().getBooleanExtra("flow", false);
         float spinW = getIntent().getFloatExtra("spin", 0.15f);
@@ -483,6 +556,31 @@ public class TrackActivity extends Activity {
             long lastGoodNs = 0;           // когда цель видели последний раз
             double wSmooth = 0;            // сглаженная команда для предела задержки
             float homeTheta = Float.NaN;   // угол вала на старте сеанса
+            // Реплики: {секунда, фраза}. Проговариваются один раз, когда
+            // прогон доходит до указанной секунды.
+            String[][] script;
+            if (scen.equals("проводка")) script = new String[][]{
+                {"0","Стойте на месте"},
+                {"8","Идите поперёк кадра, ровно и не спеша"},
+                {"20","Идите обратно"},
+                {"32","Стойте. Прогон закончен"}};
+            else if (scen.equals("выбег")) script = new String[][]{
+                {"0","Стойте на месте"},
+                {"6","Идите поперёк кадра"},
+                {"14","Спрячьтесь на две секунды и выйдите там же"},
+                {"20","Идите дальше"},
+                {"26","Стойте на месте"},
+                {"30","Спрячьтесь на две секунды и выйдите там же"},
+                {"36","Стойте. Прогон закончен"}};
+            else if (scen.equals("окно")) script = new String[][]{
+                {"0","Стойте в центре"},
+                {"8","Уйдите из кадра и не показывайтесь"},
+                {"20","Выйдите в другом конце комнаты"},
+                {"32","Стойте. Прогон закончен"}};
+            else script = new String[0][];
+            int scriptAt = 0;
+            StringBuilder cues = new StringBuilder();
+
             long t0 = System.nanoTime();
             long lastLoop = t0;
 
@@ -562,6 +660,20 @@ public class TrackActivity extends Activity {
 
 
             while ((System.nanoTime() - t0) / 1e9 < seconds) {
+                double tsec = (System.nanoTime() - t0) / 1e9;
+                while (scriptAt < script.length
+                        && tsec >= Double.parseDouble(script[scriptAt][0])) {
+                    say(script[scriptAt][1]);
+                    // Копим в отдельный буфер и дописываем ОДИН раз в конце:
+                    // прежняя редакция открывала массив в JSON и закрывала его
+                    // только на последней реплике, поэтому прогон, кончившийся
+                    // раньше сценария, оставлял массив незакрытым и весь лог
+                    // переставал разбираться.
+                    if (cues.length() > 0) cues.append(",");
+                    cues.append("{\"t\":").append(fmt(tsec)).append(",\"текст\":\"")
+                        .append(script[scriptAt][1]).append("\"}");
+                    scriptAt++;
+                }
                 Image im = latest.getAndSet(null);
                 if (im == null) { Thread.sleep(3); continue; }
                 long tf = System.nanoTime();
@@ -795,6 +907,7 @@ public class TrackActivity extends Activity {
                 j.append(",\"rtt_ms\":{\"p50\":").append(fmt(lat.get(lat.size() / 2)))
                  .append(",\"p95\":").append(fmt(lat.get((int) (0.95 * (lat.size() - 1)))))
                  .append("}");
+            if (cues.length() > 0) j.append(",\"реплики\":[").append(cues).append("]");
             j.append(",\"ok\":true");
         } catch (Throwable t) {
             Log.e(TAG, "слежение: " + t, t);
@@ -807,11 +920,14 @@ public class TrackActivity extends Activity {
             try { if (dev != null) dev.close(); } catch (Throwable ignored) {}
             try { if (reader != null) reader.close(); } catch (Throwable ignored) {}
             ht.quitSafely();
+            try { if (tts != null) { tts.stop(); tts.shutdown(); } } catch (Throwable ignored) {}
+            try { if (tone != null) tone.release(); } catch (Throwable ignored) {}
             try { if (wl != null && wl.isHeld()) wl.release(); } catch (Throwable ignored) {}
             try {
                 write(new File(base.getPath() + ".json"), j.append("}").toString());
                 write(new File(base.getPath() + ".csv"), csv.toString());
             } catch (Throwable ignored) {}
+            RUNNING_ONE.set(false);
             Log.i(TAG, "ГОТОВО " + base.getPath());
             finish();
         }
