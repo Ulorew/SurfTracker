@@ -364,12 +364,23 @@ public class TrackActivity extends Activity {
         String scen = getIntent().getStringExtra("scen");
         if (scen == null) scen = "";
 
+        // ЗАПИСЬ ПРОГОНА. Пишутся кадры В ТОМ ВИДЕ, В КАКОМ ИХ ВИДЕЛА МОДЕЛЬ,
+        // то есть уже кроп и уменьшение. Полный кадр показал бы больше
+        // контекста, но не ответил бы на главный вопрос «почему не узнала» —
+        // модель полного кадра не видит вовсе.
+        //
+        // JPEG, а не PNG: при 5 кадрах в секунду сжатие PNG отняло бы у цикла
+        // больше, чем стоит разница в качестве для разбора.
+        boolean rec = getIntent().getBooleanExtra("rec", false);
+
         boolean flow = getIntent().getBooleanExtra("flow", false);
         float spinW = getIntent().getFloatExtra("spin", 0.15f);
 
         File dir = new File(getExternalFilesDir(null), "track");
         dir.mkdirs();
         File base = new File(dir, tag);
+        File recDir = new File(dir, tag + "_кадры");
+        if (rec) recDir.mkdirs();
         StringBuilder j = new StringBuilder("{");
         StringBuilder csv = new StringBuilder(
             "i,t_ms,есть_цель,conf,cx_сенсор,ошибка_град,ω_уставка,"
@@ -379,7 +390,11 @@ public class TrackActivity extends Activity {
             // класс отказа, которым проект уже болел. Значения писались в
             // строки и раньше, но имён в заголовке не было — разборщик молча
             // выбрасывал их, то есть данные существовали и были нечитаемы.
-            + "инференс_мс,такт_мс,Sc,winCx,ω_сглаж,ужатие\n");
+            + "инференс_мс,такт_мс,Sc,winCx,ω_сглаж,ужатие,"
+            // Рамка в координатах ТЕНЗОРА (0..640): именно её надо рисовать
+            // поверх записанного кадра, а пересчёт в сенсорные пиксели для
+            // этого пришлось бы обращать.
+            + "bx,by,bw,bh\n");
 
         CameraDevice dev = null;
         BluetoothSocket sock = null;
@@ -977,6 +992,13 @@ public class TrackActivity extends Activity {
                     bin.rewind();
                     ringAt = (ringAt + 1) % RING_N;
                 }
+                if (rec && !flow) {
+                    bin.rewind();
+                    byte[] cur = new byte[NET * NET * 3 * 4];
+                    bin.get(cur); bin.rewind();
+                    dumpJpeg(cur, new File(recDir, String.format(
+                            java.util.Locale.US, "%05d.jpg", frames)));
+                }
                 if (prevHit && !hit) {          // МОМЕНТ ПОТЕРИ
                     lossIdx++;
                     for (int q = 0; q < RING_N; q++) {
@@ -1014,7 +1036,9 @@ public class TrackActivity extends Activity {
                    .append(bit(st, ProtoV2.ST_SLIP)).append(',')
                    .append(fmt(infMs)).append(',').append(fmt(loopMs)).append(',')
                    .append(Sc).append(',').append(winCx).append(',')
-                   .append(fmt(wSmooth)).append(',').append(fmt(shrink)).append('\n');
+                   .append(fmt(wSmooth)).append(',').append(fmt(shrink)).append(',')
+                   .append(fmt(bcx * NET)).append(',').append(fmt(bcy * NET)).append(',')
+                   .append(fmt(bw * NET)).append(',').append(fmt(bh * NET)).append('\n');
                 frames++;
             }
 
@@ -1161,6 +1185,29 @@ public class TrackActivity extends Activity {
         double sub = (d != 0) ? (y2 - y0) / d : 0;
         if (sub < -1 || sub > 1) sub = 0;
         return bestLag + sub;
+    }
+
+    /** Тензор NCHW float32 [0..1] -> JPEG. Для записи прогона. */
+    static void dumpJpeg(byte[] raw, File f) {
+        if (raw == null || f == null) return;
+        try {
+            java.nio.FloatBuffer fb = java.nio.ByteBuffer.wrap(raw)
+                    .order(ByteOrder.nativeOrder()).asFloatBuffer();
+            int[] px = new int[NET * NET];
+            int plane = NET * NET;
+            for (int i = 0; i < plane; i++) {
+                int r = (int) (Math.max(0, Math.min(1, fb.get(i))) * 255);
+                int g = (int) (Math.max(0, Math.min(1, fb.get(plane + i))) * 255);
+                int b2 = (int) (Math.max(0, Math.min(1, fb.get(2 * plane + i))) * 255);
+                px[i] = 0xFF000000 | (r << 16) | (g << 8) | b2;
+            }
+            android.graphics.Bitmap bm = android.graphics.Bitmap.createBitmap(
+                    px, NET, NET, android.graphics.Bitmap.Config.ARGB_8888);
+            try (FileOutputStream os2 = new FileOutputStream(f)) {
+                bm.compress(android.graphics.Bitmap.CompressFormat.JPEG, 60, os2);
+            }
+            bm.recycle();
+        } catch (Throwable t) { Log.e(TAG, "запись кадра: " + t); }
     }
 
     /** Тензор NCHW float32 [0..1] -> PNG. Ошибки глушатся: диагностика не
