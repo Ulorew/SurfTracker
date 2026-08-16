@@ -100,13 +100,79 @@ public class TrackActivity extends Activity {
     // единственным каналом. Дублирование здесь не избыточность: канал, у
     // которого нет запасного, отказывает молча.
     volatile android.widget.TextView statusView;
+
+    /**
+     * ЖИВОЕ СОСТОЯНИЕ ПРОГОНА — то, что видно от места съёмки.
+     *
+     * Заведено по двум случаям, которые уже стоили прогонов. Первый: «не вижу,
+     * когда что-то залилось, приходится гадать» — с трёх метров экран не
+     * читался вовсе, и наблюдатель не знал, начался ли прогон. Второй:
+     * «кстати, горячо и включено» — прогон давно кончился, а телефон грелся,
+     * и понять это можно было только на ощупь.
+     *
+     * Поля volatile и пишутся из петли слежения БЕЗ блокировок: показания
+     * обновляются по таймеру раз в полсекунды, и рассинхронизация на один
+     * такт здесь безразлична, а замок в петле — нет.
+     */
+    volatile android.widget.TextView liveView;
+    volatile boolean uiTracking, uiLink, uiRec, uiDry, uiDone;
+    volatile int uiTicks, uiHits, uiLoss;
+    volatile long uiEndsAtMs;
+    volatile String uiPhrase = "";
+    /** Причина отказа для экрана. null — отказа не было. */
+    volatile String uiError;
+    volatile android.widget.Button stopButton, startButton;
+    /** Просьба остановиться, поданная кнопкой. Петля проверяет её сама. */
+    volatile boolean stopRequested;
     // Защёлка старта: прогон не начинается, пока наблюдатель не нажал кнопку.
     // Так согласование момента уходит из переписки в приложение — Hero жмёт,
     // когда встал, а не когда прочитал сообщение.
     final CountDownLatch startGate = new CountDownLatch(1);
 
+    /**
+     * Обновление живого состояния раз в полсекунды.
+     *
+     * По таймеру, а не из петли слежения. Петля идёт 5-12 раз в секунду, и
+     * рисовать по каждому такту значило бы отнимать у неё время на разметку
+     * текста ради частоты, которую глаз всё равно не читает.
+     */
+    void startLiveTicker() {
+        final android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+        h.post(new Runnable() {
+            @Override public void run() {
+                android.widget.TextView v = liveView;
+                if (v != null) {
+                    v.setText(liveText());
+                    v.setBackgroundColor(LiveStatus.color(uiDone, uiTicks, uiTracking, uiError));
+                    // Кнопка после конца прогона закрывает экран, а не
+                    // останавливает то, что уже стоит.
+                    // Кнопка старта после начала прогона бесполезна и только
+                    // занимает половину экрана, на котором надо читать состояние.
+                    android.widget.Button gb = startButton;
+                    if (gb != null && (uiTicks > 0 || uiDone || uiError != null)
+                            && gb.getVisibility() == android.view.View.VISIBLE)
+                        gb.setVisibility(android.view.View.GONE);
+                    android.widget.Button sb = stopButton;
+                    if (sb != null && (uiDone || uiError != null) && sb.isEnabled()) {
+                        sb.setText("ЗАКРЫТЬ");
+                        sb.setOnClickListener(x -> finish());
+                    }
+                }
+                if (!isFinishing()) h.postDelayed(this, 500);
+            }
+        });
+    }
+
+    /** Строки состояния берутся из LiveStatus — там их достаёт стенд
+     *  tools/windowing/live_status_check. */
+    String liveText() {
+        return LiveStatus.text(uiDone, uiTicks, uiHits, uiLoss, uiTracking,
+                uiDry, uiLink, uiRec, uiEndsAtMs - System.currentTimeMillis(), uiError);
+    }
+
     void say(String phrase) {
         Log.i(TAG, "СУФЛЁР: " + phrase);
+        uiPhrase = phrase;
         final android.widget.TextView sv = statusView;
         if (sv != null) runOnUiThread(() -> sv.setText(phrase));
         boolean spoken = false;
@@ -232,10 +298,38 @@ public class TrackActivity extends Activity {
                     startGate.countDown();
                 }).start();
             });
+            // Крупное состояние. Размер выбран не на глаз: наблюдатель стоит в
+            // трёх метрах и должен различать «ведёт» и «ищет» боковым зрением,
+            // не подходя к телефону — подходить нельзя, он в кадре.
+            android.widget.TextView live = new android.widget.TextView(this);
+            live.setTextSize(44);
+            live.setPadding(0, 30, 0, 30);
+            live.setText("");
+            liveView = live;
+
+            android.widget.Button stop = new android.widget.Button(this);
+            stop.setTextSize(24);
+            stop.setText("ОСТАНОВИТЬ");
+            stopButton = stop;
+            startButton = go;
+            stop.setOnClickListener(v -> {
+                // Просьба, а не убийство процесса: петле надо доиграть
+                // остановку вала, дописать лог и снять напряжение. Прежде
+                // прогон обрывали через force-stop, и вал оставался под
+                // командой до срабатывания сторожа.
+                stopRequested = true;
+                stop.setEnabled(false);
+                stop.setText("останавливаю...");
+            });
+
             root.addView(go, new android.widget.LinearLayout.LayoutParams(
                     android.widget.LinearLayout.LayoutParams.MATCH_PARENT, 320));
+            root.addView(live);
             root.addView(tv);
+            root.addView(stop, new android.widget.LinearLayout.LayoutParams(
+                    android.widget.LinearLayout.LayoutParams.MATCH_PARENT, 180));
             setContentView(root);
+            startLiveTicker();
             getWindow().addFlags(
                     android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
                     | android.view.WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
@@ -982,7 +1076,13 @@ public class TrackActivity extends Activity {
             sender.start();
 
 
-            while ((System.nanoTime() - t0) / 1e9 < seconds) {
+            // Просьба об остановке проверяется В УСЛОВИИ ЦИКЛА, а не обрывом:
+            // дальше по коду идут остановка вала, возврат в исходное и запись
+            // файлов, и все они обязаны отработать. Кнопка «Остановить» должна
+            // кончать прогон так же, как его кончает время.
+            uiEndsAtMs = System.currentTimeMillis() + (long) seconds * 1000L;
+            uiDry = dry; uiRec = video;
+            while (!stopRequested && (System.nanoTime() - t0) / 1e9 < seconds) {
                 double tsec = (System.nanoTime() - t0) / 1e9;
                 while (scriptAt < script.length
                         && tsec >= cueBase + Double.parseDouble(script[scriptAt][0])) {
@@ -1284,9 +1384,15 @@ public class TrackActivity extends Activity {
                    .append(fmt(trk.filteredSize)).append('\n');
                 frames++;
 
+                // Показания для экрана. Отдельные поля, а не чтение frames/hits
+                // из другого потока: те живут в стеке петли и снаружи не видны.
+                uiTicks = frames; uiHits = hits;
+                uiTracking = !flow && trk.status == Tracker.TRACKING;
+                uiLink = gotTel;
+
                 // Итог копится здесь же, по тем же величинам, что ушли в лог.
                 if (!flow) {
-                    if (prevTrkStatus == Tracker.TRACKING && trk.status == Tracker.LOST) nLoss++;
+                    if (prevTrkStatus == Tracker.TRACKING && trk.status == Tracker.LOST) { nLoss++; uiLoss = nLoss; }
                     if (prevTrkStatus == Tracker.LOST && trk.status == Tracker.TRACKING
                             && frames > 1) nReacq++;
                     prevTrkStatus = trk.status;
@@ -1406,6 +1512,7 @@ public class TrackActivity extends Activity {
             j.append(",\"ok\":true");
         } catch (Throwable t) {
             Log.e(TAG, "слежение: " + t, t);
+            uiError = String.valueOf(t);
             j.append(",\"ok\":false,\"ошибка\":\"")
              .append(String.valueOf(t).replace('"', '\'')).append("\"");
         } finally {
@@ -1427,6 +1534,15 @@ public class TrackActivity extends Activity {
             // ровно тот отказ, который не заметен ни в логе, ни в коде при
             // беглом чтении.
             try { if (wl != null && wl.isHeld()) wl.release(); } catch (Throwable ignored) {}
+            // «ГОТОВО» на экране. Прогон кончался звуковым сигналом, но если
+            // наблюдатель его не услышал (ветер, шум воды), телефон выглядел
+            // ровно так же, как работающий, — отсюда «кстати, горячо и
+            // включено» уже после конца.
+            uiDone = true;
+            // Последняя реплика суфлёра («Один» из отсчёта) висела на экране
+            // после конца прогона и читалась как состояние.
+            final android.widget.TextView sv2 = statusView;
+            if (sv2 != null) runOnUiThread(() -> sv2.setText(""));
             try {
                 write(new File(base.getPath() + ".json"), j.append("}").toString());
                 write(new File(base.getPath() + ".csv"), csv.toString());
@@ -1451,7 +1567,18 @@ public class TrackActivity extends Activity {
 
             RUNNING_ONE.set(false);
             Log.i(TAG, "ГОТОВО " + base.getPath());
-            finish();
+            // ЭКРАН НЕ ЗАКРЫВАЕТСЯ САМ, если прогон запущен человеком.
+            //
+            // Прежде активность здесь заканчивалась, и телефон возвращался в
+            // лаунчер — то есть законченный прогон выглядел ровно как
+            // незапущенный. Наблюдатель, вернувшись, не мог отличить «всё
+            // прошло» от «не стартовало», и уже был случай, когда телефон
+            // остался включённым и горячим, а понять это удалось на ощупь.
+            //
+            // В режиме auto (запуск скриптом с ноутбука) закрываемся как
+            // раньше: там результат забирают файлами, а висящая активность
+            // мешает следующему запуску.
+            if (getIntent().getBooleanExtra("auto", false)) finish();
         }
     }
 
