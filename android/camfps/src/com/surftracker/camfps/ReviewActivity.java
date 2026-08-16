@@ -257,11 +257,18 @@ public class ReviewActivity extends Activity {
         // подпись, а разбор начинается именно с «где потеряли».
         if (!Double.isNaN(t.cx) && !Double.isNaN(t.size)) {
             double bx = model.toViewX(t.cx, vw), by = model.toViewY(t.cy, vh);
-            double bh = model.toViewX(t.size / 2.0, vw);
+            // Полувысота — из СВОЕЙ колонки, если она есть. По одному «размеру»
+            // (наибольшей стороне) рисовался КВАДРАТ со стороной в рост
+            // человека: 980 пикселей вместо 350, половина кадра с обрезанным
+            // верхом. Рамкой цели это не выглядело вовсе.
+            double halfX = Double.isNaN(t.bw) ? model.toViewX(t.size / 2.0, vw)
+                                              : model.toViewX(t.bw / 2.0, vw);
+            double halfH = Double.isNaN(t.bh) ? model.toViewX(t.size / 2.0, vw)
+                                              : model.toViewX(t.bh / 2.0, vw);
             p.setColor(t.tracking ? Color.GREEN : Color.RED);
             p.setStrokeWidth((float) Math.max(3, vw / 250));
-            c.drawRect((float) (bx - bh), (float) (by - bh),
-                       (float) (bx + bh), (float) (by + bh), p);
+            c.drawRect((float) (bx - halfX), (float) (by - halfH),
+                       (float) (bx + halfX), (float) (by + halfH), p);
         }
 
         // Центр кадра — по нему считается ошибка наведения, и без метки

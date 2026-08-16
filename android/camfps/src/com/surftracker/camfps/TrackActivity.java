@@ -588,7 +588,7 @@ public class TrackActivity extends Activity {
             // неверно: пишется detsPx, то есть уже пересчитанное в сенсор.
             // Разбор, поверивший комментарию, собрал бы все рамки в левом
             // верхнем углу кадра — правдоподобная картинка, неверная целиком.
-            + "bx,by,размер_детекции,размер_фильтра\n");
+            + "bx,by,размер_детекции,ширина_детекции,высота_детекции,размер_фильтра\n");
 
         CameraDevice dev = null;
         BluetoothSocket sock = null;
@@ -1001,8 +1001,8 @@ public class TrackActivity extends Activity {
             // сценарии: tools/windowing/port_check/check.py.
             Tracker trk = new Tracker(W, H);
             final int MAX_DET = 16;
-            float[][] dets = new float[MAX_DET][3];
-            double[][] detsPx = new double[MAX_DET][3];
+            float[][] dets = new float[MAX_DET][5];
+            double[][] detsPx = new double[MAX_DET][5];
             long prevTickNs = 0;
 
             int scanPos = 0;               // фаза пилы обзора при долгой потере
@@ -1272,6 +1272,9 @@ public class TrackActivity extends Activity {
                         detsPx[q][0] = cropX + dets[q][0] * NET * scale;
                         detsPx[q][1] = cropY + dets[q][1] * NET * scale;
                         detsPx[q][2] = dets[q][2] * NET * scale;
+                        // Ширина и высота — только для разбора записи.
+                        detsPx[q][3] = dets[q][3] * NET * scale;
+                        detsPx[q][4] = dets[q][4] * NET * scale;
                     }
                     // Затравка открывается заново после ДОЛГОЙ потери.
                     //
@@ -1491,6 +1494,12 @@ public class TrackActivity extends Activity {
                    .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][0]) : "").append(',')
                    .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][1]) : "").append(',')
                    .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][2]) : "").append(',')
+                   // Обе стороны: по одному «размеру» (это МАКСИМУМ сторон)
+                   // разбор рисовал КВАДРАТ со стороной в рост человека —
+                   // половина кадра вместо рамки вокруг него, и вторая сторона
+                   // из максимума не восстанавливается.
+                   .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][3]) : "").append(',')
+                   .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][4]) : "").append(',')
                    .append(fmt(trk.filteredSize)).append('\n');
                 frames++;
 

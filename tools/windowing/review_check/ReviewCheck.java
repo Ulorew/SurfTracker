@@ -35,7 +35,7 @@ public class ReviewCheck {
       + "θ_enc,ω_ramp,статус,watchdog,потолок,рампа,энкодер,кламп,срыв,"
       + "инференс_мс,такт_мс,Sc,winCx,winCy,ω_сглаж,ужатие,"
       + "кандидатов,до_предсказания,порог,состояние,промахов,"
-      + "bx,by,размер_детекции,размер_фильтра";
+      + "bx,by,размер_детекции,ширина_детекции,высота_детекции,размер_фильтра";
 
     static String row(int i, int t, int hit, int sc, int wcx, int wcy,
                       String st, int miss, String bx, String by, String sz) {
@@ -43,7 +43,9 @@ public class ReviewCheck {
              + "1.0,0.1,3,0,0,0,1,0,0,"
              + "83.0,120.0," + sc + "," + wcx + "," + wcy + ",0.1,1.0,"
              + "2,140.0,432.0," + st + "," + miss + ","
-             + bx + "," + by + "," + sz + ",300.0";
+             + bx + "," + by + "," + sz + ","
+             // ширина и высота: человек стоит — уже, чем выше
+             + (sz.isEmpty() ? "" : "340.0") + "," + (sz.isEmpty() ? "" : sz) + ",300.0";
     }
 
     static final String JSON =
@@ -135,6 +137,22 @@ public class ReviewCheck {
         eq("потеря распознана", t3.tracking, false);
         eq("окно раздулось", t3.win, 1656);
         eq("пустая рамка -> NaN", Double.isNaN(t3.cx), true);
+
+        System.out.println("== стороны рамки, а не квадрат ==");
+        // По одному «размеру» (это МАКСИМУМ сторон) разбор рисовал квадрат со
+        // стороной в рост человека: 980 px вместо 350 — половина кадра. Вторая
+        // сторона из максимума не восстанавливается, поэтому пишутся обе.
+        near("ширина", m.ticks.get(0).bw, 340);
+        near("высота", m.ticks.get(0).bh, 300);
+        // Старый лог без этих колонок обязан разбираться и рисовать квадрат
+        String headOld = HEAD.replace(",ширина_детекции,высота_детекции", "");
+        StringBuilder csvOld = new StringBuilder(headOld).append('\n');
+        csvOld.append(row(0, 0, 1, 1440, 1900, 1000, "вед", 0, "1910.0", "1005.0", "300.0")
+                .replace(",340.0,300.0,", ",")).append('\n');
+        ReviewModel mo = ReviewModel.parse(csvOld.toString(), JSON);
+        eq("старый лог разбирается", mo.usable(), true);
+        eq("ширина неизвестна", Double.isNaN(mo.ticks.get(0).bw), true);
+        near("размер на месте", mo.ticks.get(0).size, 300);
 
         System.out.println("== состав колонок изменился ==");
         // Колонку вставили В СЕРЕДИНУ. Разбор по номерам сдвинул бы всё

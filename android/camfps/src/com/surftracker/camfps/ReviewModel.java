@@ -24,6 +24,7 @@ public final class ReviewModel {
         public long tMs;
         public boolean hit;
         public double cx, cy, size;     // рамка цели, пиксели СЕНСОРА
+        public double bw = Double.NaN, bh = Double.NaN;  // стороны рамки; NaN — их нет в логе
         public int winCx, winCy, win;   // окно: центр и сторона, пиксели сенсора
         public boolean tracking;        // состояние трекера на этом такте
         public int misses;
@@ -78,6 +79,7 @@ public final class ReviewModel {
 
         int cI = col(head, "i"), cT = col(head, "t_ms"), cHit = col(head, "есть_цель");
         int cBx = col(head, "bx"), cBy = col(head, "by"), cSz = col(head, "размер_детекции");
+        int cBw = col(head, "ширина_детекции"), cBh = col(head, "высота_детекции");
         int cSc = col(head, "Sc"), cWin = col(head, "winCx"), cWinY = col(head, "winCy");
         int cSt = col(head, "состояние"), cMiss = col(head, "промахов");
         int cCand = col(head, "кандидатов");
@@ -97,6 +99,10 @@ public final class ReviewModel {
             t.tMs = (long) num(f, cT);
             t.hit = inum(f, cHit, 0) == 1;
             t.cx = num(f, cBx); t.cy = num(f, cBy); t.size = num(f, cSz);
+            // Стороны появились позже: в логах без них рамка рисуется
+            // квадратом со стороной в наибольший размер — как и рисовалась.
+            t.bw = (cBw >= 0) ? num(f, cBw) : Double.NaN;
+            t.bh = (cBh >= 0) ? num(f, cBh) : Double.NaN;
             t.win = inum(f, cSc, 0);
             t.winCx = inum(f, cWin, 0);
             // Логи, снятые до появления winCy, разбираются дальше: окно у них
