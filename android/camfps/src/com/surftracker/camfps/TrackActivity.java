@@ -247,6 +247,24 @@ public class TrackActivity extends Activity {
     static final long STALE_NS = 400_000_000L;
     /** nanoTime последней ПРИШЕДШЕЙ телеметрии; 0 — не приходила ни разу. */
     volatile long telNs = 0;
+    /** Синхронизация ошибки с углом вала. Выключается ради сравнения прогонов. */
+    volatile boolean syncEnc = true;
+
+    /**
+     * Угол вала на заданный момент, рад.
+     *
+     * Телеметрия приходит 10 Гц; между отсчётами угол берётся экстраполяцией
+     * по последней РАМПОВОЙ скорости (её присылает прошивка — это то, что вал
+     * реально отрабатывает, а не то, что мы просили). Экстраполяция ограничена
+     * 300 мс: дальше она домысливает больше, чем знает.
+     */
+    double thetaAt(long ns) {
+        long age = ns - telNs;
+        if (telNs == 0) return lastTheta;
+        if (age < 0) age = 0;
+        if (age > 300_000_000L) age = 300_000_000L;
+        return lastTheta + lastWRamp * (age / 1e9);
+    }
     static final UUID SPP = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
     static final int NET = 640;
     static final float CONF_MIN = 0.35f;
@@ -490,6 +508,7 @@ public class TrackActivity extends Activity {
         // дальше, чем дольше её нет, и это ровно тот отказ, который делает
         // возврат невозможным.
         float coast = cfg.f("coast");
+        boolean syncOn = cfg.b("sync");
 
         // РАСШИРЕНИЕ ОКНА ПРИ ДОЛГОЙ ПОТЕРЕ. Окно слежения сужает поле зрения
         // ради разрешения; когда цели нет давно, разрешение уже не нужно, нужен
@@ -581,6 +600,7 @@ public class TrackActivity extends Activity {
             // от «в кадре был только один» — а именно это и проверяется на
             // сценарии с двумя людьми.
             + "кандидатов,до_предсказания,порог,состояние,промахов,"
+            + "ошибка_свежая,цель_в_мире,вал_при_захвате,"
             // Рамка выбранной детекции в ПИКСЕЛЯХ СЕНСОРА — те же координаты,
             // в которых живёт трекер и считается winCx.
             //
@@ -1186,6 +1206,8 @@ public class TrackActivity extends Activity {
             // всю настройку сессии камеры, а это секунда и больше.
             if (recStartNs != 0)
                 j.append(",\"видео_смещение_мс\":").append((t0 - recStartNs) / 1000000L);
+            syncEnc = syncOn;
+            j.append(",\"синхронизация\":").append(syncOn);
             uiEndsAtMs = System.currentTimeMillis() + (long) seconds * 1000L;
             uiDry = dry; uiRec = video;
             while (!stopRequested && (System.nanoTime() - t0) / 1e9 < seconds) {
@@ -1208,6 +1230,21 @@ public class TrackActivity extends Activity {
                 Image im = latest.getAndSet(null);
                 if (im == null) { Thread.sleep(3); continue; }
                 long tf = System.nanoTime();
+                // УГОЛ ВАЛА НА МОМЕНТ ЗАХВАТА КАДРА.
+                //
+                // Прежде tf вычислялся и не использовался нигде, а угол брался
+                // как «последняя пришедшая телеметрия» — то есть ошибка с
+                // кадра, снятого четверть секунды назад, складывалась с углом
+                // «сейчас», и связать их было нечем. Замер по логу прогона:
+                // отношение Δошибки к Δугла вала вышло +0.62 вместо ±1.00 —
+                // петля видела собственный поворот на две трети и доворачивала
+                // снова. Это и давало затухающее качание вокруг неподвижной
+                // цели, которое нельзя вылечить снижением K.
+                //
+                // Экстраполяция по w_ramp, а не просто последнее значение:
+                // телеметрия идёт 10 Гц, между её отсчётами вал успевает
+                // повернуться на несколько градусов при 0.3 рад/с.
+                double thetaCap = thetaAt(tf);
 
                 int cropX = clamp(winCx - Sc / 2, 0, W - Sc);
                 int cropY = clamp(winCy - Sc / 2, 0, H - Sc);
@@ -1319,6 +1356,10 @@ public class TrackActivity extends Activity {
                 if (!flow && !stepped && chosenDet < 0 && trk.initialized) trk.advance(dtTick);
                 boolean hit = flow ? true : (chosenDet >= 0);
                 double errDeg = 0; double w = 0;
+                // Свежая ошибка (после вычитания собственного поворота) и угол
+                // цели в мире — в лог, чтобы синхронизацию можно было ПРОВЕРИТЬ
+                // по записи, а не поверить на слово.
+                double errFreshDeg = Double.NaN, tgtWorldRad = Double.NaN;
                 double cxSensor = winCx;
                 if (flow) {
                     // Уставка постоянна: меряем ВРАЩЕНИЕ, а не слежение.
@@ -1336,7 +1377,27 @@ public class TrackActivity extends Activity {
                     // Через арктангенс, а не умножением: на краю кадра
                     // (±36 град) линейное приближение врёт на четверть.
                     errDeg = Math.toDegrees(Math.atan((cxSensor - W / 2.0) / fPx));
-                    w = sign * K * Math.toRadians(errDeg);
+                    // УГОЛ ЦЕЛИ В МИРЕ, а не ошибка на устаревшем кадре.
+                    //
+                    //   цель_в_мире = угол вала при захвате + знак * ошибка
+                    //   команда     = K * (цель_в_мире - угол вала СЕЙЧАС)
+                    //
+                    // Собственное движение стенда теперь ВЫЧИТАЕТСЯ по
+                    // энкодеру, а не угадывается по картинке. Когда угол не
+                    // изменился, формула тождественно равна прежней —
+                    // sign*K*ошибка, — поэтому поведение без поворота то же.
+                    if (syncEnc && telNs != 0 && !dry
+                            && (System.nanoTime() - telNs) < 300_000_000L) {
+                        double tgtWorld = thetaCap + sign * Math.toRadians(errDeg);
+                        double fresh = tgtWorld - thetaAt(System.nanoTime());
+                        errFreshDeg = Math.toDegrees(fresh);
+                        w = K * fresh;
+                        tgtWorldRad = tgtWorld;
+                    } else {
+                        errFreshDeg = errDeg * sign;
+                        w = sign * K * Math.toRadians(errDeg);
+                        tgtWorldRad = Double.NaN;
+                    }
                     // Окно ведёт ТРЕКЕР: центр — предсказание, сторона — из
                     // фильтра размера. Прежняя телефонная версия ставила окно
                     // по последней детекции, то есть на такт позади цели.
@@ -1491,6 +1552,9 @@ public class TrackActivity extends Activity {
                    .append(',').append(fmt(gateNow))
                    .append(',').append(trk.status == Tracker.TRACKING ? "вед" : "потеря")
                    .append(',').append(trk.missCount).append(',')
+                   .append(Double.isNaN(errFreshDeg) ? "" : fmt(errFreshDeg)).append(',')
+                   .append(Double.isNaN(tgtWorldRad) ? "" : fmt(tgtWorldRad)).append(',')
+                   .append(fmt(thetaCap)).append(',')
                    .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][0]) : "").append(',')
                    .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][1]) : "").append(',')
                    .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][2]) : "").append(',')
