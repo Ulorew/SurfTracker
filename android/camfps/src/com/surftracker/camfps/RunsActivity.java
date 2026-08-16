@@ -180,12 +180,74 @@ public class RunsActivity extends Activity {
     }
 
 
-    private void openVideo(File f) {
+    /**
+     * Открыть запись — ЧЕРЕЗ ГАЛЕРЕЮ, а не по пути к файлу.
+     *
+     * Запись лежит в Android/data/<пакет>/files: этот каталог не индексируется
+     * галереей вовсе, а file:// чужому проигрывателю отдавать нельзя — он его
+     * не примет. Поэтому при первом нажатии видео публикуется в общий раздел
+     * (Movies/SurfTracker), и дальше открывается уже оттуда.
+     *
+     * Копия делается ОДИН РАЗ и её адрес запоминается рядом с записью: файл на
+     * четыреста мегабайт незачем копировать при каждом просмотре.
+     */
+    private void publishAndOpen(File f) {
+        File mark = new File(f.getParentFile(), "video.uri");
+        String saved = RunJson.read(mark);
+        if (saved != null && saved.trim().length() > 0) {
+            if (openUri(android.net.Uri.parse(saved.trim()))) return;
+            mark.delete();   // адрес протух (видео удалили из галереи) — опубликуем заново
+        }
+        toast("Публикую в галерею, " + (f.length() / 1024 / 1024) + " МБ…");
+        new Thread(() -> {
+            android.net.Uri uri = null;
+            try {
+                android.content.ContentValues cv = new android.content.ContentValues();
+                cv.put(android.provider.MediaStore.Video.Media.DISPLAY_NAME,
+                        f.getParentFile().getName() + ".mp4");
+                cv.put(android.provider.MediaStore.Video.Media.MIME_TYPE, "video/mp4");
+                cv.put(android.provider.MediaStore.Video.Media.RELATIVE_PATH,
+                        android.os.Environment.DIRECTORY_MOVIES + "/SurfTracker");
+                cv.put(android.provider.MediaStore.Video.Media.IS_PENDING, 1);
+                uri = getContentResolver().insert(
+                        android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI, cv);
+                if (uri == null) throw new java.io.IOException("галерея не приняла запись");
+                try (java.io.InputStream in = new java.io.FileInputStream(f);
+                     java.io.OutputStream out = getContentResolver().openOutputStream(uri)) {
+                    byte[] buf = new byte[1 << 20];
+                    int n;
+                    while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                }
+                cv.clear();
+                cv.put(android.provider.MediaStore.Video.Media.IS_PENDING, 0);
+                getContentResolver().update(uri, cv, null, null);
+                try (java.io.OutputStream m = new java.io.FileOutputStream(mark)) {
+                    m.write(uri.toString().getBytes("UTF-8"));
+                }
+            } catch (Throwable t) {
+                Log.e(TAG, "публикация: " + t);
+                final String msg = LiveStatus.shortError(String.valueOf(t));
+                runOnUiThread(() -> toast("Не опубликовалось: " + msg));
+                return;
+            }
+            final android.net.Uri u = uri;
+            runOnUiThread(() -> { if (!openUri(u)) toast("Видео в галерее: Movies/SurfTracker"); });
+        }).start();
+    }
+
+    private boolean openUri(android.net.Uri u) {
         try {
             android.content.Intent i = new android.content.Intent(android.content.Intent.ACTION_VIEW);
-            i.setDataAndType(android.net.Uri.fromFile(f), "video/mp4");
+            i.setDataAndType(u, "video/mp4");
             i.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION);
             startActivity(i);
+            return true;
+        } catch (Throwable t) { Log.e(TAG, "открытие: " + t); return false; }
+    }
+
+    private void openVideo(File f) {
+        try {
+            publishAndOpen(f);
         } catch (Throwable t) {
             // Внешний проигрыватель может не принять file:// на новых Android.
             // Сообщаем путь, а не молчим: путь позволяет открыть файл вручную.

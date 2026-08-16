@@ -46,6 +46,32 @@ public class ReviewActivity extends Activity {
     private final Handler ui = new Handler(Looper.getMainLooper());
     private volatile int pending = -1;   // последний запрошенный такт
     private volatile int shown = -1;
+    private android.widget.Button play;
+    private boolean playing;
+    private final Handler player = new Handler(Looper.getMainLooper());
+
+    /**
+     * Проигрывание по ТАКТАМ, а не по кадрам видео.
+     *
+     * Разбирают не запись, а решения петли: интересен каждый такт, на котором
+     * трекер что-то выбрал. Кадры между тактами ничего не добавляют, а на 4K
+     * их извлечение стоит сотни миллисекунд — плавного видео из этого всё
+     * равно не выйдет, и попытка сделать вид, что выйдет, только обманет.
+     *
+     * Следующий такт запрашивается ПОСЛЕ отрисовки предыдущего (см. onShown),
+     * иначе очередь запросов растёт быстрее, чем разбирается.
+     */
+    private void togglePlay() {
+        playing = !playing;
+        play.setText(playing ? "❚❚" : "▶");
+        if (playing) step();
+    }
+
+    private void step() {
+        if (!playing) return;
+        if (shown >= model.ticks.size() - 1) { playing = false; play.setText("▶"); return; }
+        request(shown + 1);
+    }
     private File dir;
 
     @Override
@@ -77,6 +103,8 @@ public class ReviewActivity extends Activity {
         row.addView(btn("‹", v -> request(shown - 1)));
         row.addView(btn("›", v -> request(shown + 1)));
         row.addView(btn("к потере", v -> nextLoss()));
+        play = btn("▶", v -> togglePlay());
+        row.addView(play);
 
         root.addView(image, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
@@ -116,7 +144,15 @@ public class ReviewActivity extends Activity {
         worker.start();
         bg = new Handler(worker.getLooper());
         bar.setMax(Math.max(0, model.ticks.size() - 1));
-        request(model.losses.isEmpty() ? 0 : model.losses.get(0));
+        // Открываем на такте С ЦЕЛЬЮ, а не на первой потере.
+        //
+        // Прежде экран открывался ровно там, где рамки цели нет по
+        // определению — на потере, — и первое, что видел человек, было
+        // «разбор не рисует рамку». Прыгать к потерям есть кнопка.
+        int first = 0;
+        for (int i = 0; i < model.ticks.size(); i++)
+            if (model.ticks.get(i).hit) { first = i; break; }
+        request(first);
     }
 
     @Override
@@ -187,6 +223,7 @@ public class ReviewActivity extends Activity {
                 shown = want;
                 if (drawn != null) image.setImageBitmap(drawn);
                 caption.setText(cap);
+                if (playing) player.postDelayed(this::step, 60);
             });
         });
     }
