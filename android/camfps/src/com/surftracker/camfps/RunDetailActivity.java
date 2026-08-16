@@ -22,7 +22,7 @@ public class RunDetailActivity extends Activity {
     protected void onCreate(Bundle b) {
         super.onCreate(b);
         File dir = new File(getIntent().getStringExtra("dir"));
-        String json = RunsActivity.read(new File(dir, "прогон.json"));
+        String json = RunsActivity.read(RunJson.pick(dir, "run.json", "прогон.json"));
 
         ScrollView sv = new ScrollView(this);
         LinearLayout root = new LinearLayout(this);
@@ -59,7 +59,7 @@ public class RunDetailActivity extends Activity {
             for (String k : new String[]{"модель", "сенсор", "запись", "поле_зрения_град",
                                           "K", "знак", "окно", "секунд", "выбег",
                                           "перезахват", "удержание", "без_мотора",
-                                          "возврат", "видео", "кадры",
+                                          "возврат", "видео", "frames",
                                           "потоков", "xnnpack", "режим"}) {
                 String v = RunsActivity.jsonStr(json, k);
                 if (v == null) {

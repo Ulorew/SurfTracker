@@ -41,15 +41,23 @@ echo "== имена файлов прогона: писатель и читат�
 A=$SRC/com/surftracker/camfps
 WRITES=$(grep -o 'new File(runDir, "[^"]*")' $A/TrackActivity.java \
         | sed 's/.*"\(.*\)".*/\1/' | tr '\n' ' ')
-# «прогон» пишется как база: base.getPath() + ".json". Разворачиваем.
-case " $WRITES " in *" прогон "*) WRITES="$WRITES прогон.json";; esac
-READS=$(grep -ho 'new File(dir, "[^"]*")\|new File(runDir, "[^"]*")' \
-        $A/ReviewActivity.java $A/RunsActivity.java $A/RunDetailActivity.java \
-        | sed 's/.*"\(.*\)".*/\1/' | sort -u | tr '\n' ' ')
+# «run» пишется как БАЗА: base.getPath() + ".json". Разворачиваем.
+case " $WRITES " in *" run "*) WRITES="$WRITES run.json";; esac
+# Читатели ходят и напрямую, и через RunJson.pick(dir, "новое", "старое"...)
+READS=$( { grep -ho 'new File(dir, "[^"]*")\|new File(f, "[^"]*")\|new File(runDir, "[^"]*")' \
+            $A/ReviewActivity.java $A/RunsActivity.java $A/RunDetailActivity.java \
+            | sed 's/.*"\(.*\)".*/\1/';
+          grep -ho 'RunJson.pick([^)]*)' \
+            $A/ReviewActivity.java $A/RunsActivity.java $A/RunDetailActivity.java \
+            | grep -o '"[^"]*"' | tr -d '"'; } | sort -u | tr '\n' ' ')
 echo "  пишет:  $WRITES"
 echo "  читают: $READS"
+# Читатели умеют откатываться на СТАРЫЕ русские имена ради уже снятых
+# прогонов — их писатель законно не пишет. Проверяем только новые.
+OLD="прогон.json лог.csv видео.mp4 прогон.csv"
 MISSING=""
 for f in $READS; do
+  case " $OLD " in *" $f "*) continue;; esac
   case " $WRITES " in *" $f "*) ;; *) MISSING="$MISSING $f";; esac
 done
 if [ -n "$MISSING" ]; then

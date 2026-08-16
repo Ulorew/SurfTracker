@@ -443,7 +443,7 @@ public class TrackActivity extends Activity {
         // Разрешатель настроек: интент -> сохранённое на экране -> умолчание.
         // Правило и умолчания живут в RunSettings, проверяются стендом
         // tools/windowing/run_settings_check. Здесь только применение.
-        final Cfg cfg = new Cfg(getIntent(), getSharedPreferences("прогон", MODE_PRIVATE));
+        final Cfg cfg = new Cfg(getIntent(), getSharedPreferences("run", MODE_PRIVATE));
 
         String tag = cfg.s("tag");
         tag = (tag == null || tag.isEmpty()) ? stamp : (stamp + "_" + tag);
@@ -543,8 +543,8 @@ public class TrackActivity extends Activity {
         File dir = new File(getExternalFilesDir(null), "track");
         File runDir = new File(dir, tag);
         runDir.mkdirs();
-        File base = new File(runDir, "прогон");
-        File recDir = new File(runDir, "кадры");
+        File base = new File(runDir, "run");
+        File recDir = new File(runDir, "frames");
         if (rec) recDir.mkdirs();
         StringBuilder j = new StringBuilder("{");
         // НАСТРОЙКИ ПИШУТСЯ СРАЗУ, до камеры и модели.
@@ -809,7 +809,7 @@ public class TrackActivity extends Activity {
                 if (wantFps > 0) prof.videoFrameRate = wantFps;
                 int wantMbps = getIntent().getIntExtra("mbps", 0);
                 if (wantMbps > 0) prof.videoBitRate = wantMbps * 1000000;
-                File vf = new File(runDir, "видео.mp4");
+                File vf = new File(runDir, "video.mp4");
                 recorder.setOutputFormat(prof.fileFormat);
                 recorder.setOutputFile(vf.getAbsolutePath());
                 recorder.setVideoEncoder(prof.videoCodec);
@@ -946,7 +946,7 @@ public class TrackActivity extends Activity {
                     // появляется вовсе, и поиск по имени там пуст всегда.
                     // Перенося этот поиск из BtLinkActivity, я не проверил,
                     // что и там он никогда не срабатывал.
-                    String last = getSharedPreferences("прогон", MODE_PRIVATE)
+                    String last = getSharedPreferences("run", MODE_PRIVATE)
                             .getString("mac_последний", null);
                     if (last != null && !last.isEmpty()) bt = ad.getRemoteDevice(last);
                 }
@@ -959,7 +959,7 @@ public class TrackActivity extends Activity {
                 // Адрес запоминается ТОЛЬКО после удачного подключения:
                 // сохранить его раньше значило бы закрепить неверный и
                 // получать отказ каждый следующий раз молча.
-                getSharedPreferences("прогон", MODE_PRIVATE).edit()
+                getSharedPreferences("run", MODE_PRIVATE).edit()
                         .putString("mac_последний", bt.getAddress()).apply();
             }
             OutputStream os = dry ? null : sock.getOutputStream();
@@ -1688,7 +1688,7 @@ public class TrackActivity extends Activity {
                 // вовсе. Заметить это по стендам было нельзя — стенд разбора
                 // кормили файлом, названным по ЧИТАТЕЛЮ, а писателя не
                 // проверяет ничто. Найдено первым же настоящим прогоном.
-                write(new File(runDir, "лог.csv"), csv.toString());
+                write(new File(runDir, "log.csv"), csv.toString());
             } catch (Throwable ignored) {}
             // Звук окончания. Наблюдатель стоит в кадре и не видит ни экрана,
             // ни лога: без сигнала он не знает, когда можно расходиться, и

@@ -85,9 +85,10 @@ public class ReviewActivity extends Activity {
         root.addView(row);
         setContentView(root);
 
-        model = ReviewModel.parse(RunJson.read(new File(dir, "лог.csv")),
-                                   RunJson.read(new File(dir, "прогон.json")));
-        File video = new File(dir, "видео.mp4");
+        model = ReviewModel.parse(
+                RunJson.read(RunJson.pick(dir, "log.csv", "лог.csv", "прогон.csv")),
+                RunJson.read(RunJson.pick(dir, "run.json", "прогон.json")));
+        File video = RunJson.pick(dir, "video.mp4", "видео.mp4");
 
         if (!model.usable()) {
             caption.setText("Разбирать нечего: " + (model.error != null ? model.error : "лог пуст"));

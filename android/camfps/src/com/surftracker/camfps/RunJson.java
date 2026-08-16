@@ -28,6 +28,22 @@ public final class RunJson {
 
     private RunJson() {}
 
+    /**
+     * Первый существующий файл из перечисленных.
+     *
+     * Нужен ради уже снятых прогонов: имена файлов переименованы на латиницу
+     * (log.csv, run.json, video.mp4), а прогоны, снятые до этого, лежат с
+     * русскими именами. Молча перестать их показывать — значит потерять
+     * материал, ради которого прогон и делался.
+     */
+    public static File pick(File dir, String... names) {
+        for (String n : names) {
+            File f = new File(dir, n);
+            if (f.exists()) return f;
+        }
+        return new File(dir, names[0]);
+    }
+
     public static String read(File f) {
         try (FileInputStream in = new FileInputStream(f)) {
             byte[] b = new byte[(int) f.length()];

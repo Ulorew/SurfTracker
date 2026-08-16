@@ -106,7 +106,7 @@ public class RunsActivity extends Activity {
         File[] all = dir.listFiles();
         if (all == null) return out;
         for (File f : all)
-            if (f.isDirectory() && new File(f, "прогон.json").exists()) out.add(f);
+            if (f.isDirectory() && (new File(f, "run.json").exists() || new File(f, "прогон.json").exists())) out.add(f);
         out.sort((a, c) -> c.getName().compareTo(a.getName()));
         return out;
     }
@@ -122,7 +122,7 @@ public class RunsActivity extends Activity {
         lp.topMargin = 24;
         c.setLayoutParams(lp);
 
-        String json = read(new File(runDir, "прогон.json"));
+        String json = read(RunJson.pick(runDir, "run.json", "прогон.json"));
         boolean ok = jsonBool(json, "ok");
         boolean started = jsonNum(json, "тактов") > 0;
         c.setBackgroundColor(!started ? 0xFF3A2A2A : (ok ? 0xFF1E2A1E : 0xFF3A3320));
@@ -141,11 +141,11 @@ public class RunsActivity extends Activity {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setPadding(0, 14, 0, 0);
-        File video = new File(runDir, "видео.mp4");
+        File video = RunJson.pick(runDir, "video.mp4", "видео.mp4");
         if (video.exists()) row.addView(button("Видео", v -> openVideo(video)));
         // Разбор доступен всегда, когда есть лог: без видео он покажет числа,
         // и это честнее, чем прятать кнопку и оставлять вопрос без ответа.
-        if (new File(runDir, "лог.csv").exists())
+        if (RunJson.pick(runDir, "log.csv", "лог.csv", "прогон.csv").exists())
             row.addView(button("Разбор", v -> startActivity(
                     new android.content.Intent(this, ReviewActivity.class)
                             .putExtra("dir", runDir.getAbsolutePath()))));
@@ -176,7 +176,7 @@ public class RunsActivity extends Activity {
 
     /** Короткая сводка для карточки: то, что решают с одного взгляда. */
     private String summary(String json, File runDir) {
-        return RunJson.summary(json, new File(runDir, "видео.mp4").exists());
+        return RunJson.summary(json, RunJson.pick(runDir, "video.mp4", "видео.mp4").exists());
     }
 
 

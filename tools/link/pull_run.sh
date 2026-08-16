@@ -19,7 +19,7 @@ DEST="$ROOT/runs/phone"
 # старого, плоского именования, и «последний по алфавиту» брал именно их —
 # имена папок начинаются с цифр и сортируются ПЕРЕД буквами.
 runs() {
-    adb shell "for d in $REMOTE/*/; do [ -f \"\$d/прогон.json\" ] && basename \"\$d\"; done" \
+    adb shell "for d in $REMOTE/*/; do { [ -f \"\$d/run.json\" ] || [ -f \"\$d/прогон.json\" ]; } && basename \"\$d\"; done" \
         2>/dev/null | tr -d '\r' | grep -v '^$' | sort
 }
 
@@ -44,8 +44,9 @@ echo "забрано в $LOCAL"
 echo
 # Итог печатается ЗДЕСЬ ЖЕ. Прогон, после которого надо ещё что-то запускать,
 # чтобы узнать результат, на практике остаётся неразобранным.
-if [ -f "$LOCAL/прогон.json" ]; then
-    "$ROOT/.venv/bin/python" - "$LOCAL/прогон.json" <<'PY'
+JSON="$LOCAL/run.json"; [ -f "$JSON" ] || JSON="$LOCAL/прогон.json"
+if [ -f "$JSON" ]; then
+    "$ROOT/.venv/bin/python" - "$JSON" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
 it = d.get('итог')
@@ -64,7 +65,7 @@ print(f"окно медианно {it['окно_медиана']:.0f} px, "
 if not d.get('ok'): print('ЗАВЕРШИЛСЯ С ОШИБКОЙ:', d.get('ошибка'))
 PY
 else
-    echo "прогон.json не найден — папка неполная"
+    echo "run.json не найден — папка неполная"
 fi
 echo
 ls -la "$LOCAL"
