@@ -61,9 +61,11 @@ public class RunDetailActivity extends Activity {
                                           "потоков", "xnnpack", "режим"}) {
                 String v = RunsActivity.jsonStr(json, k);
                 if (v == null) {
-                    double n = RunsActivity.jsonNum(json, k);
-                    if (n != 0) row(s, k, RunsActivity.fmt1(n));
-                } else row(s, k, v);
+                    // num(), а не fmt1(): целые настройки показывались как
+                    // "знак: -1.0" и "окно: 1280.0" — вид, наводящий на мысль,
+                    // что это измеренные величины, а не заданные.
+                    if (RunJson.has(json, k)) row(s, label(k), num(json, k));
+                } else row(s, label(k), v);
             }
 
             String err = RunsActivity.jsonStr(json, "ошибка");
@@ -85,6 +87,11 @@ public class RunDetailActivity extends Activity {
 
         add(root, 17, s.toString());
         setContentView(sv);
+        // Экран открывался прокрученным на строку: моноширинный TextView
+        // забирал фокус, и ScrollView подкручивал к нему, пряча заголовок с
+        // именем прогона под шапку. Прокрутка сбрасывается после раскладки —
+        // до неё ScrollView ещё не знает своей высоты.
+        sv.post(() -> sv.fullScroll(ScrollView.FOCUS_UP));
     }
 
     private static int count(File d) {
@@ -99,6 +106,15 @@ public class RunDetailActivity extends Activity {
 
     private String pct(String json, String key) {
         return Math.round(RunsActivity.jsonNum(json, key) * 100) + "%";
+    }
+
+    /**
+     * Имя настройки для показа. Переименована ровно одна: «секунд» — это
+     * ЗАКАЗАННАЯ длительность, и рядом с фактической «длительность: 0:51»
+     * строка «секунд: 180» читается как противоречие, хотя противоречия нет.
+     */
+    private static String label(String k) {
+        return "секунд".equals(k) ? "заказано, с" : k;
     }
 
     private static void row(StringBuilder s, String k, String v) {
