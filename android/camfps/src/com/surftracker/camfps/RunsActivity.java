@@ -61,8 +61,20 @@ public class RunsActivity extends Activity {
         File dir = new File(getExternalFilesDir(null), "track");
         List<File> runs = listRuns(dir);
 
+        // Начать прогон и поменять настройки можно С ТЕЛЕФОНА. Прежде и то и
+        // другое требовало ноутбука: запуск — командой adb, настройка — правкой
+        // константы и пересборкой apk. В поле нет ни того, ни другого.
+        LinearLayout top = new LinearLayout(this);
+        top.setOrientation(LinearLayout.HORIZONTAL);
+        top.addView(bigButton("НОВЫЙ ПРОГОН", v -> startActivity(
+                new android.content.Intent(this, TrackActivity.class))));
+        top.addView(bigButton("Настройки", v -> startActivity(
+                new android.content.Intent(this, SettingsActivity.class))));
+        root.addView(top);
+
         TextView head = new TextView(this);
         head.setTextSize(30);
+        head.setPadding(0, 30, 0, 0);
         head.setText(runs.isEmpty() ? "Прогонов пока нет"
                                     : "Прогоны (" + runs.size() + ")");
         root.addView(head);
@@ -134,6 +146,15 @@ public class RunsActivity extends Activity {
         row.addView(button("Подробно", v -> openDetails(runDir)));
         c.addView(row);
         return c;
+    }
+
+    private android.widget.Button bigButton(String text, View.OnClickListener l) {
+        android.widget.Button b = new android.widget.Button(this);
+        b.setTextSize(20);
+        b.setText(text);
+        b.setOnClickListener(l);
+        b.setLayoutParams(new LinearLayout.LayoutParams(0, 170, 1f));
+        return b;
     }
 
     private android.widget.Button button(String text, View.OnClickListener l) {

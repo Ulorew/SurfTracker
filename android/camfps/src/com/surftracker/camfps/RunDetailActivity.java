@@ -58,6 +58,8 @@ public class RunDetailActivity extends Activity {
             s.append("\n— НАСТРОЙКИ ЗАПУСКА —\n");
             for (String k : new String[]{"модель", "сенсор", "запись", "поле_зрения_град",
                                           "K", "знак", "окно", "секунд", "выбег",
+                                          "перезахват", "удержание", "без_мотора",
+                                          "возврат", "видео", "кадры",
                                           "потоков", "xnnpack", "режим"}) {
                 String v = RunsActivity.jsonStr(json, k);
                 if (v == null) {

@@ -313,14 +313,19 @@ public class TrackActivity extends Activity {
         // бы нечем.
         String stamp = new java.text.SimpleDateFormat("yyMMdd_HHmm",
                 java.util.Locale.US).format(new java.util.Date());
-        String tag = getIntent().getStringExtra("tag");
+        // Разрешатель настроек: интент -> сохранённое на экране -> умолчание.
+        // Правило и умолчания живут в RunSettings, проверяются стендом
+        // tools/windowing/run_settings_check. Здесь только применение.
+        final Cfg cfg = new Cfg(getIntent(), getSharedPreferences("прогон", MODE_PRIVATE));
+
+        String tag = cfg.s("tag");
         tag = (tag == null || tag.isEmpty()) ? stamp : (stamp + "_" + tag);
-        String mac = getIntent().getStringExtra("mac");
-        String mn = getIntent().getStringExtra("model");
-        if (mn == null) mn = "person_w8a32.tflite";
-        int seconds = getIntent().getIntExtra("seconds", 60);
-        int side = getIntent().getIntExtra("side", 1280);
-        float K = getIntent().getFloatExtra("k", 1.2f);
+        String mac = cfg.s("mac");
+        if (mac != null && mac.isEmpty()) mac = null;   // пусто = искать сохранённый
+        String mn = cfg.s("model");
+        int seconds = cfg.i("seconds");
+        int side = cfg.i("side");
+        float K = cfg.f("k");
         // ЗНАК ПО УМОЛЧАНИЮ -1, и это исправление ошибки.
         //
         // Прогон 15 августа: ошибка -22.3 град, команда -0.466, вал пошёл в
@@ -333,8 +338,8 @@ public class TrackActivity extends Activity {
         // K=0.6 со старым масштабом расхождение шло медленно, а наблюдатель
         // своим движением возвращался в кадр сам. Рост коэффициента вдвое и
         // масштаба на четверть сделал дефект явным.
-        int sign = getIntent().getIntExtra("sign", -1);
-        boolean dry = getIntent().getBooleanExtra("dry", false);
+        int sign = cfg.i("sign");
+        boolean dry = cfg.b("dry");
 
         // РЕЖИМ «ПОТОК»: камера как НЕЗАВИСИМЫЙ измеритель угла.
         //
@@ -357,12 +362,12 @@ public class TrackActivity extends Activity {
         // же. Держать ДОЛЬШЕ нельзя: слепое вращение уезжает от цели тем
         // дальше, чем дольше её нет, и это ровно тот отказ, который делает
         // возврат невозможным.
-        float coast = getIntent().getFloatExtra("coast", 0.4f);
+        float coast = cfg.f("coast");
 
         // РАСШИРЕНИЕ ОКНА ПРИ ДОЛГОЙ ПОТЕРЕ. Окно слежения сужает поле зрения
         // ради разрешения; когда цели нет давно, разрешение уже не нужно, нужен
         // охват. Возвращаем узкое окно сразу после захвата.
-        float relost = getIntent().getFloatExtra("relost", 1.5f);
+        float relost = cfg.f("relost");
 
         // ПРЕДЕЛ ДЛИТЕЛЬНОЙ СКОРОСТИ. Развёртка для глаза показала две полосы
         // раскачки: 0.20-0.30 и 0.45-0.50 рад/с, где гармоники привода
@@ -371,16 +376,16 @@ public class TrackActivity extends Activity {
         //
         // Поэтому ограничивается не мгновенная команда, а СГЛАЖЕННАЯ: короткие
         // броски проходят, длительное сидение в полосе — нет.
-        float dwell = getIntent().getFloatExtra("dwell", 0.18f);
+        float dwell = cfg.f("dwell");
 
         // ВОЗВРАТ В ИСХОДНОЕ. После сеанса камера остаётся там, куда доехала,
         // и следующий сеанс начинается с наведения в пустоту. На стенде это
         // уже стоило одного потерянного прогона.
-        boolean home = getIntent().getBooleanExtra("home", true);
+        boolean home = cfg.b("home");
 
         // СЦЕНАРИЙ СУФЛЁРА. Один прогон — один механизм: так и выполнимо для
         // наблюдателя, и при отказе видно, ЧТО именно отказало.
-        String scen = getIntent().getStringExtra("scen");
+        String scen = cfg.s("scen");
         if (scen == null) scen = "";
 
         // ЗАПИСЬ ПРОГОНА. Пишутся кадры В ТОМ ВИДЕ, В КАКОМ ИХ ВИДЕЛА МОДЕЛЬ,
@@ -390,11 +395,11 @@ public class TrackActivity extends Activity {
         //
         // JPEG, а не PNG: при 5 кадрах в секунду сжатие PNG отняло бы у цикла
         // больше, чем стоит разница в качестве для разбора.
-        boolean rec = getIntent().getBooleanExtra("rec", false);
+        boolean rec = cfg.b("rec");
         // ПОЛНОЦЕННАЯ ЗАПИСЬ — то, ради чего изделие и делается: видео с
         // камеры, которая ведёт цель. Кадры модели (rec) отвечают на вопрос
         // «почему потеряла», а это — собственно результат.
-        boolean video = getIntent().getBooleanExtra("video", false);
+        boolean video = cfg.b("video");
 
         boolean flow = getIntent().getBooleanExtra("flow", false);
         float spinW = getIntent().getFloatExtra("spin", 0.15f);
@@ -415,6 +420,26 @@ public class TrackActivity extends Activity {
         File recDir = new File(runDir, "кадры");
         if (rec) recDir.mkdirs();
         StringBuilder j = new StringBuilder("{");
+        // НАСТРОЙКИ ПИШУТСЯ СРАЗУ, до камеры и модели.
+        //
+        // Раньше они уходили в json уже после открытия камеры, и прогон,
+        // упавший раньше, оставлял файл с одной лишь строкой ошибки: понять,
+        // с какими параметрами он пытался идти, было нельзя. А отказ на старте
+        // — как раз тот случай, когда это нужнее всего.
+        //
+        // Здесь только то, что известно ДО железа. Величины, вычисляемые из
+        // камеры (сенсор, поле зрения, градусы на пиксель), дописываются ниже,
+        // когда камера открыта.
+        j.append("\"tag\":\"").append(tag).append("\",\"модель\":\"").append(mn)
+         .append("\",\"K\":").append(fmt(K)).append(",\"знак\":").append(sign)
+         .append(",\"окно\":").append(side).append(",\"секунд\":").append(seconds)
+         .append(",\"выбег\":").append(fmt(coast))
+         .append(",\"перезахват\":").append(fmt(relost))
+         .append(",\"удержание\":").append(fmt(dwell))
+         .append(",\"без_мотора\":").append(dry)
+         .append(",\"возврат\":").append(home)
+         .append(",\"видео\":").append(video)
+         .append(",\"кадры\":").append(rec);
         StringBuilder csv = new StringBuilder(
             "i,t_ms,есть_цель,conf,cx_сенсор,ошибка_град,ω_уставка,"
             + "θ_enc,ω_ramp,статус,watchdog,потолок,рампа,энкодер,кламп,срыв,"
@@ -547,17 +572,15 @@ public class TrackActivity extends Activity {
             final double fPx = (W / 2.0) / Math.tan(Math.toRadians(hfovDeg / 2.0));
             final double degPerPx = Math.toDegrees(1.0 / fPx);   // в центре кадра
 
-            j.append("\"tag\":\"").append(tag).append("\",\"модель\":\"").append(mn)
-             .append("\",\"сенсор\":\"").append(W).append("x").append(H)
+            // Только вычисленное из камеры: остальное записано выше, до неё.
+            j.append(",\"сенсор\":\"").append(W).append("x").append(H)
              .append("\",\"поле_зрения_град\":").append(fmt(hfovDeg))
-             .append(",\"град_на_пиксель\":").append(String.format(java.util.Locale.US, "%.5f", degPerPx))
-             .append(",\"K\":").append(fmt(K)).append(",\"знак\":").append(sign)
-             .append(",\"окно\":").append(side).append(",\"секунд\":").append(seconds)
-             .append(",\"выбег\":").append(fmt(coast))
-             .append(",\"расширение\":").append(fmt(relost))
-             .append(",\"предел_задержки\":").append(fmt(dwell))
-             .append(",\"возврат\":").append(home)
-             .append(",\"сухой_прогон\":").append(dry);
+             .append(",\"град_на_пиксель\":").append(String.format(java.util.Locale.US, "%.5f", degPerPx));
+            // Выбег, перезахват, удержание, возврат и режим без мотора отсюда
+            // УБРАНЫ: они пишутся выше, до камеры. Дублировать их здесь нельзя
+            // — разбор берёт ПЕРВОЕ вхождение ключа, и вторая запись под другим
+            // именем («расширение» вместо «перезахват») жила бы в файле молча,
+            // никем не читаемая, но выглядящая как настройка.
 
             // Очередь на 4 кадра, а не на 2. При двух возникает гонка: один
             // кадр держит слушатель в latest, второй — цикл, пока режет кроп;
@@ -623,7 +646,7 @@ public class TrackActivity extends Activity {
                 // Профиль всё равно берётся у устройства и лишь правится:
                 // назначать параметры целиком руками уже пробовали, дорожка
                 // падала на девятой секунде.
-                String q = getIntent().getStringExtra("quality");
+                String q = cfg.s("quality");
                 int qid;
                 if ("720".equals(q))       qid = android.media.CamcorderProfile.QUALITY_720P;
                 else if ("1080".equals(q)) qid = android.media.CamcorderProfile.QUALITY_1080P;
@@ -671,16 +694,16 @@ public class TrackActivity extends Activity {
                  .append("\"");
             }
             final CameraCaptureSession[] box = new CameraCaptureSession[1];
-            CountDownLatch cfg = new CountDownLatch(1);
+            CountDownLatch sessionReady = new CountDownLatch(1);   // защёлка настройки сессии камеры
             List<OutputConfiguration> cfgs = new ArrayList<>();
             for (Surface sf : targets) cfgs.add(new OutputConfiguration(sf));
             dev.createCaptureSession(new SessionConfiguration(
                     SessionConfiguration.SESSION_REGULAR, cfgs, r -> h.post(r),
                     new CameraCaptureSession.StateCallback() {
-                        public void onConfigured(CameraCaptureSession s2) { box[0] = s2; cfg.countDown(); }
-                        public void onConfigureFailed(CameraCaptureSession s2) { cfg.countDown(); }
+                        public void onConfigured(CameraCaptureSession s2) { box[0] = s2; sessionReady.countDown(); }
+                        public void onConfigureFailed(CameraCaptureSession s2) { sessionReady.countDown(); }
                     }));
-            if (!cfg.await(10, TimeUnit.SECONDS) || box[0] == null)
+            if (!sessionReady.await(10, TimeUnit.SECONDS) || box[0] == null)
                 throw new RuntimeException("сессия не собралась");
             CaptureRequest.Builder rq = dev.createCaptureRequest(
                     video ? CameraDevice.TEMPLATE_RECORD : CameraDevice.TEMPLATE_PREVIEW);
@@ -701,8 +724,8 @@ public class TrackActivity extends Activity {
             // замер на этом же телефоне давал 183 мс на ОДНОМ потоке и без
             // XNNPACK, да ещё под записью 4K. Больше потоков здесь оказалось
             // хуже, и подбирать это надо перебором, а не рассуждением.
-            int threads = getIntent().getIntExtra("threads", 1);
-            boolean wantXnn = getIntent().getBooleanExtra("xnn", false);
+            int threads = cfg.i("threads");
+            boolean wantXnn = cfg.b("xnn");
             Interpreter.Options o = new Interpreter.Options();
             o.setNumThreads(threads);
             if (flow) { /* интерпретатор не поднимаем: в потоке он не нужен */ }
@@ -1513,6 +1536,38 @@ public class TrackActivity extends Activity {
 
     static int bit(int st, int m) { return (st & m) != 0 ? 1 : 0; }
     static int clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+    /**
+     * Значения параметров прогона: интент, потом сохранённое, потом умолчание.
+     *
+     * Тонкость с интентом: extras типизированы, и «есть ли ключ» ещё не значит
+     * «строка». Поэтому значение берётся в строковом виде через общий
+     * getExtras().get(key) — иначе --ei seconds 180 из скрипта пришёл бы как
+     * Integer, getString вернул бы null, и параметр молча уехал бы в умолчание.
+     */
+    static final class Cfg {
+        private final RunSettings.Source intent, saved;
+
+        Cfg(android.content.Intent i, android.content.SharedPreferences p) {
+            final android.os.Bundle ex = (i == null) ? null : i.getExtras();
+            intent = new RunSettings.Source() {
+                public boolean has(String k) { return ex != null && ex.containsKey(k); }
+                public String get(String k) {
+                    Object v = (ex == null) ? null : ex.get(k);
+                    return v == null ? null : String.valueOf(v);
+                }
+            };
+            saved = new RunSettings.Source() {
+                public boolean has(String k) { return p != null && p.contains(k); }
+                public String get(String k) { return p == null ? null : p.getString(k, null); }
+            };
+        }
+
+        String s(String k) { return RunSettings.resolve(intent, saved, k); }
+        int i(String k) { return RunSettings.asInt(s(k), 0); }
+        float f(String k) { return RunSettings.asFloat(s(k), 0f); }
+        boolean b(String k) { return RunSettings.asBool(s(k)); }
+    }
+
     static String fmt(double v) { return String.format(java.util.Locale.US, "%.4f", v); }
 
     /** Медиана. Пустой список -> 0, чтобы итог не превращался в NaN в json. */
