@@ -22,6 +22,7 @@
     </activity>
     <activity android:name=".RunDetailActivity" android:exported="false"/>
     <activity android:name=".SettingsActivity" android:exported="false"/>
+    <activity android:name=".ReviewActivity" android:exported="false"/>
     <activity android:name=".MainActivity" android:exported="true"/>
     <!-- Стенд сквозной сверки зрения: один снимок по команде, наведённый
          кроп, сырой YUV на диск до конвертации (тикет "камерное зрение"). -->

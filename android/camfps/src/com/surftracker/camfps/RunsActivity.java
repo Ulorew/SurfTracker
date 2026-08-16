@@ -143,6 +143,12 @@ public class RunsActivity extends Activity {
         row.setPadding(0, 14, 0, 0);
         File video = new File(runDir, "видео.mp4");
         if (video.exists()) row.addView(button("Видео", v -> openVideo(video)));
+        // Разбор доступен всегда, когда есть лог: без видео он покажет числа,
+        // и это честнее, чем прятать кнопку и оставлять вопрос без ответа.
+        if (new File(runDir, "лог.csv").exists())
+            row.addView(button("Разбор", v -> startActivity(
+                    new android.content.Intent(this, ReviewActivity.class)
+                            .putExtra("dir", runDir.getAbsolutePath()))));
         row.addView(button("Подробно", v -> openDetails(runDir)));
         c.addView(row);
         return c;
