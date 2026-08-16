@@ -30,6 +30,34 @@ for m in "колонки-по-номеру:s|for (int i = 0; i < head.length; i+
 done
 [ $fails -eq 0 ] || { echo "СТЕНД НЕГОДЕН: $fails порч прошли"; exit 2; }
 
+# ИМЕНА ФАЙЛОВ: писатель против читателей.
+#
+# Лог писался как «прогон.csv», а экран разбора и карточка искали «лог.csv» —
+# кнопка «Разбор» не появлялась вовсе. Стенды этого не видели: разбор кормили
+# файлом, названным по ЧИТАТЕЛЮ, а писателя не проверяет ничто. Нашлось первым
+# же настоящим прогоном на телефоне.
+echo
+echo "== имена файлов прогона: писатель и читатели совпадают =="
+A=$SRC/com/surftracker/camfps
+WRITES=$(grep -o 'new File(runDir, "[^"]*")' $A/TrackActivity.java \
+        | sed 's/.*"\(.*\)".*/\1/' | tr '\n' ' ')
+# «прогон» пишется как база: base.getPath() + ".json". Разворачиваем.
+case " $WRITES " in *" прогон "*) WRITES="$WRITES прогон.json";; esac
+READS=$(grep -ho 'new File(dir, "[^"]*")\|new File(runDir, "[^"]*")' \
+        $A/ReviewActivity.java $A/RunsActivity.java $A/RunDetailActivity.java \
+        | sed 's/.*"\(.*\)".*/\1/' | sort -u | tr '\n' ' ')
+echo "  пишет:  $WRITES"
+echo "  читают: $READS"
+MISSING=""
+for f in $READS; do
+  case " $WRITES " in *" $f "*) ;; *) MISSING="$MISSING $f";; esac
+done
+if [ -n "$MISSING" ]; then
+  echo "  ЧИТАЮТ ТО, ЧЕГО НИКТО НЕ ПИШЕТ:$MISSING"
+  exit 2
+fi
+echo "  ок: каждое читаемое имя кем-то пишется"
+
 echo
 echo "== проверка настоящего разбора =="
 "$JAVAC" -encoding UTF-8 -d "$D/cls" -cp "$SRC" ReviewCheck.java $DEPS

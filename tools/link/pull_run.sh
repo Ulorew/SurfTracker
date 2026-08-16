@@ -15,7 +15,13 @@ C=com.surftracker.camfps
 REMOTE=/sdcard/Android/data/$C/files/track
 DEST="$ROOT/runs/phone"
 
-runs() { adb shell "ls -1 $REMOTE 2>/dev/null" | tr -d '\r' | grep -v '^$' | sort; }
+# ТОЛЬКО папки прогонов, как их видит экран приложения: каталог полон файлов
+# старого, плоского именования, и «последний по алфавиту» брал именно их —
+# имена папок начинаются с цифр и сортируются ПЕРЕД буквами.
+runs() {
+    adb shell "for d in $REMOTE/*/; do [ -f \"\$d/прогон.json\" ] && basename \"\$d\"; done" \
+        2>/dev/null | tr -d '\r' | grep -v '^$' | sort
+}
 
 if [ "${1:-}" = "--список" ] || [ "${1:-}" = "--list" ]; then
     runs

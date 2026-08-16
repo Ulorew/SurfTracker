@@ -939,11 +939,28 @@ public class TrackActivity extends Activity {
                     for (BluetoothDevice d : ad.getBondedDevices())
                         if ("SurfTracker-Link".equals(d.getName())) bt = d;
                 }
+                if (bt == null) {
+                    // Последний УДАЧНЫЙ адрес — единственный работающий
+                    // запасной путь на этом телефоне: сокет создаётся
+                    // незащищённым, поэтому модуль в списке спаренных не
+                    // появляется вовсе, и поиск по имени там пуст всегда.
+                    // Перенося этот поиск из BtLinkActivity, я не проверил,
+                    // что и там он никогда не срабатывал.
+                    String last = getSharedPreferences("прогон", MODE_PRIVATE)
+                            .getString("mac_последний", null);
+                    if (last != null && !last.isEmpty()) bt = ad.getRemoteDevice(last);
+                }
                 if (bt == null) throw new RuntimeException(
-                        "мотор не найден: mac не задан и среди спаренных нет SurfTracker-Link");
+                        "мотор не найден: адрес не задан, среди спаренных нет "
+                        + "SurfTracker-Link, удачного подключения раньше не было");
                 sock = bt.createInsecureRfcommSocketToServiceRecord(SPP);
                 ad.cancelDiscovery();
                 sock.connect();
+                // Адрес запоминается ТОЛЬКО после удачного подключения:
+                // сохранить его раньше значило бы закрепить неверный и
+                // получать отказ каждый следующий раз молча.
+                getSharedPreferences("прогон", MODE_PRIVATE).edit()
+                        .putString("mac_последний", bt.getAddress()).apply();
             }
             OutputStream os = dry ? null : sock.getOutputStream();
             InputStream is = dry ? null : sock.getInputStream();
@@ -1664,7 +1681,14 @@ public class TrackActivity extends Activity {
             if (sv2 != null) runOnUiThread(() -> sv2.setText(""));
             try {
                 write(new File(base.getPath() + ".json"), j.append("}").toString());
-                write(new File(base.getPath() + ".csv"), csv.toString());
+                // ИМЕНА ФАЙЛОВ — те, под которыми их ищут читатели.
+                //
+                // Лог писался как «прогон.csv», а экран разбора и карточка
+                // прогона искали «лог.csv»: кнопка «Разбор» не появлялась
+                // вовсе. Заметить это по стендам было нельзя — стенд разбора
+                // кормили файлом, названным по ЧИТАТЕЛЮ, а писателя не
+                // проверяет ничто. Найдено первым же настоящим прогоном.
+                write(new File(runDir, "лог.csv"), csv.toString());
             } catch (Throwable ignored) {}
             // Звук окончания. Наблюдатель стоит в кадре и не видит ни экрана,
             // ни лога: без сигнала он не знает, когда можно расходиться, и
