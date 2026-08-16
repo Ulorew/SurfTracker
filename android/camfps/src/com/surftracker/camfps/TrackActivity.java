@@ -302,8 +302,19 @@ public class TrackActivity extends Activity {
             wl.acquire(30 * 60 * 1000L);
         } catch (Throwable t) { Log.e(TAG, "wake lock: " + t); }
 
+        // ИМЯ ПАПКИ = ВРЕМЯ + метка.
+        //
+        // Время впереди по двум причинам. Оно даёт порядок: список прогонов
+        // сортируется по имени, и новые оказываются сверху сами, без разбора
+        // дат внутри файлов. И оно даёт различимость: раньше два прогона с
+        // одной меткой писались в одни и те же файлы, второй молча затирал
+        // первый — а с папкой затирание было бы ещё хуже, прогоны смешались бы
+        // в одном каталоге, и разобрать, от какого запуска какой файл, стало
+        // бы нечем.
+        String stamp = new java.text.SimpleDateFormat("yyMMdd_HHmm",
+                java.util.Locale.US).format(new java.util.Date());
         String tag = getIntent().getStringExtra("tag");
-        if (tag == null) tag = "track";
+        tag = (tag == null || tag.isEmpty()) ? stamp : (stamp + "_" + tag);
         String mac = getIntent().getStringExtra("mac");
         String mn = getIntent().getStringExtra("model");
         if (mn == null) mn = "person_w8a32.tflite";
@@ -388,10 +399,20 @@ public class TrackActivity extends Activity {
         boolean flow = getIntent().getBooleanExtra("flow", false);
         float spinW = getIntent().getFloatExtra("spin", 0.15f);
 
+        // ПРОГОН — ЭТО ПАПКА, а не россыпь файлов с общим префиксом.
+        //
+        // Раньше видео, лог, конфигурация и кадры лежали в одном каталоге
+        // вперемешку с прогонами всех прошлых дней, и на вопрос «где смотреть»
+        // приходилось отвечать путём с точностью до имени файла. Разбор
+        // требовал стянуть три файла и не перепутать, от одного ли они запуска.
+        //
+        // Имя папки — метка прогона; внутри имена ПОСТОЯННЫЕ, поэтому любой
+        // разборщик получает путь вида <прогон>/лог.csv, не зная метки.
         File dir = new File(getExternalFilesDir(null), "track");
-        dir.mkdirs();
-        File base = new File(dir, tag);
-        File recDir = new File(dir, tag + "_кадры");
+        File runDir = new File(dir, tag);
+        runDir.mkdirs();
+        File base = new File(runDir, "прогон");
+        File recDir = new File(runDir, "кадры");
         if (rec) recDir.mkdirs();
         StringBuilder j = new StringBuilder("{");
         StringBuilder csv = new StringBuilder(
@@ -633,7 +654,7 @@ public class TrackActivity extends Activity {
                 if (wantFps > 0) prof.videoFrameRate = wantFps;
                 int wantMbps = getIntent().getIntExtra("mbps", 0);
                 if (wantMbps > 0) prof.videoBitRate = wantMbps * 1000000;
-                File vf = new File(dir, tag + ".mp4");
+                File vf = new File(runDir, "видео.mp4");
                 recorder.setOutputFormat(prof.fileFormat);
                 recorder.setOutputFile(vf.getAbsolutePath());
                 recorder.setVideoEncoder(prof.videoCodec);
@@ -760,6 +781,21 @@ public class TrackActivity extends Activity {
             byte[] rx = new byte[4096];
             long[] sendNs = new long[128];
             int seq = 0, frames = 0, hits = 0, misses = 0;
+            // ---- то, из чего складывается ИТОГ прогона ----
+            //
+            // Считается по ходу, а не разбором лога задним числом: разборщик
+            // пришлось бы держать в двух местах (телефон и ноут), и он бы
+            // разъехался с форматом при первой же новой колонке.
+            //
+            // Потеря считается по СОСТОЯНИЮ ТРЕКЕРА, а не по «нет детекции на
+            // такте». Один пустой такт — это промах, а не потеря; смешивать их
+            // значит показывать десятки потерь там, где цель ни разу не терялась.
+            int nLoss = 0, nReacq = 0;
+            int prevTrkStatus = Tracker.LOST;
+            List<Double> scHist = new ArrayList<>();
+            List<Double> infHist = new ArrayList<>();
+            List<Double> loopHist = new ArrayList<>();
+            int missStreak = 0, missStreakMax = 0;
             // Окно слежения: центр — последняя уверенная детекция. При потере
             // НЕ расширяется: расширение прячет потерю и мешает увидеть, как
             // часто она случается. Для первого прогона важнее честность.
@@ -1181,16 +1217,16 @@ public class TrackActivity extends Activity {
                     for (int q = 0; q < RING_N; q++) {
                         int idx = (ringAt + q) % RING_N;
                         if (ring[idx] == null) continue;
-                        dumpTensor(ring[idx], new File(dir,
-                                tag + "_потеря" + lossIdx + "_до" + (RING_N - q) + ".png"));
+                        dumpTensor(ring[idx], new File(runDir,
+                                "потеря" + lossIdx + "_до" + (RING_N - q) + ".png"));
                     }
                     dumpLeft = RING_N;
                 } else if (dumpLeft > 0 && !flow) {
                     bin.rewind();
                     byte[] cur = new byte[NET * NET * 3 * 4];
                     bin.get(cur); bin.rewind();
-                    dumpTensor(cur, new File(dir,
-                            tag + "_потеря" + lossIdx + "_после" + (RING_N - dumpLeft + 1) + ".png"));
+                    dumpTensor(cur, new File(runDir,
+                            "потеря" + lossIdx + "_после" + (RING_N - dumpLeft + 1) + ".png"));
                     dumpLeft--;
                 }
                 prevHit = hit;
@@ -1224,6 +1260,19 @@ public class TrackActivity extends Activity {
                    .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][2]) : "").append(',')
                    .append(fmt(trk.filteredSize)).append('\n');
                 frames++;
+
+                // Итог копится здесь же, по тем же величинам, что ушли в лог.
+                if (!flow) {
+                    if (prevTrkStatus == Tracker.TRACKING && trk.status == Tracker.LOST) nLoss++;
+                    if (prevTrkStatus == Tracker.LOST && trk.status == Tracker.TRACKING
+                            && frames > 1) nReacq++;
+                    prevTrkStatus = trk.status;
+                    if (hit) missStreak = 0;
+                    else { missStreak++; if (missStreak > missStreakMax) missStreakMax = missStreak; }
+                    scHist.add((double) Sc);
+                }
+                if (infMs > 0) infHist.add(infMs);
+                if (loopMs > 0 && loopMs < 5000) loopHist.add(loopMs);
             }
 
             // ВОЗВРАТ В ИСХОДНОЕ. Простой П-регулятор по углу: ошибка берётся
@@ -1314,6 +1363,23 @@ public class TrackActivity extends Activity {
                  .append(",\"p95\":").append(fmt(lat.get((int) (0.95 * (lat.size() - 1)))))
                  .append("}");
             if (cues.length() > 0) j.append(",\"реплики\":[").append(cues).append("]");
+            // ИТОГ — отдельным объектом и с постоянными именами: его читает
+            // экран прогонов, и он не должен зависеть от того, какие ключи
+            // добавились в диагностику выше.
+            j.append(",\"итог\":{")
+             .append("\"тактов\":").append(frames)
+             .append(",\"доля_на_цели\":").append(frames > 0 ? fmt(hits / (double) frames) : "0")
+             .append(",\"потерь\":").append(nLoss)
+             .append(",\"повторных_захватов\":").append(nReacq)
+             .append(",\"промахов_подряд_макс\":").append(missStreakMax)
+             .append(",\"окно_медиана\":").append(fmt(median(scHist)))
+             .append(",\"инференс_мс_медиана\":").append(fmt(median(infHist)))
+             .append(",\"такт_мс_медиана\":").append(fmt(median(loopHist)))
+             // НЕ "секунд": этим именем выше записана ЗАКАЗАННАЯ длительность
+             // прогона, и разбор по ключу нашёл бы её вместо фактической.
+             .append(",\"длительность_с\":").append(fmt((System.nanoTime() - t0) / 1e9))
+             .append(",\"батарея_нагрев\":").append(fmt(batteryTempC()))
+             .append("}");
             j.append(",\"ok\":true");
         } catch (Throwable t) {
             Log.e(TAG, "слежение: " + t, t);
@@ -1448,6 +1514,28 @@ public class TrackActivity extends Activity {
     static int bit(int st, int m) { return (st & m) != 0 ? 1 : 0; }
     static int clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
     static String fmt(double v) { return String.format(java.util.Locale.US, "%.4f", v); }
+
+    /** Медиана. Пустой список -> 0, чтобы итог не превращался в NaN в json. */
+    static double median(List<Double> v) {
+        if (v == null || v.isEmpty()) return 0;
+        List<Double> c = new ArrayList<>(v);
+        java.util.Collections.sort(c);
+        return c.get(c.size() / 2);
+    }
+
+    /**
+     * Температура батареи, °C. Она же — единственная доступная мера нагрева:
+     * телефон грелся на каждом длинном прогоне, и это уже влияло на результат
+     * (троттлинг инференса), но нигде не записывалось.
+     */
+    float batteryTempC() {
+        try {
+            android.content.Intent bi = registerReceiver(null,
+                    new android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED));
+            if (bi == null) return 0;
+            return bi.getIntExtra(android.os.BatteryManager.EXTRA_TEMPERATURE, 0) / 10.0f;
+        } catch (Throwable t) { return 0; }
+    }
 
     static Size biggest(Size[] all) {
         Size b = all[0];

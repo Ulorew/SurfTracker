@@ -9,13 +9,19 @@
   <uses-permission android:name="android.permission.RECORD_AUDIO"/>
   <uses-permission android:name="android.permission.WAKE_LOCK"/>
   <uses-feature android:name="android.hardware.camera" android:required="true"/>
-  <application android:label="CamFps">
-    <activity android:name=".MainActivity" android:exported="true">
+  <application android:label="SurfTracker">
+    <!-- ГЛАВНЫЙ ЭКРАН — список прогонов. Прежде им была MainActivity, но она
+         не экран, а стенд замеров, запускаемый интентом с ноутбука: открыв
+         приложение с телефона, человек попадал в чужой инструмент. Запуск
+         стенда через adb (-n .MainActivity) от этой перестановки не зависит. -->
+    <activity android:name=".RunsActivity" android:exported="true">
       <intent-filter>
         <action android:name="android.intent.action.MAIN"/>
         <category android:name="android.intent.category.LAUNCHER"/>
       </intent-filter>
     </activity>
+    <activity android:name=".RunDetailActivity" android:exported="false"/>
+    <activity android:name=".MainActivity" android:exported="true"/>
     <!-- Стенд сквозной сверки зрения: один снимок по команде, наведённый
          кроп, сырой YUV на диск до конвертации (тикет "камерное зрение"). -->
     <activity android:name=".StandActivity" android:exported="true"/>
