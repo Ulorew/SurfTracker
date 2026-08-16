@@ -35,11 +35,11 @@ public class LiveStatusCheck {
 
     public static void main(String[] args) {
         System.out.println("== до первого такта показывать нечего ==");
-        eq("пусто", LiveStatus.text(false, 0, 0, 0, false, false, false, false, 60000, null), "");
+        eq("пусто", LiveStatus.text(false, 0, 0, 0, false, false, false, false, 60000, null, false), "");
         eq("цвет ожидания", LiveStatus.color(false, 0, false, null), LiveStatus.ЖДЁТ);
 
         System.out.println("== ведёт ==");
-        String s = LiveStatus.text(false, 100, 87, 1, true, false, true, true, 45000, null);
+        String s = LiveStatus.text(false, 100, 87, 1, true, false, true, true, 45000, null, false);
         System.out.println("    " + s.replace("\n", "\n    "));
         has("состояние", s, "ВЕДЁТ");
         has("остаток времени", s, "ещё 45 с");
@@ -50,7 +50,7 @@ public class LiveStatusCheck {
         eq("цвет ведения", LiveStatus.color(false, 100, true, null), LiveStatus.ВЕДЁТ);
 
         System.out.println("== ищет, мотор молчит, без записи ==");
-        s = LiveStatus.text(false, 40, 10, 3, false, false, false, false, 5000, null);
+        s = LiveStatus.text(false, 40, 10, 3, false, false, false, false, 5000, null, false);
         System.out.println("    " + s.replace("\n", "\n    "));
         has("состояние", s, "ИЩЕТ");
         // Молчащий мотор обязан читаться КРУПНО и без вопросов: прогон, в
@@ -61,13 +61,13 @@ public class LiveStatusCheck {
         eq("цвет поиска", LiveStatus.color(false, 40, false, null), LiveStatus.ИЩЕТ);
 
         System.out.println("== без мотора — это не отказ связи ==");
-        s = LiveStatus.text(false, 40, 30, 0, true, true, false, false, 1000, null);
+        s = LiveStatus.text(false, 40, 30, 0, true, true, false, false, 1000, null, false);
         has("режим без мотора", s, "без мотора");
         hasNo("не пугает молчанием", s, "МОТОР МОЛЧИТ");
         hasNo("нет потерь — нет строки", s, "потерь");
 
         System.out.println("== готово ==");
-        s = LiveStatus.text(true, 412, 361, 1, false, false, false, false, 0, null);
+        s = LiveStatus.text(true, 412, 361, 1, false, false, false, false, 0, null, false);
         System.out.println("    " + s.replace("\n", "\n    "));
         has("готово", s, "ГОТОВО");
         has("итог", s, "412 тактов, на цели 88%");
@@ -79,7 +79,7 @@ public class LiveStatusCheck {
         // наблюдатель читал успех там, где не было ни одного такта.
         String err = "java.lang.IllegalArgumentException: getCameraCharacteristics:851: "
                    + "Unable to retrieve camera characteristics for unknown device 0";
-        s = LiveStatus.text(true, 0, 0, 0, false, true, false, false, 0, err);
+        s = LiveStatus.text(true, 0, 0, 0, false, true, false, false, 0, err, false);
         System.out.println("    " + s.replace("\n", "\n    "));
         has("назван отказом", s, "ОТКАЗ");
         hasNo("не назван готовым", s, "ГОТОВО");
@@ -87,7 +87,7 @@ public class LiveStatusCheck {
         has("сказано, что не начался", s, "не начался");
         eq("цвет отказа", LiveStatus.color(true, 0, false, err), LiveStatus.ОТКАЗ);
         // Отказ посреди прогона: часть тактов успела пройти, и это надо сказать
-        s = LiveStatus.text(true, 57, 40, 1, false, false, true, true, 0, err);
+        s = LiveStatus.text(true, 57, 40, 1, false, false, true, true, 0, err, false);
         has("успевшие такты", s, "успело 57 тактов");
         eq("цвет отказа важнее ведения", LiveStatus.color(false, 57, true, err), LiveStatus.ОТКАЗ);
         System.out.println("    короткая причина: [" + LiveStatus.shortError(err) + "]");
@@ -102,15 +102,32 @@ public class LiveStatusCheck {
         // Время вышло, а прогон ещё доигрывает остановку: «ещё -3 с» было бы
         // хуже, чем ничего.
         hasNo("нет отрицательного остатка",
-                LiveStatus.text(false, 10, 5, 0, true, true, false, false, -3000, null), "ещё");
+                LiveStatus.text(false, 10, 5, 0, true, true, false, false, -3000, null, false), "ещё");
         hasNo("нет нулевого остатка",
-                LiveStatus.text(false, 10, 5, 0, true, true, false, false, 0, null), "ещё");
-        // Итог «ГОТОВО» на прогоне без единого такта не должен делить на ноль
-        has("готово при нуле тактов",
-                LiveStatus.text(true, 0, 0, 0, false, false, false, false, 0, null), "на цели 0%");
+                LiveStatus.text(false, 10, 5, 0, true, true, false, false, 0, null, false), "ещё");
+        System.out.println("== ноль тактов — не успех ==");
+        // Прежде экран говорил «ГОТОВО / 0 тактов / можно подходить»: нажали
+        // «Остановить» до старта, человек в кадре прочитал успех и ушёл.
+        // Карточка прогона на тех же данных говорит «ПРОГОН НЕ СОСТОЯЛСЯ» —
+        // два места одного проекта давали противоположный вердикт.
+        String zero = LiveStatus.text(true, 0, 0, 0, false, false, false, false, 0, null, false);
+        System.out.println(indent(zero));
+        hasNo("не назван готовым", zero, "ГОТОВО");
+        has("назван несостоявшимся", zero, "НЕ СОСТОЯЛСЯ");
+        hasNo("не зовёт за результатом", zero, "можно подходить");
+        eq("цвет не зелёный", LiveStatus.color(true, 0, false, null), LiveStatus.ОТКАЗ);
+        String st0 = LiveStatus.text(true, 0, 0, 0, false, false, false, false, 0, null, true);
+        has("остановлен до старта — так и сказано", st0, "ОСТАНОВЛЕНО");
+        String st1 = LiveStatus.text(true, 120, 100, 1, false, false, false, false, 0, null, true);
+        has("остановлен посреди — тоже", st1, "ОСТАНОВЛЕНО");
+        has("но итог показан", st1, "120 тактов");
 
         System.out.println();
         if (failed == 0) System.out.println("ИТОГ: экран прогона показывает верное");
         else { System.out.println("ИТОГ: " + failed + " ПРОВЕРОК ПРОВАЛЕНО"); System.exit(1); }
+    }
+
+    static String indent(String s) {
+        return "    " + s.replace("\n", "\n    ");
     }
 }

@@ -126,6 +126,8 @@ public class TrackActivity extends Activity {
     long recStartNs;
     /** Просьба остановиться, поданная кнопкой. Петля проверяет её сама. */
     volatile boolean stopRequested;
+    /** Прогон окончен по просьбе, а не по времени. */
+    volatile boolean uiStopped;
     // Защёлка старта: прогон не начинается, пока наблюдатель не нажал кнопку.
     // Так согласование момента уходит из переписки в приложение — Hero жмёт,
     // когда встал, а не когда прочитал сообщение.
@@ -155,7 +157,8 @@ public class TrackActivity extends Activity {
                             && gb.getVisibility() == android.view.View.VISIBLE)
                         gb.setVisibility(android.view.View.GONE);
                     android.widget.Button sb = stopButton;
-                    if (sb != null && (uiDone || uiError != null) && sb.isEnabled()) {
+                    if (sb != null && (uiDone || uiError != null)
+                            && !"ЗАКРЫТЬ".contentEquals(sb.getText())) {
                         sb.setText("ЗАКРЫТЬ");
                         sb.setOnClickListener(x -> finish());
                     }
@@ -169,7 +172,8 @@ public class TrackActivity extends Activity {
      *  tools/windowing/live_status_check. */
     String liveText() {
         return LiveStatus.text(uiDone, uiTicks, uiHits, uiLoss, uiTracking,
-                uiDry, uiLink, uiRec, uiEndsAtMs - System.currentTimeMillis(), uiError);
+                uiDry, uiLink, uiRec, uiEndsAtMs - System.currentTimeMillis(),
+                uiError, uiStopped);
     }
 
     void say(String phrase) {
@@ -233,6 +237,16 @@ public class TrackActivity extends Activity {
     volatile int telCount = 0;
     volatile int bWd = 0, bCap = 0, bRamp = 0, bEnc = 0, bClamp = 0, bSlip = 0;
     volatile int staleZeros = 0;   // сколько раз слали ноль из-за протухания
+    /**
+     * Возраст, после которого уставка считается протухшей, нс.
+     *
+     * 400 мс — прежнее решение по этому проекту: такт зрения идёт 5-12 Гц
+     * (медиана такта в записи 4K — 124 мс), значит порог пропускает три
+     * пропущенных такта подряд и срабатывает раньше, чем это станет опасным.
+     */
+    static final long STALE_NS = 400_000_000L;
+    /** nanoTime последней ПРИШЕДШЕЙ телеметрии; 0 — не приходила ни разу. */
+    volatile long telNs = 0;
     static final UUID SPP = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
     static final int NET = 640;
     static final float CONF_MIN = 0.35f;
@@ -320,7 +334,9 @@ public class TrackActivity extends Activity {
                 // прогон обрывали через force-stop, и вал оставался под
                 // командой до срабатывания сторожа.
                 stopRequested = true;
-                stop.setEnabled(false);
+                // Кнопка НЕ выключается: тикер превращает её в «ЗАКРЫТЬ» по
+                // окончании, и проверка isEnabled() оставляла её навсегда
+                // мёртвой надписью «останавливаю…».
                 stop.setText("останавливаю...");
             });
 
@@ -375,12 +391,27 @@ public class TrackActivity extends Activity {
      */
     @Override protected void onPause() {
         super.onPause();
+        // Диалог разрешений — это НЕ уход в фон.
+        //
+        // requestPermissions приостанавливает активность, и прежняя редакция
+        // ставила running=false ещё до старта петли. На первом запуске после
+        // установки прогон отрабатывал целиком, не послав в мотор ни одной
+        // уставки, и заканчивался зелёным «ГОТОВО».
+        if (isFinishing() || !started) return;
         if (running) {
             running = false;
+            // Просьба остановиться — та же, что от кнопки. Иначе главный цикл
+            // продолжал крутиться до конца заказанной длительности, удерживая
+            // RUNNING_ONE, и каждая следующая попытка «НОВЫЙ ПРОГОН» молча
+            // закрывалась. Это и есть «второй прогон не стартует».
+            stopRequested = true;
             wCmd = 0.0f; wCmdNs = System.nanoTime();
             Log.i(TAG, "уход в фон: прогон остановлен");
         }
     }
+
+    /** Петля запущена: до этого момента приостановка активности ничего не значит. */
+    volatile boolean started;
 
     void run() {
         if (!RUNNING_ONE.compareAndSet(false, true)) {
@@ -580,6 +611,7 @@ public class TrackActivity extends Activity {
             } catch (Throwable ignored) {}
         }
 
+        started = true;
         try {
             // Режим БЕЗ КАМЕРЫ: интерпретатор в тесном цикле на нулевом буфере.
             // Нужен ровно для одного — отделить цену инференса от цены
@@ -891,8 +923,24 @@ public class TrackActivity extends Activity {
             if (!dry) {
                 BluetoothAdapter ad = BluetoothAdapter.getDefaultAdapter();
                 if (ad == null || !ad.isEnabled()) throw new RuntimeException("Bluetooth выключен");
-                BluetoothDevice bt = (mac != null) ? ad.getRemoteDevice(mac) : null;
-                if (bt == null) throw new RuntimeException("не задан mac");
+                // Пустой mac — ИСКАТЬ СПАРЕННЫЙ, а не падать.
+                //
+                // Подсказка на экране настроек обещает ровно это («пусто —
+                // искать сохранённый»), и поиск давно есть в BtLinkActivity,
+                // но сюда перенесён не был. Прогон, запущенный кнопкой с
+                // телефона, extras не передаёт вовсе — то есть на чистой
+                // установке единственный путь через интерфейс кончался
+                // падением ПОСЛЕ восьмисекундного отсчёта, когда наблюдатель
+                // уже отошёл и встал в кадр.
+                BluetoothDevice bt = null;
+                if (mac != null && !mac.isEmpty()) {
+                    bt = ad.getRemoteDevice(mac);
+                } else {
+                    for (BluetoothDevice d : ad.getBondedDevices())
+                        if ("SurfTracker-Link".equals(d.getName())) bt = d;
+                }
+                if (bt == null) throw new RuntimeException(
+                        "мотор не найден: mac не задан и среди спаренных нет SurfTracker-Link");
                 sock = bt.createInsecureRfcommSocketToServiceRecord(SPP);
                 ad.cancelDiscovery();
                 sock.connect();
@@ -1043,7 +1091,31 @@ public class TrackActivity extends Activity {
                     try {
                         if (!fdry) {
                             int q = sq & 0x7F;
-                            ProtoV2.buildReq(sreq, q, wCmd, 0.0f);
+                            // ПРОТУХШАЯ УСТАВКА -> НОЛЬ.
+                            //
+                            // Без этой проверки поток слал последнее число 10
+                            // раз в секунду, не глядя на его возраст. Сторож
+                            // прошивки тут не помогает: он ловит «нет КАДРА
+                            // дольше 300 мс», а кадры идут исправно — просто с
+                            // несвежей командой. То есть при остановке зрения
+                            // (отказ камеры, голодание ImageReader) вал
+                            // продолжал бы крутиться с последней уставкой до
+                            // конца заказанной длительности.
+                            //
+                            // Поля wCmdNs и staleZeros для этого и заводились,
+                            // но wCmdNs не читался НИГДЕ, а staleZeros не рос
+                            // ни разу — в каждом прогоне в отчёт уходил ноль,
+                            // и этот ноль выглядел доказательством, что
+                            // механизм не срабатывал, тогда как механизма не
+                            // было вовсе.
+                            float wSend = wCmd;
+                            if (wCmdNs == 0) {
+                                wSend = 0.0f;          // команды ещё не было
+                            } else if (System.nanoTime() - wCmdNs > STALE_NS) {
+                                if (wSend != 0.0f) staleZeros++;
+                                wSend = 0.0f;
+                            }
+                            ProtoV2.buildReq(sreq, q, wSend, 0.0f);
                             sendNs[q] = System.nanoTime();
                             fos.write(sreq); fos.flush();
                             sq++;
@@ -1061,7 +1133,7 @@ public class TrackActivity extends Activity {
                                         sendNs[t.seq] = 0;
                                     }
                                     lastStatus = t.status; lastTheta = t.theta; lastWRamp = t.wRamp;
-                                    telCount++;
+                                    telCount++; telNs = System.nanoTime();
                                     int stt = t.status;
                                     if ((stt & ProtoV2.ST_WATCHDOG) != 0) bWd++;
                                     if ((stt & ProtoV2.ST_EXTRAP_CAP) != 0) bCap++;
@@ -1409,7 +1481,13 @@ public class TrackActivity extends Activity {
                 // из другого потока: те живут в стеке петли и снаружи не видны.
                 uiTicks = frames; uiHits = hits;
                 uiTracking = !flow && trk.status == Tracker.TRACKING;
-                uiLink = gotTel;
+                // Связь на экране — по свежести телеметрии, а не по
+                // счётчику. telCount монотонен: после первого же пакета
+                // «мотор на связи» горело бы до конца прогона, даже если
+                // поток отправки давно выпал по ошибке сокета. Наблюдатель
+                // вернулся бы с уверенностью, что прогон состоялся, а вал
+                // стоял по сторожу с середины записи.
+                uiLink = telNs != 0 && (System.nanoTime() - telNs) < 1_000_000_000L;
 
                 // Итог копится здесь же, по тем же величинам, что ушли в лог.
                 if (!flow) {
@@ -1428,7 +1506,10 @@ public class TrackActivity extends Activity {
             // ВОЗВРАТ В ИСХОДНОЕ. Простой П-регулятор по углу: ошибка берётся
             // из телеметрии, команда ограничена как обычная уставка. Идём
             // медленно (0.12 рад/с) — ниже полосы раскачки 0.20-0.30.
-            if (home && !dry && !Float.isNaN(homeTheta)) {
+            // Просьба об остановке отменяет и ВОЗВРАТ: иначе нажатие посреди
+            // прогона выводило петлю прямо сюда, и вал ехал ещё до 26 секунд —
+            // ровно тогда, когда человек нажал «Остановить», чтобы он встал.
+            if (home && !dry && !stopRequested && !Float.isNaN(homeTheta)) {
                 // Пауза перед возвратом. Главный цикл кончился, команда упала в
                 // ноль, но вал ещё катится по инерции — и детектор срыва видит
                 // расхождение угла с интегралом команды. Это штатный
@@ -1449,7 +1530,7 @@ public class TrackActivity extends Activity {
                 long prevNs = System.nanoTime();
                 int telAt = telCount;
                 long telSeenNs = System.nanoTime();
-                while ((System.nanoTime() - th0) / 1e9 < 25.0) {
+                while (!stopRequested && (System.nanoTime() - th0) / 1e9 < 25.0) {
                     if (telCount != telAt) { telAt = telCount; telSeenNs = System.nanoTime(); }
                     if ((System.nanoTime() - telSeenNs) > 300_000_000L) { hstat = "нет_телеметрии"; break; }
                     // Ворота срабатывают по ТРЁМ подряд плохим кадрам, а не по
@@ -1489,16 +1570,32 @@ public class TrackActivity extends Activity {
             // Остановить вал ЯВНО. Полагаться на сторож нельзя: он сработает,
             // но через 300 мс и с поднятым битом, то есть штатный выход
             // выглядел бы как отказ связи.
+            //
+            // Отказ этой отправки НЕ должен уносить с собой итог прогона.
+            // Прежде она стояла в общем try, и обрыв связи на последних
+            // секундах (а связь чаще всего и рвётся к концу, на нагретом
+            // модуле) означал переход в catch: в прогон.json не попадал ключ
+            // «тактов», и карточка рисовала красное «ПРОГОН НЕ СОСТОЯЛСЯ»
+            // рядом с логом на девять тысяч строк и пятиминутным видео.
             if (!dry) {
-                byte[] stopReq = new byte[ProtoV2.REQ_LEN];
-                for (int i = 0; i < 5; i++) {
-                    ProtoV2.buildReq(stopReq, i & 0x7F, 0.0f, 0.0f);
-                    os.write(stopReq); os.flush();
-                    Thread.sleep(60);
+                try {
+                    byte[] stopReq = new byte[ProtoV2.REQ_LEN];
+                    for (int i = 0; i < 5; i++) {
+                        ProtoV2.buildReq(stopReq, i & 0x7F, 0.0f, 0.0f);
+                        os.write(stopReq); os.flush();
+                        Thread.sleep(60);
+                    }
+                } catch (Throwable t) {
+                    Log.e(TAG, "остановка вала: " + t);
+                    j.append(",\"остановка_вала\":\"")
+                     .append(String.valueOf(t).replace('"', '\'')).append("\"");
                 }
             }
 
-            java.util.Collections.sort(lat);
+            // Под замком: список пополняет поток отправки, и сортировка без
+            // синхронизации давала ConcurrentModificationException — а он
+            // уносил итог тем же путём, что и обрыв связи.
+            synchronized (lat) { java.util.Collections.sort(lat); }
             j.append(",\"кадров\":").append(frames).append(",\"с_целью\":").append(hits)
              .append(",\"без_цели\":").append(misses)
              .append(",\"доля_с_целью\":").append(frames > 0 ? fmt(hits / (double) frames) : "0")
@@ -1560,6 +1657,7 @@ public class TrackActivity extends Activity {
             // ровно так же, как работающий, — отсюда «кстати, горячо и
             // включено» уже после конца.
             uiDone = true;
+            uiStopped = stopRequested;
             // Последняя реплика суфлёра («Один» из отсчёта) висела на экране
             // после конца прогона и читалась как состояние.
             final android.widget.TextView sv2 = statusView;
@@ -1711,8 +1809,23 @@ public class TrackActivity extends Activity {
         }
 
         String s(String k) { return RunSettings.resolve(intent, saved, k); }
-        int i(String k) { return RunSettings.asInt(s(k), 0); }
-        float f(String k) { return RunSettings.asFloat(s(k), 0f); }
+        // Резерв — УМОЛЧАНИЕ ИЗ SPEC, а не ноль.
+        //
+        // При нуле мусорное значение («--es sign ""», юникодный минус в поле
+        // «Знак») давало sign=0 или K=0, то есть w = sign*K*ошибка тождественно
+        // ноль на каждом такте: цель ведётся, лог пишется, «ok»:true — а вал не
+        // трогается ни разу. Отказ, который на экране выглядит как успешный
+        // прогон. С резервом из SPEC мусор откатывается на рабочее значение.
+        int i(String k) {
+            RunSettings.Item it = RunSettings.find(k);
+            int def = (it == null) ? 0 : RunSettings.asInt(it.def, 0);
+            return RunSettings.asInt(s(k), def);
+        }
+        float f(String k) {
+            RunSettings.Item it = RunSettings.find(k);
+            float def = (it == null) ? 0f : RunSettings.asFloat(it.def, 0f);
+            return RunSettings.asFloat(s(k), def);
+        }
         boolean b(String k) { return RunSettings.asBool(s(k)); }
     }
 

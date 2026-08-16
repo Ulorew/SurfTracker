@@ -18,9 +18,10 @@ for m in "интент-игнорируется:s/if (intent != null \&\& intent
   M="$D/$name"; mkdir -p "$M/com/surftracker/camfps"
   sed "$expr" "$SRC/com/surftracker/camfps/RunSettings.java" \
       > "$M/com/surftracker/camfps/RunSettings.java"
-  "$JAVAC" -encoding UTF-8 -d "$M/cls" -cp "$M" RunSettingsCheck.java \
-      "$M/com/surftracker/camfps/RunSettings.java" 2>/dev/null || {
-      echo "  порча '$name' не компилируется — пропущена"; continue; }
+  "$JAVAC" -encoding UTF-8 -d "$M/cls" -cp "$M:$SRC" RunSettingsCheck.java \
+      "$M/com/surftracker/camfps/RunSettings.java" || {
+      echo "  ПОРЧА '$name' НЕ ПРИМЕНИЛАСЬ (не компилируется) — стенд не проверил её";
+      fails=$((fails+1)); continue; }
   if "$JAVA" -Dfile.encoding=UTF-8 -cp "$M/cls" RunSettingsCheck >/dev/null 2>&1; then
     echo "  ПОРЧА '$name' НЕ ПОЙМАНА"; fails=$((fails+1))
   else echo "  порча '$name' поймана"; fi

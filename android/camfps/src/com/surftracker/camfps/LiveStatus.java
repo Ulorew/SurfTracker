@@ -39,6 +39,7 @@ public final class LiveStatus {
                             ОТКАЗ = 0xFF4A1E1E;
 
     public static int color(boolean done, int ticks, boolean tracking, String error) {
+        if (done && ticks == 0 && error == null) return ОТКАЗ;   // ноль тактов — не успех
         // Отказ проверяется ПЕРВЫМ. Упавший прогон уже показывал зелёное
         // «ГОТОВО»: наблюдатель, вернувшись, читал успех там, где камера
         // вообще не открылась.
@@ -58,7 +59,8 @@ public final class LiveStatus {
      */
     public static String text(boolean done, int ticks, int hits, int loss,
                               boolean tracking, boolean dry, boolean link,
-                              boolean rec, long leftMs, String error) {
+                              boolean rec, long leftMs, String error,
+                              boolean stopped) {
         if (error != null) {
             // Причина — коротко и первой строкой после слова «ОТКАЗ».
             // Полное исключение уходит в прогон.json; на экране с трёх метров
@@ -66,8 +68,20 @@ public final class LiveStatus {
             return "ОТКАЗ\n" + shortError(error)
                     + (ticks > 0 ? ("\nуспело " + ticks + " тактов") : "\nне начался");
         }
+        if (done && ticks == 0) {
+            // Ноль тактов — это НЕ успешный прогон.
+            //
+            // Прежде экран говорил «ГОТОВО / 0 тактов, на цели 0% / можно
+            // подходить»: нажали «Остановить» до старта, человек в кадре
+            // прочитал успех и ушёл. Карточка прогона на тех же данных
+            // говорит «ПРОГОН НЕ СОСТОЯЛСЯ» — два места одного проекта
+            // давали противоположный вердикт.
+            return (stopped ? "ОСТАНОВЛЕНО" : "ПРОГОН НЕ СОСТОЯЛСЯ")
+                    + "\nни одного такта\nподойдите и посмотрите";
+        }
         if (done) {
-            return "ГОТОВО\n" + ticks + " тактов, на цели " + percent(hits, ticks) + "%"
+            return (stopped ? "ОСТАНОВЛЕНО" : "ГОТОВО")
+                    + "\n" + ticks + " тактов, на цели " + percent(hits, ticks) + "%"
                     + ", потерь " + loss + "\nможно подходить";
         }
         // До первого такта показывать нечего: камера ещё поднимается, и любая

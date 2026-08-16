@@ -18,9 +18,10 @@ for m in "секунд-вместо-факта:s|\"длительность_с\"
   M="$D/mut_$name"; mkdir -p "$M/com/surftracker/camfps"
   sed "$sed_expr" "$SRC/com/surftracker/camfps/RunJson.java" \
       > "$M/com/surftracker/camfps/RunJson.java"
-  "$JAVAC" -encoding UTF-8 -d "$M/cls" -cp "$M" RunJsonCheck.java \
-      "$M/com/surftracker/camfps/RunJson.java" 2>/dev/null || {
-      echo "  порча '$name' не компилируется — пропущена"; continue; }
+  "$JAVAC" -encoding UTF-8 -d "$M/cls" -cp "$M:$SRC" RunJsonCheck.java \
+      "$M/com/surftracker/camfps/RunJson.java" || {
+      echo "  ПОРЧА '$name' НЕ ПРИМЕНИЛАСЬ (не компилируется) — стенд не проверил её";
+      fails=$((fails+1)); continue; }
   if "$JAVA" -Dfile.encoding=UTF-8 -cp "$M/cls" RunJsonCheck >/dev/null 2>&1; then
     echo "  ПОРЧА '$name' НЕ ПОЙМАНА"; fails=$((fails+1))
   else
