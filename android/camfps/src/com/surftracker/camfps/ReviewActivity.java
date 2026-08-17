@@ -72,7 +72,7 @@ public class ReviewActivity extends Activity {
         if (shown >= model.ticks.size() - 1) { playing = false; play.setText("▶"); return; }
         request(shown + 1);
     }
-    private File dir;
+    private File dir, framesDir;
 
     @Override
     protected void onCreate(Bundle b) {
@@ -122,21 +122,35 @@ public class ReviewActivity extends Activity {
             caption.setText("Разбирать нечего: " + (model.error != null ? model.error : "лог пуст"));
             return;
         }
-        if (!video.exists()) {
-            // Прогон без записи — обычное дело, и это не ошибка. Но и рисовать
-            // поверх нечего, поэтому говорим прямо, а не показываем чёрный экран.
-            caption.setText("Видео не писалось — разбирать можно только числа.\n"
-                    + "Тактов в логе: " + model.ticks.size()
-                    + ", потерь: " + model.losses.size());
-            return;
-        }
+        // КАДРЫ МОДЕЛИ — самостоятельный источник разбора.
+        //
+        // Прежде экран выходил здесь, если нет видео, и прогон, снятый ради
+        // кадров модели, показывал «видео не писалось» вместо разбора. А
+        // именно кадры модели и есть точный источник: рамка ложится на них по
+        // построению, без привязки ко времени видео.
+        framesDir = new File(dir, "frames");
+        if (!framesDir.isDirectory()) framesDir = new File(dir, "кадры");
+        boolean haveFrames = framesDir.isDirectory()
+                && framesDir.list() != null && framesDir.list().length > 0;
 
-        try {
-            mmr = new MediaMetadataRetriever();
-            mmr.setDataSource(video.getAbsolutePath());
-        } catch (Throwable t) {
-            caption.setText("Видео не открылось: " + LiveStatus.shortError(String.valueOf(t)));
-            mmr = null;
+        if (video.exists()) {
+            try {
+                mmr = new MediaMetadataRetriever();
+                mmr.setDataSource(video.getAbsolutePath());
+            } catch (Throwable t) {
+                mmr = null;
+                if (!haveFrames) {
+                    caption.setText("Видео не открылось: "
+                            + LiveStatus.shortError(String.valueOf(t)));
+                    return;
+                }
+            }
+        } else if (!haveFrames) {
+            caption.setText("Ни видео, ни кадров модели — разбирать можно только числа.\n"
+                    + "Тактов в логе: " + model.ticks.size()
+                    + ", потерь: " + model.losses.size()
+                    + "\n\nЧтобы разбирать картинку, включите «Писать кадры модели»"
+                    + " или «Писать видео» в настройках.");
             return;
         }
 
@@ -189,7 +203,8 @@ public class ReviewActivity extends Activity {
      * ещё пять секунд после того, как палец убран.
      */
     private void request(int idx) {
-        if (model == null || !model.usable() || mmr == null) return;
+        if (model == null || !model.usable()) return;
+        if (mmr == null && framesDir == null) return;
         final int i = Math.max(0, Math.min(model.ticks.size() - 1, idx));
         pending = i;
         bar.setProgress(i);
@@ -207,11 +222,9 @@ public class ReviewActivity extends Activity {
             // (сдвиг цели до 189 px за такт) — рамка ровно на человеке, тогда
             // как поверх видеозаписи она в тех же тактах отставала. Значит
             // отставание жило в привязке к видео, а не в зрении.
-            File mf = new File(dir, String.format(java.util.Locale.US,
-                    "frames/%05d.jpg", t.i));
-            if (!mf.exists()) mf = new File(dir, String.format(java.util.Locale.US,
-                    "кадры/%05d.jpg", t.i));
-            if (mf.exists()) {
+            File mf = (framesDir == null) ? null
+                    : new File(framesDir, String.format(java.util.Locale.US, "%05d.jpg", t.i));
+            if (mf != null && mf.exists()) {
                 try { frame = android.graphics.BitmapFactory.decodeFile(mf.getAbsolutePath()); }
                 catch (Throwable ignored) {}
                 if (frame != null) {
@@ -243,6 +256,19 @@ public class ReviewActivity extends Activity {
                 frame = mmr.getFrameAtTime(model.videoMs(t) * 1000L,
                         MediaMetadataRetriever.OPTION_CLOSEST);
             } catch (Throwable ignored) {}
+            if (mmr == null) {
+                // Кадра модели на этот такт нет, а видео не писалось: сказать
+                // прямо, а не показывать прошлый кадр как нынешний.
+                final String capN = ReviewModel.caption(t, want, model.ticks.size())
+                        + "\nкадра модели на этот такт нет";
+                ui.post(() -> {
+                    if (pending != want) return;
+                    shown = want;
+                    caption.setText(capN);
+                    if (playing) player.postDelayed(this::step, 60);
+                });
+                return;
+            }
             final Bitmap drawn = (frame == null) ? null : overlay(frame, t);
             final String cap = ReviewModel.caption(t, want, model.ticks.size())
                     + (model.noWinY ? "\n(старый лог: вертикаль окна неизвестна)" : "")
