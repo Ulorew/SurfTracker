@@ -254,6 +254,11 @@ public class TrackActivity extends Activity {
     /** Сколько раз цель взята КРАЙНЕЙ мерой — по уверенности. В run.json. */
     volatile int reseeds = 0;
     long lastHitMs = 0, lastCueMs = 0, runStartMs = 0;
+    /** Поиск вращением: угол начала, направление, скорость и полусектор. */
+    double searchBase = Double.NaN;
+    int searchDir = 1;
+    static final double SEARCH_SPEED = 0.15;                     // рад/с, медленно
+    static final double SEARCH_SPAN_RAD = Math.toRadians(60.0);  // полусектор
 
     /**
      * Угол вала на заданный момент, рад.
@@ -514,6 +519,7 @@ public class TrackActivity extends Activity {
         // возврат невозможным.
         float coast = cfg.f("coast");
         boolean syncOn = cfg.b("sync");
+        boolean searchOn = cfg.b("search");
 
         // РАСШИРЕНИЕ ОКНА ПРИ ДОЛГОЙ ПОТЕРЕ. Окно слежения сужает поле зрения
         // ради разрешения; когда цели нет давно, разрешение уже не нужно, нужен
@@ -1504,6 +1510,27 @@ public class TrackActivity extends Activity {
                     // Тот же дефект уже описан в проекте для питоновского
                     // трекера (reports/КРИТИЧЕСКИЙ_ДЕФЕКТ_ОКНО.md), и здесь он
                     // был повторён заново.
+                    // ПОИСК ВРАЩЕНИЕМ, пока цель не найдена НИ РАЗУ.
+                    //
+                    // Развёртка пилой двигает только вырезку внутри кадра —
+                    // если человек вне поля зрения вовсе, она не поможет. Два
+                    // прогона 17 августа сняли пустую стену от начала до
+                    // конца: камера смотрела мимо, и узнать это можно было
+                    // только потом.
+                    //
+                    // Сектор ограничен, и отсчитывается он от угла, на котором
+                    // поиск начался: неограниченное вращение намотало бы
+                    // кабель. Направление меняется на краю сектора.
+                    if (searchOn && !dry && hits == 0 && !flow
+                            && (System.currentTimeMillis() - runStartMs) > 6000) {
+                        double now = thetaAt(System.nanoTime());
+                        if (Double.isNaN(searchBase)) {
+                            searchBase = now;
+                            say("Ищу цель");
+                        }
+                        if (Math.abs(now - searchBase) > SEARCH_SPAN_RAD) searchDir = -searchDir;
+                        w = searchDir * SEARCH_SPEED;
+                    }
                     // ОКНО ТРЕКЕРА ПРИМЕНЯЕТСЯ И НА ПРОМАХЕ.
                     //
                     // Прежде winCx/winCy/Sc присваивались ТОЛЬКО в ветке

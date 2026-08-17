@@ -36,7 +36,7 @@ public class RunSettingsCheck {
     static final String[][] WAS = {
         {"seconds", "60"}, {"side", "1280"}, {"k", "1.2"}, {"sign", "-1"},
         {"dry", "false"}, {"coast", "0.4"}, {"relost", "1.5"}, {"dwell", "0.18"},
-        {"home", "true"}, {"rec", "false"}, {"video", "false"},
+        {"rec", "false"}, {"video", "false"},
         {"model", "person_w8a32.tflite"}, {"threads", "1"}, {"xnn", "false"},
         {"tag", ""}, {"mac", ""}, {"scen", ""},
     };
@@ -48,6 +48,15 @@ public class RunSettingsCheck {
             if (i == null) { failed++; System.out.println("  ПЛОХО нет параметра " + w[0]); continue; }
             eq(w[0], i.def, w[1]);
         }
+
+        System.out.println("== умолчания, изменённые НАМЕРЕННО ==");
+        // Возврат в исходное был true. Выключен решением владельца 17 августа:
+        // он приводил камеру в угол ПЕРВОГО прогона, а не туда, где ходит
+        // человек, и следующий прогон начинался вслепую — два прогона подряд
+        // сняли пустую стену. Проверка держит новое значение: молчаливый
+        // возврат к true вернул бы то же поведение.
+        eq("возврат выключен", RunSettings.find("home").def, "false");
+        eq("поиск вращением включён", RunSettings.find("search").def, "true");
 
         System.out.println("== правило разрешения ==");
         Map1 intent = new Map1().put("seconds", "180").put("k", "2.0");
@@ -105,7 +114,7 @@ public class RunSettingsCheck {
                 failed++; System.out.println("  ПЛОХО умолчание " + i.key + " не число");
             }
         }
-        eq("параметров на экране", RunSettings.SPEC.length, 20);
+        eq("параметров на экране", RunSettings.SPEC.length, 21);
 
         System.out.println("== defaults: команда может потребовать умолчания ==");
         // Команды с ноутбука передают 5-7 ключей из двадцати; для остальных
