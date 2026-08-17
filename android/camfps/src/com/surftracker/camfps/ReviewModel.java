@@ -166,6 +166,24 @@ public final class ReviewModel {
         return videoOffsetMs + (t.tFrameMs >= 0 ? t.tFrameMs : t.tMs);
     }
 
+    /**
+     * Вырезка, из которой получен кадр такта: {x0, y0, масштаб}.
+     *
+     * Строится по плану ПРЕДЫДУЩЕГО такта: winCx/winCy/Sc в строке n — это уже
+     * план на n+1, а кадр такта n вырезан по плану, посчитанному на n-1.
+     * Ошибиться здесь значит нарисовать рамку рядом с целью и списать это на
+     * трекер.
+     */
+    public double[] cropOf(int idx, int frameW, int frameH) {
+        Tick p = ticks.get(idx > 0 ? idx - 1 : idx);
+        double sc = p.win;
+        if (sc <= 0) return null;
+        double scale = sc / 640.0;
+        double x0 = Math.max(0, Math.min(frameW - sc, p.winCx - sc / 2));
+        double y0 = Math.max(0, Math.min(frameH - sc, (p.winCy >= 0 ? p.winCy : frameH / 2.0) - sc / 2));
+        return new double[]{ x0, y0, scale };
+    }
+
     /** Ближайший такт к моменту видео. Список отсортирован по времени. */
     public int tickAtVideoMs(long ms) {
         if (ticks.isEmpty()) return -1;

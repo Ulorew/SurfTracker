@@ -199,6 +199,35 @@ public class ReviewActivity extends Activity {
             if (want != i) return;            // уже запросили другой — этот не нужен
             ReviewModel.Tick t = model.ticks.get(want);
             Bitmap frame = null;
+            // КАДР МОДЕЛИ, если он записан.
+            //
+            // Это тот самый кадр, по которому получена детекция: рамка ложится
+            // на него точно по построению, без привязки ко времени видео.
+            // Проверено 17 августа на четырёх тактах с самым резким движением
+            // (сдвиг цели до 189 px за такт) — рамка ровно на человеке, тогда
+            // как поверх видеозаписи она в тех же тактах отставала. Значит
+            // отставание жило в привязке к видео, а не в зрении.
+            File mf = new File(dir, String.format(java.util.Locale.US,
+                    "frames/%05d.jpg", t.i));
+            if (!mf.exists()) mf = new File(dir, String.format(java.util.Locale.US,
+                    "кадры/%05d.jpg", t.i));
+            if (mf.exists()) {
+                try { frame = android.graphics.BitmapFactory.decodeFile(mf.getAbsolutePath()); }
+                catch (Throwable ignored) {}
+                if (frame != null) {
+                    final Bitmap drawnM = overlayModelFrame(frame, t, want);
+                    final String capM = ReviewModel.caption(t, want, model.ticks.size())
+                            + "\nкадр модели (то, что видела сеть)";
+                    ui.post(() -> {
+                        if (pending != want) return;
+                        shown = want;
+                        image.setImageBitmap(drawnM);
+                        caption.setText(capM);
+                        if (playing) player.postDelayed(this::step, 60);
+                    });
+                    return;
+                }
+            }
             try {
                 // OPTION_CLOSEST, а НЕ OPTION_CLOSEST_SYNC.
                 //
@@ -226,6 +255,44 @@ public class ReviewActivity extends Activity {
                 if (playing) player.postDelayed(this::step, 60);
             });
         });
+    }
+
+    /**
+     * Наложение на КАДР МОДЕЛИ. Координаты переводятся в тензорные по той же
+     * вырезке, из которой кадр и получен, — пересчёта времени здесь нет вовсе.
+     */
+    private Bitmap overlayModelFrame(Bitmap src, ReviewModel.Tick t, int idx) {
+        Bitmap bm = src.copy(Bitmap.Config.ARGB_8888, true);
+        Canvas c = new Canvas(bm);
+        double[] cr = model.cropOf(idx, model.sensorW, model.sensorH);
+        if (cr == null) return bm;
+        double n = bm.getWidth();
+        Paint p = new Paint();
+        p.setStyle(Paint.Style.STROKE);
+        p.setAntiAlias(true);
+        p.setStrokeWidth((float) Math.max(2, n / 160));
+        if (!Double.isNaN(t.cx)) {
+            double tx = (t.cx - cr[0]) / cr[2], ty = (t.cy - cr[1]) / cr[2];
+            double hw = (Double.isNaN(t.bw) ? t.size : t.bw) / cr[2] / 2;
+            double hh = (Double.isNaN(t.bh) ? t.size : t.bh) / cr[2] / 2;
+            p.setColor(!Double.isNaN(t.conf) && t.conf < 0.35 ? Color.YELLOW
+                       : (t.tracking ? Color.GREEN : Color.RED));
+            c.drawRect((float) (tx - hw), (float) (ty - hh),
+                       (float) (tx + hw), (float) (ty + hh), p);
+        } else {
+            // Детекции нет — показываем предсказание, и показываем иначе.
+            double px = (t.winCx - cr[0]) / cr[2];
+            double py = ((t.winCy >= 0 ? t.winCy : model.sensorH / 2.0) - cr[1]) / cr[2];
+            double h = (Double.isNaN(t.filtSize) ? t.win / 8.0 : t.filtSize) / cr[2] / 2;
+            p.setColor(0xFF4FC3F7);
+            p.setPathEffect(new android.graphics.DashPathEffect(
+                    new float[]{ (float) (n / 40), (float) (n / 60) }, 0));
+            c.drawRect((float) (px - h), (float) (py - h), (float) (px + h), (float) (py + h), p);
+            c.drawLine((float) (px - h), (float) py, (float) (px + h), (float) py, p);
+            c.drawLine((float) px, (float) (py - h), (float) px, (float) (py + h), p);
+            p.setPathEffect(null);
+        }
+        return bm;
     }
 
     /**
