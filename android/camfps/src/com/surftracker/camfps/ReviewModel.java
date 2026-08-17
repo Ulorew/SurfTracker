@@ -31,6 +31,7 @@ public final class ReviewModel {
         public int misses;
         public int cand;                // сколько кандидатов было в окне
         public double errDeg, w;
+        public double conf = Double.NaN;   // уверенность выбранной детекции
     }
 
     public final List<Tick> ticks = new ArrayList<>();
@@ -84,7 +85,7 @@ public final class ReviewModel {
         int cBw = col(head, "ширина_детекции"), cBh = col(head, "высота_детекции");
         int cSc = col(head, "Sc"), cWin = col(head, "winCx"), cWinY = col(head, "winCy");
         int cSt = col(head, "состояние"), cMiss = col(head, "промахов");
-        int cCand = col(head, "кандидатов");
+        int cCand = col(head, "кандидатов"), cConf = col(head, "conf");
         int cErr = col(head, "ошибка_град"), cW = col(head, "ω_уставка");
         if (cT < 0 || cSc < 0) {
             m.error = "в логе нет колонок t_ms/Sc — это не лог слежения";
@@ -119,6 +120,7 @@ public final class ReviewModel {
             else t.winCy = inum(f, cWinY, -1);
             t.misses = inum(f, cMiss, 0);
             t.cand = inum(f, cCand, 0);
+            t.conf = (cConf >= 0) ? num(f, cConf) : Double.NaN;
             t.errDeg = num(f, cErr); t.w = num(f, cW);
             // Состояние пишется словом: «вед» или «потеря».
             t.tracking = cSt >= 0 && cSt < f.length && f[cSt].trim().startsWith("вед");
@@ -219,6 +221,9 @@ public final class ReviewModel {
         if (t.misses > 0) s.append("   промахов подряд ").append(t.misses);
         s.append("\nокно ").append(t.win).append(" px");
         if (!Double.isNaN(t.size)) s.append("   цель ").append(Math.round(t.size)).append(" px");
+        if (!Double.isNaN(t.conf))
+            s.append("   уверенность ").append(String.format(java.util.Locale.US, "%.2f", t.conf))
+             .append(t.conf < 0.35 ? "  СЛАБАЯ" : "");
         if (!Double.isNaN(t.errDeg))
             s.append("\nошибка ").append(String.format(java.util.Locale.US, "%.1f", t.errDeg))
              .append("°   уставка ").append(String.format(java.util.Locale.US, "%.2f", t.w));

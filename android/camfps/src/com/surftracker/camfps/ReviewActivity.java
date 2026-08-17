@@ -265,7 +265,13 @@ public class ReviewActivity extends Activity {
                                               : model.toViewX(t.bw / 2.0, vw);
             double halfH = Double.isNaN(t.bh) ? model.toViewX(t.size / 2.0, vw)
                                               : model.toViewX(t.bh / 2.0, vw);
-            p.setColor(t.tracking ? Color.GREEN : Color.RED);
+            // Слабая детекция — ЖЁЛТЫМ. При уверенности около 0.3 модель
+            // регулярно находит «цель» на смятом покрывале, когда человек ушёл
+            // из кадра: рамка при этом выглядит как обычная, и разбор
+            // принимает её за цель. Порог 0.35 — тот же, по которому работает
+            // затравка крайней меры.
+            p.setColor(!Double.isNaN(t.conf) && t.conf < 0.35 ? Color.YELLOW
+                       : (t.tracking ? Color.GREEN : Color.RED));
             p.setStrokeWidth((float) Math.max(3, vw / 250));
             c.drawRect((float) (bx - halfX), (float) (by - halfH),
                        (float) (bx + halfX), (float) (by + halfH), p);
