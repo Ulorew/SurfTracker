@@ -107,6 +107,18 @@ public class RunSettingsCheck {
         }
         eq("параметров на экране", RunSettings.SPEC.length, 20);
 
+        System.out.println("== измеренные величины ==");
+        // Поле зрения — ИЗМЕРЕНО, а не взято у камеры. Два прогона режимом
+        // flow 17 августа дали 84.3 и 87.2; умолчание 86 — середина. Проверка
+        // держит его в измеренных пределах: тихая замена на камерные 72.9
+        // вернула бы петле недооценку угловой ошибки на 18%.
+        RunSettings.Item fov = RunSettings.find("fov");
+        double v = RunSettings.asFloat(fov.def, -1);
+        boolean inRange = v >= 84.0 && v <= 88.0;
+        if (!inRange) { failed++; System.out.println("  ПЛОХО поле зрения " + v
+                + " вне измеренных пределов 84..88"); }
+        else System.out.println("  ok   поле зрения по умолчанию " + v + " (измерено 84.3 и 87.2)");
+
         System.out.println();
         if (failed == 0) System.out.println("ИТОГ: настройки прогона исправны");
         else { System.out.println("ИТОГ: " + failed + " ПРОВЕРОК ПРОВАЛЕНО"); System.exit(1); }

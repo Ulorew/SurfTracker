@@ -72,6 +72,32 @@ public class RunsActivity extends Activity {
                 new android.content.Intent(this, SettingsActivity.class))));
         root.addView(top);
 
+        // КАЛИБРОВКА — с телефона, без ноутбука.
+        //
+        // Поле зрения, которое сообщает камера, занижено на 18% (измерено), и
+        // величина уже дважды менялась со сменой режима потока — значит её
+        // надо перемерять, а не считать константой. Пока этот прогон
+        // запускался только командой с ноутбука, в поле он был недоступен, а
+        // трижды подряд вместо него по ошибке запускалось обычное слежение.
+        LinearLayout top2 = new LinearLayout(this);
+        top2.setOrientation(LinearLayout.HORIZONTAL);
+        top2.addView(bigButton("КАЛИБРОВКА ПОЛЯ ЗРЕНИЯ", v -> startActivity(
+                new android.content.Intent(this, TrackActivity.class)
+                        .putExtra("flow", true)
+                        .putExtra("spin", 0.12f)
+                        .putExtra("seconds", 40)
+                        .putExtra("video", false)
+                        .putExtra("home", true)
+                        .putExtra("tag", "калибровка"))));
+        root.addView(top2);
+
+        TextView calHint = new TextView(this);
+        calHint.setTextSize(15);
+        calHint.setPadding(0, 6, 0, 0);
+        calHint.setText("Калибровка: наведите на неподвижную сцену с фактурой, "
+                + "нажмите СТАРТ и уйдите из кадра. Человек не нужен и мешает.");
+        root.addView(calHint);
+
         TextView head = new TextView(this);
         head.setTextSize(30);
         head.setPadding(0, 30, 0, 0);
