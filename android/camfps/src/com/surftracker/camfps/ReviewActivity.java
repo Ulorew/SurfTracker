@@ -277,6 +277,30 @@ public class ReviewActivity extends Activity {
                        (float) (bx + halfX), (float) (by + halfH), p);
         }
 
+        // ТАКТ БЕЗ ДЕТЕКЦИИ: показываем ПРЕДСКАЗАНИЕ, и показываем иначе.
+        //
+        // Прежде на таком такте не рисовалось ничего, и человек видел только
+        // окно — а оно движется по инерции экстраполяции. Читалось это как
+        // «рамка цели отстала», хотя рамки цели в этот момент нет вовсе.
+        // Пунктир и синий цвет: домысел не должен выглядеть как измерение.
+        if (Double.isNaN(t.cx) && t.win > 0) {
+            double px = model.toViewX(t.winCx, vw);
+            double py = (t.winCy >= 0) ? model.toViewY(t.winCy, vh) : vh / 2;
+            double ph = Double.isNaN(t.filtSize) ? model.toViewX(t.win / 8.0, vw)
+                                                 : model.toViewX(t.filtSize / 2.0, vw);
+            p.setColor(0xFF4FC3F7);
+            p.setStrokeWidth((float) Math.max(3, vw / 300));
+            p.setPathEffect(new android.graphics.DashPathEffect(
+                    new float[]{ (float) (vw / 60), (float) (vw / 90) }, 0));
+            c.drawRect((float) (px - ph), (float) (py - ph),
+                       (float) (px + ph), (float) (py + ph), p);
+            // Перекрестье в центре: пунктирный прямоугольник на пёстром фоне
+            // теряется, а суть в том, ГДЕ петля считает цель.
+            c.drawLine((float) (px - ph), (float) py, (float) (px + ph), (float) py, p);
+            c.drawLine((float) px, (float) (py - ph), (float) px, (float) (py + ph), p);
+            p.setPathEffect(null);
+        }
+
         // Центр кадра — по нему считается ошибка наведения, и без метки
         // невозможно глазами оценить, куда петля ведёт.
         p.setColor(0x88FFFF00);
