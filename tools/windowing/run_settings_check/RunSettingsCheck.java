@@ -107,6 +107,20 @@ public class RunSettingsCheck {
         }
         eq("параметров на экране", RunSettings.SPEC.length, 20);
 
+        System.out.println("== defaults: команда может потребовать умолчания ==");
+        // Команды с ноутбука передают 5-7 ключей из двадцати; для остальных
+        // прежняя гарантия «не передал = умолчание» сменилась на «что натыкано
+        // на телефоне». Ключ defaults возвращает прежнее поведение целиком.
+        Map1 intentD = new Map1().put("defaults", "true").put("seconds", "180");
+        Map1 savedD  = new Map1().put("dry", "true").put("k", "9.9").put("home", "false");
+        // с игнорированием сохранённого источник saved просто не передаётся
+        eq("dry не протечёт", RunSettings.resolve(intentD, null, "dry"), "false");
+        eq("k из умолчания", RunSettings.resolve(intentD, null, "k"), "1.2");
+        eq("home из умолчания", RunSettings.resolve(intentD, null, "home"), "true");
+        eq("переданное всё равно работает", RunSettings.resolve(intentD, null, "seconds"), "180");
+        // а БЕЗ ключа сохранённое по-прежнему в силе
+        eq("без defaults сохранённое живо", RunSettings.resolve(intentD, savedD, "dry"), "true");
+
         System.out.println("== поле зрения ==");
         // Умолчание 0 = брать у камеры. Проверено детектором на участке
         // наведения по неподвижной цели: масштаб 1.030 при камерных 72.92 и

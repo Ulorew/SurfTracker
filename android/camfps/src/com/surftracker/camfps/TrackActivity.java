@@ -251,6 +251,8 @@ public class TrackActivity extends Activity {
     volatile boolean syncEnc = true;
     /** Сколько раз синхронизация отвергнута как несуразная. В прогон.json. */
     volatile int syncSkips = 0;
+    /** Сколько раз цель взята КРАЙНЕЙ мерой — по уверенности. В run.json. */
+    volatile int reseeds = 0;
 
     /**
      * Угол вала на заданный момент, рад.
@@ -1229,7 +1231,8 @@ public class TrackActivity extends Activity {
             if (recStartNs != 0)
                 j.append(",\"видео_смещение_мс\":").append((t0 - recStartNs) / 1000000L);
             syncEnc = syncOn;
-            j.append(",\"синхронизация\":").append(syncOn);
+            j.append(",\"синхронизация\":").append(syncOn)
+             .append(",\"настройки_с_экрана\":").append(cfg.fromSaved());
             uiEndsAtMs = System.currentTimeMillis() + (long) seconds * 1000L;
             uiDry = dry; uiRec = video;
             while (!stopRequested && (System.nanoTime() - t0) / 1e9 < seconds) {
@@ -1349,35 +1352,51 @@ public class TrackActivity extends Activity {
                     // полностью видимая в кадре, но вне этого круга, не
                     // принимается никогда. Тот же дефект уже был найден в
                     // питоновском трекере и описан отдельным отчётом.
-                    boolean mayReseed = !trk.initialized
-                            || (trk.status == Tracker.LOST && lostSecNow > relost);
-                    if (mayReseed) {
-                        // Затравка: цели ещё нет, брать по близости не к чему.
-                        // Берём сильнейшую — единственный случай, когда
-                        // уверенность участвует в выборе.
-                        // Индекс 0: nms сортирует по УБЫВАНИЮ уверенности, и
-                        // первый элемент — самый уверенный.
-                        //
-                        // Прежняя строка сравнивала dets[q][2], а это РАЗМЕР:
-                        // в dets уверенности нет вовсе, nms кладёт только
-                        // центр и размер. То есть затравка бралась по самому
-                        // КРУПНОМУ объекту в кропе, а комментарий рядом
-                        // утверждал «берём сильнейшую».
-                        int b = 0;
+                    if (!trk.initialized) {
+                        // Первая затравка: цели ещё нет, брать по близости не к
+                        // чему. Берём сильнейшую — единственный случай, когда
+                        // уверенность участвует в выборе. Индекс 0: nms
+                        // сортирует по УБЫВАНИЮ уверенности.
                         if (bestC >= CONF_MIN) {
-                            trk.seed(detsPx[b][0], detsPx[b][1], detsPx[b][2]);
-                            chosenDet = b;
+                            trk.seed(detsPx[0][0], detsPx[0][1], detsPx[0][2]);
+                            chosenDet = 0;
                         }
                     } else {
-                        // Весь такт — одним вызовом. Расстояние и радиус приёма
-                        // приходят ОТТУДА ЖЕ, где принималось решение: пока их
-                        // считали здесь, два диагностических столбца успели
-                        // разойтись с логикой и врали в отчёт.
+                        // ТАКТ ТРЕКЕРА — ВСЕГДА, в том числе в потере.
+                        //
+                        // Прежде при потере дольше relost такт пропускался
+                        // целиком, и цель бралась по УВЕРЕННОСТИ: самая
+                        // уверенная детекция в кропе, без всякой проверки
+                        // близости к убеждению. У офлайнового трекера
+                        // пере-затравка возможна только для кандидата,
+                        // прошедшего REACQUIRE_MAX_DIST_FRAC, а времени потери
+                        // там нет вовсе. То есть перенесённая логика в самом
+                        // важном месте — при возврате после потери — обходилась
+                        // стороной, и камера захватывала того, кого детектор
+                        // считает увереннее.
+                        //
+                        // Хуже: при потере дольше relost порог приёма
+                        // подскакивал с DETECT_LOW_CONF=0.08 до CONF_MIN=0.35,
+                        // и цель, видимая в центре убеждения с уверенностью
+                        // 0.30 (брызги, контровой свет), отвергалась — хотя
+                        // перенесённая логика приняла бы её сразу.
                         Tracker.Tick tk = trk.step(detsPx, nDet, dtTick);
                         chosenDet = tk.chosen;
                         distToPred = tk.dist;
                         gateNow = tk.gate;
                         stepped = true;
+
+                        // Затравка по уверенности осталась КРАЙНЕЙ мерой: она
+                        // срабатывает, только если такт трекера не нашёл ничего
+                        // и потеря длится дольше relost. Без неё потеря была бы
+                        // поглощающей — цель, полностью видимая, но вне круга
+                        // приёма, не принималась бы никогда.
+                        if (chosenDet < 0 && trk.status == Tracker.LOST
+                                && lostSecNow > relost && bestC >= CONF_MIN) {
+                            trk.seed(detsPx[0][0], detsPx[0][1], detsPx[0][2]);
+                            chosenDet = 0;
+                            reseeds++;
+                        }
                     }
                 }
                 // advance только если такт НЕ прошёл через step(): внутри него
@@ -1481,6 +1500,25 @@ public class TrackActivity extends Activity {
                     // Тот же дефект уже описан в проекте для питоновского
                     // трекера (reports/КРИТИЧЕСКИЙ_ДЕФЕКТ_ОКНО.md), и здесь он
                     // был повторён заново.
+                    // ОКНО ТРЕКЕРА ПРИМЕНЯЕТСЯ И НА ПРОМАХЕ.
+                    //
+                    // Прежде winCx/winCy/Sc присваивались ТОЛЬКО в ветке
+                    // попадания, а сторона, которую трекер честно растит по
+                    // числу промахов, не читалась отсюда ни разу. Вырезка
+                    // оставалась замороженной на плане последнего попадания:
+                    // расширение окна — механизм, ради которого перенос и
+                    // делался, — до модели не доходило вовсе, и цель, ушедшая
+                    // из замороженной вырезки, физически не могла в ней
+                    // появиться.
+                    if (trk.initialized) {
+                        double sideMiss = trk.windowSide();
+                        winCx = (int) trk.planCx(dtTick, sideMiss);
+                        winCy = (int) trk.planCy(dtTick, sideMiss);
+                        Sc = (int) Math.round(sideMiss);
+                    }
+                    // Развёртка — только при ДОЛГОЙ потере: квадратное окно
+                    // накрывает максимум min(W,H)/W ширины кадра, и цель,
+                    // ушедшая вбок, иначе остаётся снаружи навсегда.
                     if (lost > relost) {
                         Sc = ScWide;
                         int span = Math.max(1, W - Sc);
@@ -1733,6 +1771,7 @@ public class TrackActivity extends Activity {
              .append(",\"телеметрии\":").append(telCount)
              .append(",\"протухших_нулей\":").append(staleZeros)
              .append(",\"синхронизация_отвергнута\":").append(syncSkips)
+             .append(",\"затравок_по_уверенности\":").append(reseeds)
              .append(",\"биты\":{\"watchdog\":").append(bWd)
              .append(",\"потолок\":").append(bCap).append(",\"рампа\":").append(bRamp)
              .append(",\"энкодер\":").append(bEnc).append(",\"кламп\":").append(bClamp)
@@ -1934,6 +1973,16 @@ public class TrackActivity extends Activity {
 
         Cfg(android.content.Intent i, android.content.SharedPreferences p) {
             final android.os.Bundle ex = (i == null) ? null : i.getExtras();
+            // --ez defaults true — ИГНОРИРОВАТЬ сохранённое на экране.
+            //
+            // Команды с ноутбука передают 5-7 ключей из двадцати, а для
+            // остальных прежняя гарантия «не передал = умолчание из кода»
+            // сменилась на «не передал = что натыкано на телефоне». Поставил в
+            // комнате «Без мотора», выехал в поле, запустил обычной командой —
+            // Bluetooth не открывается, вал стоит весь сеанс, и сказать из
+            // командной строки «игнорируй сохранённое» было нечем.
+            final boolean ignoreSaved = ex != null && ex.containsKey("defaults")
+                    && RunSettings.asBool(String.valueOf(ex.get("defaults")));
             intent = new RunSettings.Source() {
                 public boolean has(String k) { return ex != null && ex.containsKey(k); }
                 public String get(String k) {
@@ -1941,13 +1990,24 @@ public class TrackActivity extends Activity {
                     return v == null ? null : String.valueOf(v);
                 }
             };
-            saved = new RunSettings.Source() {
+            saved = ignoreSaved ? null : new RunSettings.Source() {
                 public boolean has(String k) { return p != null && p.contains(k); }
                 public String get(String k) { return p == null ? null : p.getString(k, null); }
             };
         }
 
         String s(String k) { return RunSettings.resolve(intent, saved, k); }
+
+        /** Сколько значений пришло НЕ из интента и не из умолчания, а с экрана.
+         *  В отчёт: прогон, запущенный командой, обязан показывать, что часть
+         *  чисел ему подсунул телефон. */
+        int fromSaved() {
+            int n = 0;
+            for (RunSettings.Item it : RunSettings.SPEC)
+                if (!intent.has(it.key) && saved != null && saved.has(it.key)
+                        && !RunSettings.resolve(intent, saved, it.key).equals(it.def)) n++;
+            return n;
+        }
         // Резерв — УМОЛЧАНИЕ ИЗ SPEC, а не ноль.
         //
         // При нуле мусорное значение («--es sign ""», юникодный минус в поле
