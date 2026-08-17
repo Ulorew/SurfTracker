@@ -49,6 +49,8 @@ public final class ReviewModel {
     public final List<Integer> gaps = new ArrayList<>();
     public int sensorW, sensorH, videoW, videoH;
     public long videoOffsetMs;
+    /** Сторона вырезки на НУЛЕВОМ такте: min(окно, min(W,H)) из настроек. */
+    public int startWin;
     public String error;
     /** Лог снят до появления колонки winCy: вертикаль окна неизвестна. */
     public boolean noWinY;
@@ -155,6 +157,13 @@ public final class ReviewModel {
         if (vwh != null) { m.videoW = vwh[0]; m.videoH = vwh[1]; }
         else { m.videoW = m.sensorW; m.videoH = m.sensorH; }
         m.videoOffsetMs = (long) RunJson.num(json, "видео_смещение_мс");
+        // Нулевой такт вырезан по НАЧАЛЬНЫМ значениям цикла: центр кадра и
+        // сторона min(окно, min(W,H)). Плана предыдущего такта у него нет, и
+        // подстановка своего собственного уводила рамку на 124 тензорных
+        // пикселя из 640 — на первом же экране разбора.
+        int w0 = (int) RunJson.num(json, "окно");
+        m.startWin = (w0 > 0) ? Math.min(w0, Math.min(m.sensorW, m.sensorH))
+                              : Math.min(m.sensorW, m.sensorH);
         return m;
     }
 
@@ -187,12 +196,20 @@ public final class ReviewModel {
      * трекер.
      */
     public double[] cropOf(int idx, int frameW, int frameH) {
-        Tick p = ticks.get(idx > 0 ? idx - 1 : idx);
-        double sc = p.win;
+        double sc, cx, cy;
+        if (idx == 0) {
+            // Начальные значения цикла, а не чужой план.
+            sc = startWin > 0 ? startWin : Math.min(frameW, frameH);
+            cx = frameW / 2.0; cy = frameH / 2.0;
+        } else {
+            Tick p = ticks.get(idx - 1);
+            sc = p.win; cx = p.winCx;
+            cy = (p.winCy >= 0) ? p.winCy : frameH / 2.0;
+        }
         if (sc <= 0) return null;
         double scale = sc / 640.0;
-        double x0 = Math.max(0, Math.min(frameW - sc, p.winCx - sc / 2));
-        double y0 = Math.max(0, Math.min(frameH - sc, (p.winCy >= 0 ? p.winCy : frameH / 2.0) - sc / 2));
+        double x0 = Math.max(0, Math.min(frameW - sc, cx - sc / 2));
+        double y0 = Math.max(0, Math.min(frameH - sc, cy - sc / 2));
         return new double[]{ x0, y0, scale };
     }
 

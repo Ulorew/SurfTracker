@@ -15,7 +15,8 @@ for m in "колонки-по-номеру:s|for (int i = 0; i < head.length; i+
          "забыт-пересчёт:s|return sensorX \* (viewW / (double) sensorW);|return sensorX;|" \
          "смещение-видео-потеряно:s@return videoOffsetMs + (t.tFrameMs@return (t.tFrameMs@" \
          "вертикаль-без-вырезки:s@double crop = (fullH - videoH) / 2.0;@double crop = 0;@" \
-         "пропуск-каждый-такт:s@if (!t.hit \&\& (m.ticks.isEmpty() || prevHit))@if (!t.hit)@"; do
+         "пропуск-каждый-такт:s@if (!t.hit \&\& (m.ticks.isEmpty() || prevHit))@if (!t.hit)@" \
+         "нулевой-такт-чужой-план:s@if (idx == 0) {@if (false) {@"; do
   name="${m%%:*}"; expr="${m#*:}"
   M="$D/$name"; mkdir -p "$M/com/surftracker/camfps"
   cp "$SRC/com/surftracker/camfps/RunJson.java" "$M/com/surftracker/camfps/"
