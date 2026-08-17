@@ -213,7 +213,7 @@ public class ReviewActivity extends Activity {
             int want = pending;
             if (want != i) return;            // уже запросили другой — этот не нужен
             ReviewModel.Tick t = model.ticks.get(want);
-            Bitmap frame = null;
+            Bitmap frame = null;   // переприсваивается при уменьшении
             // КАДР МОДЕЛИ, если он записан.
             //
             // Это тот самый кадр, по которому получена детекция: рамка ложится
@@ -268,6 +268,19 @@ public class ReviewActivity extends Activity {
                     if (playing) player.postDelayed(this::step, 60);
                 });
                 return;
+            }
+            // УМЕНЬШАЕМ ДО РИСОВАНИЯ. Кадр 4K в ARGB — 33 МБ, а copy() для
+            // наложения удваивает: 66 МБ на такт в приложении, которое рядом
+            // держит камерный конвейер и модель. Экран телефона всё равно
+            // меньше 1920, поэтому уменьшение ничего не отнимает у разбора, а
+            // расход памяти режет вчетверо. Наложение считает координаты от
+            // размеров переданной картинки, так что пересчёт не нужен.
+            if (frame != null && frame.getWidth() > 1920) {
+                try {
+                    Bitmap small = Bitmap.createScaledBitmap(frame, 1920,
+                            Math.max(1, frame.getHeight() * 1920 / frame.getWidth()), true);
+                    if (small != null && small != frame) { frame.recycle(); frame = small; }
+                } catch (Throwable ignored) {}
             }
             final Bitmap drawn = (frame == null) ? null : overlay(frame, t);
             final String cap = ReviewModel.caption(t, want, model.ticks.size())

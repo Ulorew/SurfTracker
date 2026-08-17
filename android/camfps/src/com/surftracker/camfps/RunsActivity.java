@@ -1,6 +1,8 @@
 package com.surftracker.camfps;
 
 import android.app.Activity;
+import android.graphics.Bitmap;
+import android.media.MediaMetadataRetriever;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.Gravity;
@@ -42,7 +44,122 @@ public class RunsActivity extends Activity {
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
+        // САМОПРОВЕРКА РАЗБОРА — без единого нажатия.
+        //
+        // Владелец сообщил, что разборы прежних прогонов показывают
+        // красно-чёрный шум вместо кадра. Проверять такое глазами дорого и
+        // ненадёжно: нужно открыть каждый прогон руками и поверить впечатлению.
+        // Здесь то же самое делается числами: кадры достаются тем же путём,
+        // что и в разборе, и по каждому считается статистика цвета. Шум
+        // отличается от комнаты разительно, и его видно в отчёте.
+        String st = getIntent().getStringExtra("selftest");
+        if (st != null) { new Thread(() -> selfTest(st)).start(); return; }
         render();
+    }
+
+    /** Достаёт кадры тем же путём, что разбор, и пишет статистику в файл. */
+    private void selfTest(String which) {
+        StringBuilder out = new StringBuilder();
+        File dir = new File(getExternalFilesDir(null), "track");
+        for (File run : listRuns(dir)) {
+            if (!"all".equals(which) && !run.getName().contains(which)) continue;
+            out.append("=== ").append(run.getName()).append('\n');
+            ReviewModel m = ReviewModel.parse(
+                    RunJson.read(RunJson.pick(run, "log.csv", "лог.csv", "прогон.csv")),
+                    RunJson.read(RunJson.pick(run, "run.json", "прогон.json")));
+            if (!m.usable()) { out.append("  лог не разобрался: ").append(m.error).append('\n'); continue; }
+            File fr = new File(run, "frames");
+            if (!fr.isDirectory()) fr = new File(run, "кадры");
+            File vid = RunJson.pick(run, "video.mp4", "видео.mp4");
+            out.append("  тактов ").append(m.ticks.size())
+               .append(", кадров модели ").append(fr.isDirectory() && fr.list() != null ? fr.list().length : 0)
+               .append(", видео ").append(vid.exists() ? (vid.length() / 1048576 + " МБ") : "нет")
+               .append('\n');
+            MediaMetadataRetriever r = null;
+            if (vid.exists()) {
+                try { r = new MediaMetadataRetriever(); r.setDataSource(vid.getAbsolutePath()); }
+                catch (Throwable t) { out.append("  видео не открылось: ").append(t).append('\n'); r = null; }
+            }
+            int n = m.ticks.size();
+            for (int k = 1; k <= 4; k++) {
+                int idx = Math.min(n - 1, n * k / 5);
+                ReviewModel.Tick t = m.ticks.get(idx);
+                Bitmap bm = null; String src = "-";
+                File mf = new File(fr, String.format(java.util.Locale.US, "%05d.jpg", t.i));
+                if (mf.exists()) {
+                    bm = android.graphics.BitmapFactory.decodeFile(mf.getAbsolutePath());
+                    src = "кадр модели";
+                } else if (r != null) {
+                    long us = m.videoMs(t) * 1000L;
+                    try { bm = r.getFrameAtTime(us, MediaMetadataRetriever.OPTION_CLOSEST); }
+                    catch (Throwable ignored) {}
+                    src = "видео " + m.videoMs(t) + " мс";
+                    // Тот же момент ОПОРНЫМ кадром: если точный кадр приходит
+                    // мусором, а опорный — картинкой, дело в перемотке между
+                    // опорными кадрами, а не в файле.
+                    Bitmap sync = null;
+                    try { sync = r.getFrameAtTime(us, MediaMetadataRetriever.OPTION_CLOSEST_SYNC); }
+                    catch (Throwable ignored) {}
+                    if (sync != null) {
+                        out.append("    опорный: ").append(stats(sync)).append('\n');
+                        sync.recycle();
+                    } else out.append("    опорный: НЕ ПОЛУЧЕН\n");
+                }
+                out.append("  такт ").append(t.i).append("  ").append(src).append(": ");
+                out.append(bm == null ? "КАДР НЕ ПОЛУЧЕН" : stats(bm)).append('\n');
+                // Сам кадр — маленькой копией. Числа говорят, ЧТО не так, а
+                // картинка отвечает, шум это или просто тёмная сцена; без неё
+                // отличить одно от другого нельзя, а полный кадр 4K тянуть на
+                // ноутбук ради этого незачем.
+                if (bm != null) {
+                    try {
+                        File od = new File(getExternalFilesDir(null), "selftest");
+                        od.mkdirs();
+                        Bitmap sm = Bitmap.createScaledBitmap(bm, 480,
+                                Math.max(1, bm.getHeight() * 480 / bm.getWidth()), true);
+                        java.io.OutputStream os2 = new java.io.FileOutputStream(
+                                new File(od, run.getName() + "_" + t.i + ".jpg"));
+                        sm.compress(Bitmap.CompressFormat.JPEG, 80, os2);
+                        os2.close(); sm.recycle();
+                    } catch (Throwable ignored) {}
+                }
+                if (bm != null) bm.recycle();
+            }
+            try { if (r != null) r.release(); } catch (Throwable ignored) {}
+        }
+        File f = new File(getExternalFilesDir(null), "selftest.txt");
+        try (java.io.OutputStream os = new java.io.FileOutputStream(f)) {
+            os.write(out.toString().getBytes("UTF-8"));
+        } catch (Throwable ignored) {}
+        Log.i(TAG, "самопроверка записана: " + f);
+        finish();
+    }
+
+    /**
+     * Статистика цвета по решётке 40x40.
+     *
+     * Комната даёт умеренный разброс и сбалансированные каналы; красно-чёрный
+     * шум — огромный разброс и перекос в красный. Числа, а не впечатление.
+     */
+    private static String stats(Bitmap bm) {
+        int W = bm.getWidth(), H = bm.getHeight();
+        long sr = 0, sg = 0, sb = 0; int cnt = 0;
+        java.util.List<Integer> lum = new ArrayList<>();
+        for (int y = 0; y < 40; y++)
+            for (int x = 0; x < 40; x++) {
+                int px = bm.getPixel(x * (W - 1) / 39, y * (H - 1) / 39);
+                int rr = (px >> 16) & 255, gg = (px >> 8) & 255, bb = px & 255;
+                sr += rr; sg += gg; sb += bb; cnt++;
+                lum.add((rr * 30 + gg * 59 + bb * 11) / 100);
+            }
+        double mr = sr / (double) cnt, mg = sg / (double) cnt, mb = sb / (double) cnt;
+        double ml = 0; for (int v : lum) ml += v; ml /= lum.size();
+        double sd = 0; for (int v : lum) sd += (v - ml) * (v - ml);
+        sd = Math.sqrt(sd / lum.size());
+        int dark = 0; for (int v : lum) if (v < 24) dark++;
+        return String.format(java.util.Locale.US,
+                "%dx%d  R%.0f G%.0f B%.0f  яркость %.0f разброс %.0f  тёмных %d%%",
+                W, H, mr, mg, mb, ml, sd, dark * 100 / lum.size());
     }
 
     @Override

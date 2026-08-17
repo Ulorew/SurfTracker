@@ -36,7 +36,7 @@ public class RunSettingsCheck {
     static final String[][] WAS = {
         {"seconds", "60"}, {"side", "1280"}, {"k", "1.2"}, {"sign", "-1"},
         {"dry", "false"}, {"coast", "0.4"}, {"relost", "1.5"}, {"dwell", "0.18"},
-        {"rec", "false"}, {"video", "false"},
+        {"video", "false"},
         {"model", "person_w8a32.tflite"}, {"threads", "1"}, {"xnn", "false"},
         {"tag", ""}, {"mac", ""}, {"scen", ""},
     };
@@ -57,6 +57,9 @@ public class RunSettingsCheck {
         // возврат к true вернул бы то же поведение.
         eq("возврат выключен", RunSettings.find("home").def, "false");
         eq("поиск вращением включён", RunSettings.find("search").def, "true");
+        // Кадры модели включены: единственный точный источник для разбора,
+        // 16 МБ на полторы минуты против 572 МБ видео.
+        eq("кадры модели пишутся", RunSettings.find("rec").def, "true");
 
         System.out.println("== правило разрешения ==");
         Map1 intent = new Map1().put("seconds", "180").put("k", "2.0");
