@@ -49,6 +49,11 @@ public class ReviewActivity extends Activity {
     private android.widget.Button play;
     private boolean playing;
     private final Handler player = new Handler(Looper.getMainLooper());
+    private android.widget.Button speed;
+    private int speedIdx = 1;
+    /** Пауза между тактами, мс: чем быстрее, тем меньше. */
+    private static final String[] SPEEDS = { "0.5", "1", "2", "4" };
+    private static final int[] DELAYS   = { 500, 220, 60, 0 };
 
     /**
      * Проигрывание по ТАКТАМ, а не по кадрам видео.
@@ -105,6 +110,14 @@ public class ReviewActivity extends Activity {
         row.addView(btn("к потере", v -> nextLoss()));
         play = btn("▶", v -> togglePlay());
         row.addView(play);
+        // Скорость проигрывания. Такт разбирается за сотни миллисекунд
+        // (кадр модели быстрее, кадр 4K из видео медленнее), поэтому «быстро»
+        // это не столько ускорение, сколько отказ от паузы между тактами.
+        speed = btn("1x", v -> {
+            speedIdx = (speedIdx + 1) % SPEEDS.length;
+            speed.setText(SPEEDS[speedIdx] + "x");
+        });
+        row.addView(speed);
 
         root.addView(image, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
@@ -236,7 +249,7 @@ public class ReviewActivity extends Activity {
                         shown = want;
                         image.setImageBitmap(drawnM);
                         caption.setText(capM);
-                        if (playing) player.postDelayed(this::step, 60);
+                        if (playing) player.postDelayed(this::step, DELAYS[speedIdx]);
                     });
                     return;
                 }
@@ -265,7 +278,7 @@ public class ReviewActivity extends Activity {
                     if (pending != want) return;
                     shown = want;
                     caption.setText(capN);
-                    if (playing) player.postDelayed(this::step, 60);
+                    if (playing) player.postDelayed(this::step, DELAYS[speedIdx]);
                 });
                 return;
             }
@@ -291,7 +304,7 @@ public class ReviewActivity extends Activity {
                 shown = want;
                 if (drawn != null) image.setImageBitmap(drawn);
                 caption.setText(cap);
-                if (playing) player.postDelayed(this::step, 60);
+                if (playing) player.postDelayed(this::step, DELAYS[speedIdx]);
             });
         });
     }
