@@ -249,6 +249,8 @@ public class TrackActivity extends Activity {
     volatile long telNs = 0;
     /** Синхронизация ошибки с углом вала. Выключается ради сравнения прогонов. */
     volatile boolean syncEnc = true;
+    /** Сколько раз синхронизация отвергнута как несуразная. В прогон.json. */
+    volatile int syncSkips = 0;
 
     /**
      * Угол вала на заданный момент, рад.
@@ -721,6 +723,26 @@ public class TrackActivity extends Activity {
             //
             // Цена ошибки была не в отчёте, а в контуре: коэффициент петли
             // слежения считался вокруг заниженного на 16% масштаба.
+            // ПОЛЕ ЗРЕНИЯ КАЛИБРУЕТСЯ, а не берётся у камеры на веру.
+            //
+            // Замер 17 августа режимом flow: за 40 с приказано +272.2°,
+            // энкодер намотал +264.6° (две механические стороны сходятся в
+            // пределах 3%), а камера насчитала по картинке лишь +216.0° —
+            // на 18% меньше. Чтобы камера сошлась с механикой, поле зрения
+            // должно быть 84.3°, а телефон сообщает 72.9°.
+            //
+            // Тот же замер в истории проекта давал 0.883, после правки формулы
+            // фокуса 1.026, сейчас 0.816 — то есть коэффициент уехал со сменой
+            // режима потока. Значит это не константа устройства, а величина,
+            // которую надо перемерять при смене конфигурации камеры.
+            //
+            // Умолчание 0 = брать у камеры: менять поведение всех прежних
+            // прогонов по одному замеру рано.
+            float fovSet = cfg.f("fov");
+            if (fovSet > 1.0f && fovSet < 179.0f) {
+                Log.i(TAG, "поле зрения задано вручную: " + fovSet + " вместо " + hfovDeg);
+                hfovDeg = fovSet;
+            }
             final double fPx = (W / 2.0) / Math.tan(Math.toRadians(hfovDeg / 2.0));
             final double degPerPx = Math.toDegrees(1.0 / fPx);   // в центре кадра
 
@@ -1245,6 +1267,13 @@ public class TrackActivity extends Activity {
                 // телеметрия идёт 10 Гц, между её отсчётами вал успевает
                 // повернуться на несколько градусов при 0.3 рад/с.
                 double thetaCap = thetaAt(tf);
+                // Годен ли снимок: на самом первом такте телеметрии ещё не
+                // было, thetaAt вернул ноль, а к моменту команды угол уже
+                // пришёл — и свежая ошибка вышла -661° при уставке -13.8 рад/с.
+                // Прошивка обрезала её до предела 1.2, но четверть секунды
+                // стенд гнало на максимуме. Один такт из 314 в прогоне
+                // 17 августа.
+                boolean thetaCapOk = telNs != 0;
 
                 int cropX = clamp(winCx - Sc / 2, 0, W - Sc);
                 int cropY = clamp(winCy - Sc / 2, 0, H - Sc);
@@ -1386,14 +1415,26 @@ public class TrackActivity extends Activity {
                     // энкодеру, а не угадывается по картинке. Когда угол не
                     // изменился, формула тождественно равна прежней —
                     // sign*K*ошибка, — поэтому поведение без поворота то же.
-                    if (syncEnc && telNs != 0 && !dry
-                            && (System.nanoTime() - telNs) < 300_000_000L) {
+                    boolean syncOk = syncEnc && thetaCapOk && telNs != 0 && !dry
+                            && (System.nanoTime() - telNs) < 300_000_000L;
+                    double fresh = 0;
+                    if (syncOk) {
                         double tgtWorld = thetaCap + sign * Math.toRadians(errDeg);
-                        double fresh = tgtWorld - thetaAt(System.nanoTime());
-                        errFreshDeg = Math.toDegrees(fresh);
-                        w = K * fresh;
-                        tgtWorldRad = tgtWorld;
-                    } else {
+                        fresh = tgtWorld - thetaAt(System.nanoTime());
+                        // Здравый смысл поверх арифметики: свежая ошибка не
+                        // может превышать поле зрения плюс поворот за такт.
+                        // Больше — значит рассинхрон, а не цель на краю света,
+                        // и командовать по такому числу нельзя.
+                        if (Math.abs(Math.toDegrees(fresh)) > 90.0) {
+                            syncOk = false;
+                            syncSkips++;
+                        } else {
+                            errFreshDeg = Math.toDegrees(fresh);
+                            w = K * fresh;
+                            tgtWorldRad = tgtWorld;
+                        }
+                    }
+                    if (!syncOk) {
                         errFreshDeg = errDeg * sign;
                         w = sign * K * Math.toRadians(errDeg);
                         tgtWorldRad = Double.NaN;
@@ -1691,6 +1732,7 @@ public class TrackActivity extends Activity {
              .append(",\"доля_с_целью\":").append(frames > 0 ? fmt(hits / (double) frames) : "0")
              .append(",\"телеметрии\":").append(telCount)
              .append(",\"протухших_нулей\":").append(staleZeros)
+             .append(",\"синхронизация_отвергнута\":").append(syncSkips)
              .append(",\"биты\":{\"watchdog\":").append(bWd)
              .append(",\"потолок\":").append(bCap).append(",\"рампа\":").append(bRamp)
              .append(",\"энкодер\":").append(bEnc).append(",\"кламп\":").append(bClamp)

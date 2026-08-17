@@ -105,7 +105,7 @@ public class RunSettingsCheck {
                 failed++; System.out.println("  ПЛОХО умолчание " + i.key + " не число");
             }
         }
-        eq("параметров на экране", RunSettings.SPEC.length, 19);
+        eq("параметров на экране", RunSettings.SPEC.length, 20);
 
         System.out.println();
         if (failed == 0) System.out.println("ИТОГ: настройки прогона исправны");
