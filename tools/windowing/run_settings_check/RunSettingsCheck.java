@@ -125,7 +125,7 @@ public class RunSettingsCheck {
         // с игнорированием сохранённого источник saved просто не передаётся
         eq("dry не протечёт", RunSettings.resolve(intentD, null, "dry"), "false");
         eq("k из умолчания", RunSettings.resolve(intentD, null, "k"), "1.2");
-        eq("home из умолчания", RunSettings.resolve(intentD, null, "home"), "true");
+        eq("home из умолчания", RunSettings.resolve(intentD, null, "home"), "false");
         eq("переданное всё равно работает", RunSettings.resolve(intentD, null, "seconds"), "180");
         // а БЕЗ ключа сохранённое по-прежнему в силе
         eq("без defaults сохранённое живо", RunSettings.resolve(intentD, savedD, "dry"), "true");
