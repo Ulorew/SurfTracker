@@ -253,6 +253,7 @@ public class TrackActivity extends Activity {
     volatile int syncSkips = 0;
     /** Сколько раз цель взята КРАЙНЕЙ мерой — по уверенности. В run.json. */
     volatile int reseeds = 0;
+    long lastHitMs = 0, lastCueMs = 0, runStartMs = 0;
 
     /**
      * Угол вала на заданный момент, рад.
@@ -1235,7 +1236,8 @@ public class TrackActivity extends Activity {
             syncEnc = syncOn;
             j.append(",\"синхронизация\":").append(syncOn)
              .append(",\"настройки_с_экрана\":").append(cfg.fromSaved());
-            uiEndsAtMs = System.currentTimeMillis() + (long) seconds * 1000L;
+            runStartMs = System.currentTimeMillis();
+            uiEndsAtMs = runStartMs + (long) seconds * 1000L;
             uiDry = dry; uiRec = video;
             while (!stopRequested && (System.nanoTime() - t0) / 1e9 < seconds) {
                 double tsec = (System.nanoTime() - t0) / 1e9;
@@ -1666,6 +1668,26 @@ public class TrackActivity extends Activity {
                    .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][4]) : "").append(',')
                    .append(fmt(trk.filteredSize)).append('\n');
                 frames++;
+
+                // ГОЛОСОМ, ЕСЛИ ЦЕЛИ НЕТ. Наблюдатель стоит вне кадра и экрана
+                // не видит: прогон, в котором камера смотрит мимо, молча
+                // расходует полторы минуты и запись, а выглядит как «мотор не
+                // подключился». Ровно это и случилось 17 августа дважды подряд:
+                // уверенность 0.04-0.10, ноль тактов с целью, вал не двигался,
+                // потому что двигать было не за чем.
+                if (!flow) {
+                    long nowMs = System.currentTimeMillis();
+                    if (hit) { lastHitMs = nowMs; }
+                    else if (lastHitMs == 0 && nowMs - runStartMs > 8000
+                             && nowMs - lastCueMs > 10000) {
+                        lastCueMs = nowMs;
+                        say(hits == 0 ? "Цель не вижу" : "Цель потеряна");
+                    } else if (lastHitMs != 0 && nowMs - lastHitMs > 12000
+                               && nowMs - lastCueMs > 10000) {
+                        lastCueMs = nowMs;
+                        say("Цель потеряна");
+                    }
+                }
 
                 // Показания для экрана. Отдельные поля, а не чтение frames/hits
                 // из другого потока: те живут в стеке петли и снаружи не видны.
