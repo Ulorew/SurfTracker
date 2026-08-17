@@ -35,7 +35,14 @@ public class SettingsActivity extends Activity {
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
-        prefs = getSharedPreferences("прогон", MODE_PRIVATE);
+        // ИМЯ ФАЙЛА НАСТРОЕК — то же, что читает TrackActivity.
+        //
+        // Переименование файлов прогона на латиницу задело здесь только одну
+        // сторону: экран остался писать в «прогон», а прогон стал читать
+        // «run». С того коммита экран настроек не влиял НИ НА ОДИН прогон, а
+        // в run.json при этом уходило «настройки_с_экрана: 0» — то есть отчёт
+        // подтверждал, что всё чисто.
+        prefs = getSharedPreferences("run", MODE_PRIVATE);
 
         ScrollView sv = new ScrollView(this);
         LinearLayout root = new LinearLayout(this);
@@ -60,7 +67,18 @@ public class SettingsActivity extends Activity {
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setPadding(0, 40, 0, 0);
         row.addView(btn("Сохранить", v -> { save(); finish(); }));
-        row.addView(btn("Сбросить всё", v -> { prefs.edit().clear().apply(); recreate(); }));
+        row.addView(btn("Сбросить всё", v -> {
+            // Чистим ТОЛЬКО ключи с этого экрана. clear() снёс бы и
+            // mac_последний — адрес удачного подключения, который пишет
+            // TrackActivity в этот же файл. А при пустом «MAC модуля» в
+            // настройках это единственный работающий путь к мотору: модуль
+            // подключается незащищённым сокетом и в списке спаренных не
+            // появляется вовсе.
+            SharedPreferences.Editor ed = prefs.edit();
+            for (RunSettings.Item it : RunSettings.SPEC) ed.remove(it.key);
+            ed.apply();
+            recreate();
+        }));
         root.addView(row);
 
         TextView note = new TextView(this);
