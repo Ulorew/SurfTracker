@@ -36,8 +36,17 @@ public final class ReviewModel {
     }
 
     public final List<Tick> ticks = new ArrayList<>();
-    /** Индексы тактов, на которых трек перешёл в потерю. */
+    /** Индексы тактов, на которых трек перешёл в потерю (по состоянию). */
     public final List<Integer> losses = new ArrayList<>();
+    /**
+     * НАЧАЛА ОТРЕЗКОВ БЕЗ ДЕТЕКЦИИ.
+     *
+     * Именно это человек видит как «потеряло»: рамка пропала. Состояние
+     * «потеря» ставится только после пяти промахов подряд, поэтому по нему
+     * отрезков выходит вчетверо меньше, и кнопка перехода упиралась в
+     * единственную запись и топталась на ней.
+     */
+    public final List<Integer> gaps = new ArrayList<>();
     public int sensorW, sensorH, videoW, videoH;
     public long videoOffsetMs;
     public String error;
@@ -130,6 +139,9 @@ public final class ReviewModel {
             // Момент ПЕРЕХОДА в потерю, а не каждый такт потери: иначе список
             // «где посмотреть» состоит из сотни соседних тактов одного события.
             if (prevTracking && !t.tracking) m.losses.add(m.ticks.size());
+            // Начало отрезка без детекции: предыдущий такт был с целью.
+            boolean prevHit = !m.ticks.isEmpty() && m.ticks.get(m.ticks.size() - 1).hit;
+            if (!t.hit && (m.ticks.isEmpty() || prevHit)) m.gaps.add(m.ticks.size());
             prevTracking = t.tracking;
             m.ticks.add(t);
         }

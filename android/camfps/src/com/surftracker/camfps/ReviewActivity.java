@@ -107,7 +107,7 @@ public class ReviewActivity extends Activity {
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.addView(btn("‹", v -> request(shown - 1)));
         row.addView(btn("›", v -> request(shown + 1)));
-        row.addView(btn("к потере", v -> nextLoss()));
+        row.addView(btn("пропуск ›", v -> nextGap()));
         play = btn("▶", v -> togglePlay());
         row.addView(play);
         // Скорость проигрывания. Такт разбирается за сотни миллисекунд
@@ -199,14 +199,25 @@ public class ReviewActivity extends Activity {
         return b;
     }
 
-    /** Ближайшая потеря после показанного такта; по кругу. */
-    private void nextLoss() {
-        if (model.losses.isEmpty()) {
-            caption.setText("Потерь в этом прогоне не было");
+    /**
+     * К началу СЛЕДУЮЩЕГО отрезка без детекции.
+     *
+     * По отрезкам, а не по тактам: подряд идущие пропуски — одно событие, и
+     * шагать по каждому такту внутри него бессмысленно. И строго вперёд: кольцо
+     * выглядело как «кнопка всегда бросает в одно и то же место», потому что
+     * прежний список строился по состоянию «потеря» (пять промахов подряд) и
+     * часто содержал единственную запись.
+     */
+    private void nextGap() {
+        if (model.gaps.isEmpty()) {
+            caption.setText("Тактов без детекции в этом прогоне нет");
             return;
         }
-        for (int idx : model.losses) if (idx > shown) { request(idx); return; }
-        request(model.losses.get(0));
+        for (int idx : model.gaps) if (idx > shown) { request(idx); return; }
+        caption.setText("Дальше пропусков нет — всего их "
+                + model.gaps.size() + ", последний на такте "
+                + model.ticks.get(model.gaps.get(model.gaps.size() - 1)).i
+                + ". Нажмите ‹ или потяните ползунок, чтобы вернуться назад.");
     }
 
     /**
@@ -331,19 +342,11 @@ public class ReviewActivity extends Activity {
                        : (t.tracking ? Color.GREEN : Color.RED));
             c.drawRect((float) (tx - hw), (float) (ty - hh),
                        (float) (tx + hw), (float) (ty + hh), p);
-        } else {
-            // Детекции нет — показываем предсказание, и показываем иначе.
-            double px = (t.winCx - cr[0]) / cr[2];
-            double py = ((t.winCy >= 0 ? t.winCy : model.sensorH / 2.0) - cr[1]) / cr[2];
-            double h = (Double.isNaN(t.filtSize) ? t.win / 8.0 : t.filtSize) / cr[2] / 2;
-            p.setColor(0xFF4FC3F7);
-            p.setPathEffect(new android.graphics.DashPathEffect(
-                    new float[]{ (float) (n / 40), (float) (n / 60) }, 0));
-            c.drawRect((float) (px - h), (float) (py - h), (float) (px + h), (float) (py + h), p);
-            c.drawLine((float) (px - h), (float) py, (float) (px + h), (float) py, p);
-            c.drawLine((float) px, (float) (py - h), (float) px, (float) (py + h), p);
-            p.setPathEffect(null);
         }
+        // На кадре модели предсказание НЕ рисуется. Вырезка построена вокруг
+        // него же, поэтому метка стояла бы ровно в центре всегда и не несла
+        // никаких сведений — а выглядела как измерение. Что детекции нет,
+        // сказано в подписи.
         return bm;
     }
 
