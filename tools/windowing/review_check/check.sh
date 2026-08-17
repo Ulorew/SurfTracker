@@ -13,7 +13,7 @@ fails=0
 for m in "колонки-по-номеру:s|for (int i = 0; i < head.length; i++) if (head\[i\].trim().equals(name)) return i;|switch (name) { case \"t_ms\": return 1; case \"Sc\": return 18; case \"winCx\": return 19; case \"winCy\": return 20; case \"bx\": return 28; }|" \
          "потеря-каждый-такт:s|if (prevTracking \&\& !t.tracking)|if (!t.tracking)|" \
          "забыт-пересчёт:s|return sensorX \* (viewW / (double) sensorW);|return sensorX;|" \
-         "смещение-видео-потеряно:s|return videoOffsetMs + t.tMs;|return t.tMs;|" \
+         "смещение-видео-потеряно:s@return videoOffsetMs + (t.tFrameMs@return (t.tFrameMs@" \
          "вертикаль-без-вырезки:s@double crop = (fullH - videoH) / 2.0;@double crop = 0;@"; do
   name="${m%%:*}"; expr="${m#*:}"
   M="$D/$name"; mkdir -p "$M/com/surftracker/camfps"

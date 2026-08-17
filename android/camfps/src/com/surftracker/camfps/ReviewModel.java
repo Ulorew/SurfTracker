@@ -21,7 +21,8 @@ public final class ReviewModel {
     /** Один такт лога — только то, что нужно для показа. */
     public static final class Tick {
         public int i;
-        public long tMs;
+        public long tMs;      // конец такта
+        public long tFrameMs; // момент СЪЁМКИ кадра; -1 — нет в логе
         public boolean hit;
         public double cx, cy, size;     // рамка цели, пиксели СЕНСОРА
         public double bw = Double.NaN, bh = Double.NaN;  // стороны рамки; NaN — их нет в логе
@@ -78,6 +79,7 @@ public final class ReviewModel {
         String[] head = lines[0].split(",");
 
         int cI = col(head, "i"), cT = col(head, "t_ms"), cHit = col(head, "есть_цель");
+        int cTf = col(head, "t_кадра_мс");
         int cBx = col(head, "bx"), cBy = col(head, "by"), cSz = col(head, "размер_детекции");
         int cBw = col(head, "ширина_детекции"), cBh = col(head, "высота_детекции");
         int cSc = col(head, "Sc"), cWin = col(head, "winCx"), cWinY = col(head, "winCy");
@@ -97,6 +99,11 @@ public final class ReviewModel {
             Tick t = new Tick();
             t.i = inum(f, cI, li - 1);
             t.tMs = (long) num(f, cT);
+            // Кадр ищется по времени СЪЁМКИ, а не конца такта: между ними
+            // целый инференс (215 мс при такте 247), и рамка ложилась на кадр
+            // почти на такт позже своего.
+            double tf = (cTf >= 0) ? num(f, cTf) : Double.NaN;
+            t.tFrameMs = Double.isNaN(tf) ? -1 : (long) tf;
             t.hit = inum(f, cHit, 0) == 1;
             t.cx = num(f, cBx); t.cy = num(f, cBy); t.size = num(f, cSz);
             // Стороны появились позже: в логах без них рамка рисуется
@@ -150,7 +157,9 @@ public final class ReviewModel {
     // ---- привязка ко времени и координатам ---------------------------------
 
     /** Время в видео для такта, мс. Смещение — сколько записи прошло до нулевого такта. */
-    public long videoMs(Tick t) { return videoOffsetMs + t.tMs; }
+    public long videoMs(Tick t) {
+        return videoOffsetMs + (t.tFrameMs >= 0 ? t.tFrameMs : t.tMs);
+    }
 
     /** Ближайший такт к моменту видео. Список отсортирован по времени. */
     public int tickAtVideoMs(long ms) {
