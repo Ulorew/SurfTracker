@@ -75,6 +75,14 @@ public class RunsActivity extends Activity {
                .append(", кадров модели ").append(fr.isDirectory() && fr.list() != null ? fr.list().length : 0)
                .append(", видео ").append(vid.exists() ? (vid.length() / 1048576 + " МБ") : "нет")
                .append('\n');
+            // ТА ЖЕ приёмка, что после прогона, но по уже снятым записям.
+            //
+            // Иначе её нельзя проверить, не сняв новый прогон: первая редакция
+            // приёмки писалась в отчёт ПОСЛЕ того, как отчёт уже сохранён, и
+            // молчала — а узналось это только следующим прогоном.
+            if (vid.exists())
+                out.append("  приёмка записи: ")
+                   .append(TrackActivity.checkRecordingStatic(vid)).append('\n');
             MediaMetadataRetriever r = null;
             if (vid.exists()) {
                 try { r = new MediaMetadataRetriever(); r.setDataSource(vid.getAbsolutePath()); }

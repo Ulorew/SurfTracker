@@ -1903,17 +1903,6 @@ public class TrackActivity extends Activity {
             // после конца прогона и читалась как состояние.
             final android.widget.TextView sv2 = statusView;
             if (sv2 != null) runOnUiThread(() -> sv2.setText(""));
-            try {
-                write(new File(base.getPath() + ".json"), j.append("}").toString());
-                // ИМЕНА ФАЙЛОВ — те, под которыми их ищут читатели.
-                //
-                // Лог писался как «прогон.csv», а экран разбора и карточка
-                // прогона искали «лог.csv»: кнопка «Разбор» не появлялась
-                // вовсе. Заметить это по стендам было нельзя — стенд разбора
-                // кормили файлом, названным по ЧИТАТЕЛЮ, а писателя не
-                // проверяет ничто. Найдено первым же настоящим прогоном.
-                write(new File(runDir, "log.csv"), csv.toString());
-            } catch (Throwable ignored) {}
             // ПРИЁМКА ЗАПИСИ. Прогон 17 августа снял сорок секунд красно-чёрного
             // шума, назвался успешным и был отдан человеку: испорченный кадр
             // приходит на вход кодировщика, поток при этом безупречен (полное
@@ -1932,6 +1921,17 @@ public class TrackActivity extends Activity {
                 }
             }
 
+            try {
+                write(new File(base.getPath() + ".json"), j.append("}").toString());
+                // ИМЕНА ФАЙЛОВ — те, под которыми их ищут читатели.
+                //
+                // Лог писался как «прогон.csv», а экран разбора и карточка
+                // прогона искали «лог.csv»: кнопка «Разбор» не появлялась
+                // вовсе. Заметить это по стендам было нельзя — стенд разбора
+                // кормили файлом, названным по ЧИТАТЕЛЮ, а писателя не
+                // проверяет ничто. Найдено первым же настоящим прогоном.
+                write(new File(runDir, "log.csv"), csv.toString());
+            } catch (Throwable ignored) {}
             // Звук окончания. Наблюдатель стоит в кадре и не видит ни экрана,
             // ни лога: без сигнала он не знает, когда можно расходиться, и
             // либо стоит лишнее, либо уходит раньше времени.
@@ -2123,7 +2123,10 @@ public class TrackActivity extends Activity {
      * состоянию объекта: setOnErrorListener молчал ровно в том прогоне, где
      * писался шум, и stop() отработал без единой жалобы.
      */
-    String checkRecording(File f) {
+    String checkRecording(File f) { return checkRecordingStatic(f); }
+
+    /** То же самое, но доступно самопроверке: она живёт в другой активности. */
+    static String checkRecordingStatic(File f) {
         if (!f.exists() || f.length() < 100000) return "нет: файла нет или он пуст";
         android.media.MediaMetadataRetriever r = null;
         try {
