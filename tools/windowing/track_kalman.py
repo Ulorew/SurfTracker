@@ -129,6 +129,10 @@ class KalmanAngularFilter:
                           r, self.v_max_ang ** 2,
                           self.cfg.KALMAN_R_LOGH ** 2])
         self.initialized = True
+        # Счётчик принятых измерений: по нему судят, СОШЁЛСЯ ли фильтр. Ноль
+        # на затравке, а не при создании: после перезахвата ковариация снова
+        # широка, и гейту снова нельзя верить.
+        self.n_updates = 0
 
     def predict(self, dt):
         """Чистая: состояние не трогает (её зовёт планирование окна каждый
@@ -154,6 +158,29 @@ class KalmanAngularFilter:
             self.x[IDX_DTH] *= k
             self.x[IDX_DPH] *= k
 
+    def _match_r_size(self, xp, m_size):
+        """Размер, из которого берётся допуск ПО ПОЛОЖЕНИЮ при сопоставлении.
+
+        ОДНА ФУНКЦИЯ НА ВСЕ МЕСТА, и это не вкусовщина. Правило «допуск от
+        предсказанного размера цели, а не от размера кандидата» было принято
+        5 августа (коммит 00baa94) и реализовано в ЧЕТЫРЁХ местах порознь:
+        двух формах счёта в track_score, в score_distance2 и в gate_distance2.
+        Три места правку получили, четвёртое — нет. Пропущенным оказался
+        ИМЕННО ГЕЙТ, то есть единственное из четырёх, что исполняется в
+        боевой конфигурации: при SCORE_FORM = "distance" ни одна форма счёта
+        не вызывается вовсе.
+
+        Тринадцать дней прод отбирал кандидатов по правилу, которое считалось
+        отменённым, и телефонный перенос честно скопировал его. Флаг в конфиге
+        при этом существовал и стоял в True — то есть выглядел как решение,
+        принятое повсеместно.
+
+        Пока реализаций несколько, следующая правка разойдётся так же.
+        """
+        if getattr(self.cfg, "MAHA_R_FROM_PREDICTED_SIZE", True):
+            return math.exp(xp[IDX_LOGH])
+        return max(m_size, 1e-12)
+
     def gate_distance2(self, mx, my, m_size, dt):
         """Квадрат махаланобисова расстояния кандидата до предсказания, 2 dof.
 
@@ -164,7 +191,10 @@ class KalmanAngularFilter:
         """
         xp, Pp = self._predict_moments(dt)
         y = np.array([mx - xp[IDX_TH], my - xp[IDX_PH]])
-        S = Pp[np.ix_(POS_IDX, POS_IDX)] + self._R_pos(m_size)
+        # Допуск по положению — из ПРЕДСКАЗАННОГО размера цели (см.
+        # _match_r_size). В двумерном гейте размер кандидата измерением не
+        # является вовсе: сравниваются только положения.
+        S = Pp[np.ix_(POS_IDX, POS_IDX)] + self._R_pos(self._match_r_size(xp, m_size))
         return float(y @ np.linalg.solve(S, y))
 
     def score_distance2(self, mx, my, m_size, dt):
@@ -199,8 +229,7 @@ class KalmanAngularFilter:
         # поощряет ровно ту подмену, ради предотвращения которой заведён.
         # Размер кандидата остаётся там, где он и есть измерение, — в третьей
         # координате. Переключатель оставлен, чтобы разницу можно было мерить.
-        r_size = size if not getattr(self.cfg, "MAHA_R_FROM_PREDICTED_SIZE", True) \
-            else math.exp(xp[IDX_LOGH])
+        r_size = self._match_r_size(xp, size)
         R = np.diag([self._R_pos(r_size)[0, 0], self._R_pos(r_size)[1, 1],
                      self.cfg.KALMAN_R_LOGH ** 2])
         S = H @ Pp @ H.T + R
@@ -211,6 +240,7 @@ class KalmanAngularFilter:
         if not self.initialized:
             self.seed(mx, my, m_size)
             return (self.cx, self.cy)
+        self.n_updates += 1
 
         xp, Pp = self._predict_moments(dt)
         if m_size is not None and m_size > 0:

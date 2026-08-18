@@ -355,10 +355,23 @@ class TrackState:
         by_radius = [d for d in detections
                      if dist(pred_cx, pred_cy, *_det_center(d)) <= max_dist]
         gated = None
-        if self.uses_mahalanobis_gate():
+        # ГЕЙТ ТОЛЬКО ПОСЛЕ СХОДИМОСТИ. Начальная дисперсия скорости берётся
+        # из KALMAN_MAX_SPEED — это не знание, а его отсутствие, и на первых
+        # тактах ковариация даёт допуск шире кадра. Судить по ней осмысленно
+        # только после того, как она сошлась; до тех пор отбор идёт по
+        # радиусу, то есть ровно как на уровне 1.
+        warm = getattr(self.filter, "n_updates", 1 << 30) \
+            >= getattr(self.cfg, "KALMAN_GATE_MIN_UPDATES", 0)
+        if self.uses_mahalanobis_gate() and warm:
+            also_radius = getattr(self.cfg, "KALMAN_GATE_ALSO_RADIUS", True)
             gated = []
             for d in detections:
                 dcx, dcy = _det_center(d)
+                # ГЕЙТ МОЖЕТ ТОЛЬКО СУЖАТЬ. Прежде он ЗАМЕЩАЛ радиус и потому
+                # мог принять то, что радиус отверг бы — а расширяется он
+                # охотнее, чем сужается. Теперь оба условия обязательны.
+                if also_radius and dist(pred_cx, pred_cy, dcx, dcy) > max_dist:
+                    continue
                 d2 = self.filter.gate_distance2(dcx, dcy, _det_size(d), dt)
                 if d2 <= self.cfg.KALMAN_GATE_CHI2:
                     gated.append(d)
