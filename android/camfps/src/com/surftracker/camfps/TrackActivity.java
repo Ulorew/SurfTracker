@@ -249,6 +249,19 @@ public class TrackActivity extends Activity {
      * пропущенных такта подряд и срабатывает раньше, чем это станет опасным.
      */
     static final long STALE_NS = 400_000_000L;
+    /**
+     * Порог протухания подстраивается под ФАКТИЧЕСКИЙ такт.
+     *
+     * 400 мс выбирались, когда такт был 124-210 мс, — то есть с запасом втрое.
+     * На полном прогоне 18 августа запись 4K и нагрев растянули такт до 337 мс
+     * медианно и 396 на p90: порог оказался НИЖЕ обычного такта, и уставка
+     * обнулялась 157 раз на здоровом зрении, а не на его отказе. Вал при этом
+     * дёргается на ровном месте.
+     *
+     * Теперь порог не меньше двух с половиной тактов: три пропущенных кадра
+     * подряд по-прежнему ловятся, а обычная работа — нет.
+     */
+    volatile long staleNs = STALE_NS;
     /** nanoTime последней ПРИШЕДШЕЙ телеметрии; 0 — не приходила ни разу. */
     volatile long telNs = 0;
     /** Синхронизация ошибки с углом вала. Выключается ради сравнения прогонов. */
@@ -261,6 +274,7 @@ public class TrackActivity extends Activity {
     volatile int battStart = -1, battNow = -1;
     volatile long battStartNs = 0;
     int battTick = 0;
+    volatile double tickAvgMs = 200;
     long lastHitMs = 0, lastCueMs = 0, runStartMs = 0;
     /** Поиск вращением: угол начала, направление, скорость и полусектор. */
     double searchBase = Double.NaN;
@@ -1261,7 +1275,7 @@ public class TrackActivity extends Activity {
                             float wSend = wCmd;
                             if (wCmdNs == 0) {
                                 wSend = 0.0f;          // команды ещё не было
-                            } else if (System.nanoTime() - wCmdNs > STALE_NS) {
+                            } else if (System.nanoTime() - wCmdNs > staleNs) {
                                 if (wSend != 0.0f) staleZeros++;
                                 wSend = 0.0f;
                             }
@@ -1893,6 +1907,10 @@ public class TrackActivity extends Activity {
 
                 // Показания для экрана. Отдельные поля, а не чтение frames/hits
                 // из другого потока: те живут в стеке петли и снаружи не видны.
+                // Порог протухания следует за фактическим тактом: медленная
+                // оценка, чтобы одиночный выброс его не двигал.
+                tickAvgMs += (loopMs - tickAvgMs) * 0.05;
+                staleNs = Math.max(STALE_NS, (long) (tickAvgMs * 2.5 * 1_000_000L));
                 uiTicks = frames; uiHits = hits;
                 uiTracking = !flow && trk.status == Tracker.TRACKING;
                 // Связь на экране — по свежести телеметрии, а не по
