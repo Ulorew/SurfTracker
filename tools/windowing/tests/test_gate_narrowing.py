@@ -28,13 +28,13 @@ def make_cfg(**overrides):
 
 SIZE = math.radians(2.0)
 DT = 0.25
-# ПОТОЛОК ОКНА ОБЯЗАТЕЛЕН, иначе проверяется не тот режим. Без потолка
-# сторона окна равна 3.5 размера, радиус приёма выходит 1.05 размера и почти
-# совпадает с допуском сошедшегося гейта (1.28) — разница в 22% тонет.
-# В прогоне 260818_1059 окно упиралось в потолок кадра медианно: 1440 при
-# 3.5*960 = 3360, и радиус там был 0.45 размера, то есть гейт шире втрое.
-# Здесь потолок ставится так, чтобы воспроизвести именно это отношение.
-MAX_WINDOW = SIZE * 1.5          # радиус приёма 0.3*1.5 = 0.45 размера
+# Потолок окна БОЛЬШЕ не сжимает радиус приёма: он свойство кадра, а не цели
+# (TARGET_RADIUS_IGNORES_VIEW_CAP). Прежде эти тесты ставили тесный потолок,
+# чтобы радиус вышел 0.45 размера против допуска гейта 1.28 — теперь так уже
+# не бывает, и полоса, где гейт шире радиуса, узкая: 1.05 против 1.28, то есть
+# 22%. Кандидат ставится внутрь неё.
+MAX_WINDOW = SIZE * 10           # потолок не связывает
+РАДИУС = 0.30 * 3.5              # доля размера цели: TARGET_SELECT_MAX_DIST_FRAC * K
 
 
 def converged(**overrides):
@@ -108,11 +108,10 @@ class TestГейтТолькоСужает:
 
     def test_далёкий_кандидат_отвергается(self):
         st = self._состояние(KALMAN_GATE_ALSO_RADIUS=True)
-        side = st.current_window_side()
-        радиус = st.cfg.TARGET_SELECT_MAX_DIST_FRAC * side
+        радиус = st.cfg.TARGET_SELECT_MAX_DIST_FRAC * st.acceptance_side()
         # Кандидат ЗА радиусом, но внутри ковариационного допуска: ровно тот
         # случай, ради которого правка и делалась.
-        d = радиус * 1.4
+        d = радиус * 1.1
         assert st.filter.gate_distance2(d, 0.0, SIZE, DT) <= st.cfg.KALMAN_GATE_CHI2, \
             "предпосылка теста: гейт сам по себе такого кандидата принимает"
         r = st.step(DT, [_рамка(d, 0.0, SIZE)])
@@ -120,8 +119,7 @@ class TestГейтТолькоСужает:
 
     def test_без_правки_тот_же_кандидат_принимается(self):
         st = self._состояние(KALMAN_GATE_ALSO_RADIUS=False)
-        side = st.current_window_side()
-        d = st.cfg.TARGET_SELECT_MAX_DIST_FRAC * side * 1.4
+        d = st.cfg.TARGET_SELECT_MAX_DIST_FRAC * st.acceptance_side() * 1.1
         r = st.step(DT, [_рамка(d, 0.0, SIZE)])
         assert r.chosen is not None
 
@@ -130,8 +128,7 @@ class TestГейтТолькоСужает:
         радиусом, и гейтом, обязано приниматься по-прежнему."""
         for also in (True, False):
             st = self._состояние(KALMAN_GATE_ALSO_RADIUS=also)
-            side = st.current_window_side()
-            d = st.cfg.TARGET_SELECT_MAX_DIST_FRAC * side * 0.3
+            d = st.cfg.TARGET_SELECT_MAX_DIST_FRAC * st.acceptance_side() * 0.3
             r = st.step(DT, [_рамка(d, 0.0, SIZE)])
             assert r.chosen is not None, f"also_radius={also}"
 
@@ -181,8 +178,7 @@ class TestПрогревГейта:
         st = tl.TrackState(cfg, 0.0, 0.0, SIZE, min_window=0.0,
                            max_window=MAX_WINDOW,
                            view_half_w=5.0, view_half_h=5.0)
-        side = st.current_window_side()
-        d = st.cfg.TARGET_SELECT_MAX_DIST_FRAC * side * 1.4
+        d = st.cfg.TARGET_SELECT_MAX_DIST_FRAC * st.acceptance_side() * 1.1
         # первый же такт: фильтр не прогрет, отбор обязан идти по радиусу
         r = st.step(DT, [_рамка(d, 0.0, SIZE)])
         assert r.chosen is None
@@ -198,8 +194,7 @@ class TestПрогревГейта:
                            view_half_w=5.0, view_half_h=5.0)
         for _ in range(8):
             st.step(DT, [_рамка(0.0, 0.0, SIZE)])
-        side = st.current_window_side()
-        d = st.cfg.TARGET_SELECT_MAX_DIST_FRAC * side * 1.4
+        d = st.cfg.TARGET_SELECT_MAX_DIST_FRAC * st.acceptance_side() * 1.1
         r = st.step(DT, [_рамка(d, 0.0, SIZE)])
         assert r.chosen is not None, \
             "после прогрева гейт обязан снова быть шире радиуса (с выключенным сужением)"

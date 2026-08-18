@@ -39,6 +39,9 @@ CONFIGS = {
     # «стало лучше» опиралось бы на память, а не на число.
     "A_kalman_gate_legacy": ["--enable-a", "--filter-level", "2", "--enable-gate",
                               "--gate-legacy"],
+    # Радиус приёма ДО правки 18.08: прижат потолком кадра вместе с окном.
+    "A_kalman_gate_radlegacy": ["--enable-a", "--filter-level", "2", "--enable-gate",
+                                 "--radius-legacy"],
     "A_kalman_gate_vdir": ["--enable-a", "--filter-level", "2", "--enable-gate",
                             "--enable-vdir"],
     # Финалист тикета "счёт кандидата": форма 2 (анизотропный махаланобис) +

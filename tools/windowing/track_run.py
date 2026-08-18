@@ -277,6 +277,9 @@ def main():
     ap.add_argument("--filter-level", type=int, default=None, choices=[0, 1, 2],
                      help="0 = последняя детекция, 1 = alpha-beta (по умолчанию из конфига), "
                           "2 = Калман в углах (theta, theta', phi, phi', log h)")
+    ap.add_argument("--radius-legacy", action="store_true",
+                     help="радиус приёма от ПРИЖАТОЙ стороны окна, как было до "
+                          "18.08: потолок кадра сжимает и приём тоже")
     ap.add_argument("--gate-legacy", action="store_true",
                      help="гейт в форме ДО правок 18.08: допуск от размера "
                           "кандидата, замещение радиуса, без прогрева. "
@@ -323,6 +326,8 @@ def main():
     if args.enable_gate and tcfg.FILTER_LEVEL != 2:
         raise SystemExit("--enable-gate без --filter-level 2: гейту нужна ковариация Калмана")
     tcfg.ENABLE_MAHALANOBIS_GATE = args.enable_gate
+    if args.radius_legacy:
+        tcfg.TARGET_RADIUS_IGNORES_VIEW_CAP = False
     if args.gate_legacy:
         # Все три правки разом: сравнивать надо с тем, что работало, а не с
         # промежуточной комбинацией, которой никогда не было в проде.
@@ -360,6 +365,7 @@ def main():
         "gate_r_from_predicted_size": tcfg.MAHA_R_FROM_PREDICTED_SIZE,
         "gate_also_radius": tcfg.KALMAN_GATE_ALSO_RADIUS,
         "gate_min_updates": tcfg.KALMAN_GATE_MIN_UPDATES,
+        "radius_ignores_view_cap": tcfg.TARGET_RADIUS_IGNORES_VIEW_CAP,
         "kalman": {
             "sigma_accel_mps2": tcfg.KALMAN_SIGMA_ACCEL_MPS2,
             "ref_distance_m": tcfg.KALMAN_REF_DISTANCE_M,

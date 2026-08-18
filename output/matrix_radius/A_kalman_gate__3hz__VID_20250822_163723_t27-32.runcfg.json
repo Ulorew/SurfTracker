@@ -1,0 +1,52 @@
+{
+  "weights": "/home/ulorew/Projects/SurfTracker/models/night_legacy_s3_best.pt",
+  "weights_sha256": "9e102c8ec59fffadd9590c59937d7aaa8888fe4f37b5077c38979ac0a79769f2",
+  "frames_dir": "/home/ulorew/Projects/SurfTracker/Data/frames/val_manual/VID_20250822_163723_t27-32",
+  "imgsz": 640,
+  "detect_low_conf": 0.08,
+  "mechanism_A_size": true,
+  "mechanism_B_occlusion": false,
+  "mechanism_V_velocity": false,
+  "mechanism_Vdir_direction": false,
+  "shadow_tracks": false,
+  "score_form": "distance",
+  "extrapolation_tau_sec": 1.5,
+  "vdir_lambda": 0.5,
+  "vdir_cos_veto": 0.0,
+  "tick_hz": 3.0,
+  "size_lambda": 0.5,
+  "size_veto_ratio": 1.8,
+  "occlusion_proximity_frac": 0.25,
+  "occlusion_hold_ticks": 4,
+  "target_select_max_dist_frac": 0.3,
+  "filter_level": 2,
+  "mahalanobis_gate": true,
+  "gate_r_from_predicted_size": true,
+  "gate_also_radius": true,
+  "gate_min_updates": 5,
+  "radius_ignores_view_cap": true,
+  "kalman": {
+    "sigma_accel_mps2": 2.0,
+    "ref_distance_m": 50.0,
+    "max_speed_mps": 20.0,
+    "min_distance_m": 20.0,
+    "r_pos_size_frac": 0.3,
+    "r_logh": 0.25,
+    "logh_radial_frac": 0.3,
+    "gate_chi2": 9.21
+  },
+  "intrinsics": {
+    "fx": 1450.401785870305,
+    "cx": 960.0,
+    "cy": 540.0,
+    "source": "прикидка",
+    "note": "смартфон, типичный FOV 67°"
+  },
+  "min_window_deg": 24.883526129370694,
+  "max_window_deg": 40.841667237749384,
+  "view_half_deg": [
+    33.5,
+    20.420833618874692
+  ],
+  "view_clamp": "window"
+}

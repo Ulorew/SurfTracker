@@ -252,6 +252,27 @@ public final class Tracker {
     }
 
     /**
+     * Сторона, ОТ КОТОРОЙ меряется приём. То же, что окно, но БЕЗ потолка кадра.
+     *
+     * Потолок — свойство КАДРА: вырезка больше короткой стороны приходит в
+     * модель анизотропно сплющенной, поэтому окно им и режется. Но к вопросу
+     * «мог ли этот кандидат быть моей целью» размер кадра отношения не имеет.
+     *
+     * Числа прогона 260818_1059: цель 960, окно 3.5*960 = 3360 упирается в
+     * 1440, радиус приёма выходит 0.30*1440 = 432 px — 0.45 размера цели
+     * вместо 1.05. На тактах 409 и 419 уверенные детекции (0.90 и 0.92) были
+     * отвергнуты именно этим схлопнувшимся радиусом.
+     *
+     * Размер ПРЕДСКАЗАННЫЙ (ведёт фильтр), а не размер кандидата. Урок выучен
+     * трижды: счёт кандидата, гейт, теперь радиус.
+     */
+    public double acceptanceSide() {
+        double base = Math.max(WINDOW_K * filteredSize, MIN_WINDOW_PX);
+        int steps = Math.min(missCount, MAX_EXPAND_STEPS);
+        return (steps > 0) ? base * Math.pow(EXPAND_PER_MISS, steps) : base;
+    }
+
+    /**
      * Проекция ПОЗИЦИИ на видимую область; скорость не трогается.
      *
      * Перенесено из clamp_belief_to_view. В первой редакции переноса не было
@@ -449,7 +470,8 @@ public final class Tracker {
     private int selectTarget(double[][] dets, int n, double predCx, double predCy,
                              double side, double dt) {
         double frac = (status == TRACKING) ? SELECT_MAX_DIST_FRAC : REACQ_MAX_DIST_FRAC;
-        double maxDist = frac * side;
+        // ОТ СТОРОНЫ ПРИЁМА, не от прижатой стороны окна (см. acceptanceSide).
+        double maxDist = frac * acceptanceSide();
         int best = -1; double bestScore = Double.MAX_VALUE;
         for (int i = 0; i < n; i++) {
             double d = Math.hypot(dets[i][0] - predCx, dets[i][1] - predCy);
@@ -537,7 +559,8 @@ public final class Tracker {
         t.predCy = planCy(dt, t.side);
         boolean byGate = ENABLE_GATE && ENABLE_KALMAN && status == TRACKING;
         if (!byGate)
-            t.gate = ((status == TRACKING) ? SELECT_MAX_DIST_FRAC : REACQ_MAX_DIST_FRAC) * t.side;
+            t.gate = ((status == TRACKING) ? SELECT_MAX_DIST_FRAC : REACQ_MAX_DIST_FRAC)
+                     * acceptanceSide();
         t.chosen = selectTarget(dets, n, t.predCx, t.predCy, t.side, dt);
         if (t.chosen >= 0) {
             t.dist = Math.hypot(dets[t.chosen][0] - t.predCx, dets[t.chosen][1] - t.predCy);
