@@ -26,9 +26,9 @@ echo "== сборка =="
 # сочетания. Константа, которой в данном режиме не пользуются, не должна менять
 # ничего — и это такая же проверка, как и обратная: механизм, влияющий в
 # выключенном виде, включён не там, где думают.
-BASE="k expand miss reacq tau"      # общие для всех режимов
+BASE="k expand miss reacq tau minwin"   # общие для всех режимов
 MUT_L1="shrink alpha"               # альфа-бета и EMA размера: только уровень 1
-MUT_A="lam veto"                    # механизм А
+MUT_A="lam lam0 veto veto0"         # механизм А: и величина, и наличие
 MUT_K="rpos rlogh accel"            # Калман
 MUT_G="chi2"                        # гейт
 MUT_RADIUS="frac"                   # радиус приёма в ведении: не нужен при гейте
@@ -65,10 +65,15 @@ for combo in "уровень1|false|false|false" \
     for m in $LIST; do
       PORT_CHECK_MUTATE=$m "$PY" py_drive.py scenarios.txt "$D/m.csv" \
           "$mode" "$a" "$kal" "$gate" 2>/dev/null
-      if "$PY" compare.py "$D/m.csv" "$D/java.csv" --quiet; then
+      # ИМЕНА СЦЕНАРИЕВ, а не голое «поймана». Порча ловится ровно теми
+      # сценариями, которые трогают её механизм, и увидеть этот список —
+      # единственный способ заметить, что механизм проверен не тем местом.
+      # Так и вскрылось, что вето ловилось только нижней половиной.
+      where=$("$PY" compare.py "$D/m.csv" "$D/java.csv" --names) || true
+      if [ "$where" = "-" ]; then
         echo "  ПОРЧА '$m' НЕ ПОЙМАНА"; bad=$((bad+1))
       else
-        echo "  порча '$m' поймана"
+        echo "  порча '$m' поймана на: $where"
       fi
     done
     for m in $SILENT; do

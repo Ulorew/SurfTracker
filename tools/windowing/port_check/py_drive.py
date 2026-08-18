@@ -72,6 +72,15 @@ MUTATIONS = {
     # обязан их НЕ поймать, и это тоже проверяется (контроль ниже).
     'lam':    ('SIZE_LAMBDA', 2.0),
     'veto':   ('SIZE_VETO_RATIO', 1.2),
+    # ШТРАФ ЕСТЬ ВООБЩЕ? Порча 'lam' (0.5 -> 2.0) отвечала только на вопрос
+    # «тот ли коэффициент», и отвечала им же на переносе, где штрафа нет
+    # вовсе. Ноль — единственная порча, которую невозможно пройти без
+    # работающего штрафного слагаемого: контроль требует совпасть с λ=0.5, а
+    # эта порча требует РАЗОЙТИСЬ с λ=0.0, и вместе они зажимают механизм.
+    'lam0':   ('SIZE_LAMBDA', 0.0),
+    # То же для вето: 'veto' лишь ужимает полосу, а эта порча снимает её
+    # целиком — и ловится только сценарием, где вето кого-то отвергает.
+    'veto0':  ('SIZE_VETO_RATIO', 1e9),
     # Уровень 2: ловятся только при включённом Калмане (а chi2 — при гейте).
     'chi2':   ('KALMAN_GATE_CHI2', 3.0),
     'rpos':   ('KALMAN_R_POS_SIZE_FRAC', 0.10),
@@ -80,7 +89,15 @@ MUTATIONS = {
 }
 
 
+# Пол окна живёт не в конфиге, а в аргументе конструктора TrackState (обе
+# стороны читают его из строки FRAME), поэтому порча идёт особым путём.
+MIN_WINDOW_MUTATION = 900
+
+
 def apply_mutation(name):
+    if name == 'minwin':
+        sys.stderr.write(f'ПОРЧА: min_window = {MIN_WINDOW_MUTATION}\n')
+        return
     attr, val = MUTATIONS[name]
     setattr(tcfg, attr, val)
     sys.stderr.write(f'ПОРЧА: {attr} = {val}\n')
@@ -151,6 +168,8 @@ def main():
         apply_mutation(mut)
     frame, scens = read_scenarios(sys.argv[1])
     W, H, dt, min_win = frame
+    if mut == 'minwin':
+        min_win = MIN_WINDOW_MUTATION
     hw, hh = W / 2.0, H / 2.0
     max_win = min(W, H)
 

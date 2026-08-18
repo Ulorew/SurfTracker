@@ -9,7 +9,10 @@
 """
 import sys, csv
 
-TOL_PX = 1.0          # допуск по координатам и стороне окна, пиксели
+TOL_PX = 0.001       # допуск, пиксели. НЕ 1.0: контроль без порчи даёт ровный
+                     # ноль во всех клетках матрицы, а обнуление блоков Q двигает
+                     # предсказание на 0.0154 px — допуск в тысячу раз выше уровня
+                     # шума выбрасывал три порчи Калмана и всё прочее того же масштаба.
 
 
 def load(path):
@@ -21,6 +24,7 @@ def main():
     a = load(sys.argv[1])   # питон, эталон
     b = load(sys.argv[2])   # телефонный перенос
     quiet = '--quiet' in sys.argv
+    names = '--names' in sys.argv   # только имена разошедшихся сценариев
 
     if len(a) != len(b):
         print(f'РАЗНОЕ ЧИСЛО ТАКТОВ: питон {len(a)}, телефон {len(b)}')
@@ -46,17 +50,22 @@ def main():
             bad_status += 1; per_scen[s]['st'] += 1
             why.append(f"состояние {ra['status']}!={rb['status']}")
         if ra['miss'] != rb['miss']:
-            bad_miss += 1; why.append(f"промахов {ra['miss']}!={rb['miss']}")
+            bad_miss += 1; per_scen[s]['ot'] = per_scen[s].get('ot', 0) + 1; why.append(f"промахов {ra['miss']}!={rb['miss']}")
         if abs(float(ra['side']) - float(rb['side'])) > TOL_PX:
-            bad_side += 1
+            bad_side += 1; per_scen[s]['ot'] = per_scen[s].get('ot', 0) + 1
             why.append(f"окно {float(ra['side']):.1f}!={float(rb['side']):.1f}")
         dx = abs(float(ra['pred_cx']) - float(rb['pred_cx']))
         dy = abs(float(ra['pred_cy']) - float(rb['pred_cy']))
         if max(dx, dy) > TOL_PX:
-            bad_pred += 1
+            bad_pred += 1; per_scen[s]['ot'] = per_scen[s].get('ot', 0) + 1
             why.append(f"центр {dx:.1f}/{dy:.1f} px")
         if why and len(first) < 12:
             first.append(f"  {s} такт {ra['tick']}: " + '; '.join(why))
+
+    if names:
+        bad = [s for s, d in per_scen.items() if d['ch'] or d['st'] or d.get('ot')]
+        print(','.join(bad) if bad else '-')
+        return 0 if not bad else 1
 
     if not quiet:
         print(f'тактов сличено: {n}')
