@@ -1,46 +1,42 @@
-# --- данные и артефакты обучения: в репозиторий не идут ---
+
+android/camfps/build/
+android/camfps/proofs/
+*.avi
+*.cache
 Data/
 Datasets/
-models/
-runs/
-reports/v1_viz/
-tools/windowing/output/
-tools/X-AnyLabeling/
-
-# окружения
-.venv/
-.venv-label/
-
-# секреты
 .env
-
-# питон
-__pycache__/
-*.pyc
-.pytest_cache/
-
-# веса, медиа, кеши датасетов
-*.pt
-*.onnx
-*.cache
-*.jpg
-*.jpeg
-*.png
-*.mp4
-*.mov
-*.avi
-*.webm
-.venv-export/
-
-# Экспорт: артефакты тяжёлые и воспроизводятся скриптами; в репозитории
-# остаются только манифесты и отчёты сверки
+export/*.log
+export/models/*.tflite
+export/phone_pack/
 export/testset/
 export/testset_big/
-export/phone_pack/
-export/models/*.tflite
-export/*.log
-
-# пруфы с устройства (данные, не код)
-android/camfps/proofs/
+*.jpeg
+*.jpg
+models/
+models/phone/
+*.mov
+*.mp4
+*.onnx
+*.png
+*.pt
+*.pyc
+__pycache__/
+.pytest_cache/
+reports/v1_viz/
+runs/
 tools/stand/out/
-android/camfps/build/
+tools/windowing/output/
+tools/X-AnyLabeling/
+.venv/
+.venv-export/
+.venv-label/
+*.webm
+# веса, медиа, кеши датасетов
+# --- данные и артефакты обучения: в репозиторий не идут ---
+# окружения
+# остаются только манифесты и отчёты сверки
+# питон
+# пруфы с устройства (данные, не код)
+# секреты
+# Экспорт: артефакты тяжёлые и воспроизводятся скриптами; в репозитории

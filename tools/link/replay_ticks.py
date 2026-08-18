@@ -2,41 +2,45 @@
 """Репроигрыш отдельных тактов записанного прогона: почему цель не взяли.
 
 ЗАЧЕМ. Лог говорит, ЧТО решила петля (кандидатов столько-то, выбран такой-то,
-до предсказания столько), но не говорит, КАКИЕ кандидаты были и почему
-отвергнуты. Для тактов 409 и 419 прогона 260818_1059 известно лишь, что
-уверенность в кадре была 0.90 и 0.92, а цель не взята.
+до предсказания столько), но при отказе не говорит, ГДЕ был отвергнутый
+кандидат — а без этого «модель не нашла» и «алгоритм отверг» неразличимы.
 
-Инструмент запускает детектор на СОХРАНЁННОМ КАДРЕ МОДЕЛИ (frames/NNNNN.jpg —
-ровно тот тензор 640x640, который видела сеть на телефоне) и печатает каждого
-кандидата с приговором по каждому механизму отбора порознь: радиус в прежней
-форме, радиус в новой, вето по размеру, гейт.
+Инструмент прогоняет ТУ ЖЕ МОДЕЛЬ на СОХРАНЁННОМ КАДРЕ МОДЕЛИ
+(frames/NNNNN.jpg — ровно тот тензор 640x640, который видела сеть на
+телефоне) и печатает каждого кандидата с приговором по каждому механизму
+отбора порознь: радиус в прежней форме, радиус в новой, вето механизма А.
 
-Так вопрос «модель не нашла или алгоритм отверг» решается числом, а не глазом.
+МОДЕЛЬ БЕРЁТСЯ ИЗ run.json И СВЕРЯЕТСЯ. Первая редакция этого не делала, и
+подставленная не та модель (сёрферная вместо COCO) дала ноль детекций на
+кадре, где телефон нашёл цель с уверенностью 0.886 — то есть инструмент
+уверенно ответил «вопрос к модели» там, где вопрос был к нему самому.
+Несовпадение теперь останавливает прогон.
 
-    replay_ticks.py runs/phone/260818_1059_полный 409 419 433 719 \\
-        [--weights models/night_legacy_s3_best.pt]
+NMS берётся из стенда nms_check — той самой реализации, что посимвольно
+сличена с телефонной на 172 случаях. Своя копия здесь означала бы, что
+репроигрыш меряет не тот отбор, что боевой.
 
-Требует, чтобы прогон был стянут ВМЕСТЕ с папкой frames.
+    replay_ticks.py runs/phone/260818_1059_полный 409 419 433 719
+
+Требует папку frames (пишется при rec=true) и модель в models/phone/.
 """
 import argparse
 import csv
+import json
 import math
 import os
 import sys
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+sys.path.insert(0, os.path.join(ROOT, "tools", "windowing", "nms_check"))
 
-LOW_CONF = 0.08          # Tracker.DETECT_LOW_CONF
 WINDOW_K = 3.5           # TRACK_WINDOW_K
 MIN_WINDOW = 640         # DETECT_MIN_WINDOW_PX
 SELECT_FRAC = 0.30       # TARGET_SELECT_MAX_DIST_FRAC
 VETO_RATIO = 1.8         # SIZE_VETO_RATIO
-LAMBDA = 0.5             # SIZE_LAMBDA
-
-
-def строки(run):
-    with open(os.path.join(run, "log.csv")) as f:
-        return list(csv.DictReader(f))
+NET = 640
+MAX_DET = 16
 
 
 def число(row, key, default=float("nan")):
@@ -49,13 +53,26 @@ def число(row, key, default=float("nan")):
         return default
 
 
+def инференс(interp, путь):
+    import numpy as np
+    from PIL import Image
+    im = Image.open(путь).convert("RGB")
+    if im.size != (NET, NET):
+        sys.exit(f"кадр {путь} размера {im.size}, ожидался {NET}x{NET}")
+    a = np.asarray(im, dtype=np.float32) / 255.0          # HWC
+    x = np.transpose(a, (2, 0, 1))[None, ...]             # NCHW, как на телефоне
+    inp = interp.get_input_details()[0]
+    interp.set_tensor(inp["index"], x)
+    interp.invoke()
+    return interp.get_tensor(interp.get_output_details()[0]["index"])[0]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("run")
     ap.add_argument("ticks", nargs="+", type=int)
-    ap.add_argument("--weights",
-                    default=os.path.join(ROOT, "models", "night_legacy_s3_best.pt"))
-    ap.add_argument("--imgsz", type=int, default=640)
+    ap.add_argument("--model", default=None,
+                    help="по умолчанию — та, что записана в run.json прогона")
     args = ap.parse_args()
 
     run = args.run if os.path.isabs(args.run) else os.path.join(ROOT, args.run)
@@ -64,66 +81,78 @@ def main():
         sys.exit(f"нет папки {frames} — прогон стянут без кадров модели.\n"
                  f"Кадры пишутся при rec=true; стянуть: tools/link/pull_run.sh <имя>")
 
-    rows = строки(run)
-    by_i = {int(r["i"]): r for r in rows}
+    cfg = json.load(open(os.path.join(run, "run.json")))
+    имя_модели = cfg.get("модель")
+    модель = args.model or os.path.join(ROOT, "models", "phone", имя_модели or "")
+    if not имя_модели:
+        sys.exit("в run.json нет поля «модель» — сверить нечем, отказываюсь гадать")
+    if not os.path.exists(модель):
+        sys.exit(f"нет модели {модель}.\nПрогон шёл на «{имя_модели}»; стянуть с телефона:\n"
+                 f"  adb pull /sdcard/Android/data/com.surftracker.camfps/files/{имя_модели} "
+                 f"models/phone/")
+    if args.model and os.path.basename(args.model) != имя_модели:
+        sys.exit(f"МОДЕЛЬ НЕ ТА: прогон шёл на «{имя_модели}», подставлена "
+                 f"«{os.path.basename(args.model)}». Репроигрыш другой моделью отвечает "
+                 f"на другой вопрос.")
 
-    from ultralytics import YOLO
-    model = YOLO(args.weights)
+    with open(os.path.join(run, "log.csv")) as f:
+        by_i = {int(r["i"]): r for r in csv.DictReader(f)}
+
+    from ai_edge_litert.interpreter import Interpreter
+    import nms_ref
+    interp = Interpreter(model_path=модель)
+    interp.allocate_tensors()
+    print(f"модель: {имя_модели}, кадр {cfg.get('сенсор')}, окно {cfg.get('окно')}")
+
+    W, H = (int(v) for v in str(cfg.get("сенсор", "1920x1440")).split("x"))
 
     for tick in args.ticks:
-        if tick not in by_i:
-            print(f"\n=== такт {tick}: нет в логе ==="); continue
-        r = by_i[tick]
-        prev = by_i.get(tick - 1)
-        if prev is None:
-            print(f"\n=== такт {tick}: нет предыдущей строки, центр приёма не восстановить ===")
+        r, prev = by_i.get(tick), by_i.get(tick - 1)
+        if r is None or prev is None:
+            print(f"\n=== такт {tick}: нет строки в логе ===")
             continue
 
         # Центр приёма и окно — из ПРЕДЫДУЩЕЙ строки: план на этот такт
-        # составлялся в конце прошлого. Сверено по логу: расхождение с
-        # настоящим центром p50 = 1.8 px.
+        # составлялся в конце прошлого. Сверено по логу: p50 = 1.8 px.
         pcx, pcy = число(prev, "winCx"), число(prev, "winCy")
-        sc = число(prev, "Sc")
-        filt = число(prev, "размер_фильтра")
-        if not (sc > 0 and filt > 0):
-            print(f"\n=== такт {tick}: в логе нет Sc или размера фильтра ==="); continue
-
+        sc, filt = число(prev, "Sc"), число(prev, "размер_фильтра")
         путь = os.path.join(frames, f"{tick:05d}.jpg")
         if not os.path.exists(путь):
-            print(f"\n=== такт {tick}: нет кадра {путь} ==="); continue
+            print(f"\n=== такт {tick}: нет кадра {путь} ===")
+            continue
 
-        cropX = min(max(pcx - sc / 2, 0), 3840 - sc)   # как в петле
-        cropY = min(max(pcy - sc / 2, 0), 2160 - sc)
-        масштаб = sc / 640.0
+        cropX = min(max(pcx - sc / 2, 0), W - sc)
+        cropY = min(max(pcy - sc / 2, 0), H - sc)
+        масштаб = sc / NET
 
-        res = model.predict(путь, imgsz=args.imgsz, conf=LOW_CONF, verbose=False)[0]
+        raw = инференс(interp, путь)
+        cols = [[float(raw[row][a]) for row in range(5)] for a in range(raw.shape[1])]
+        dets = nms_ref.nms(cols, MAX_DET)
 
-        радиус_было = SELECT_FRAC * sc                        # от ПРИЖАТОГО окна
+        радиус_было = SELECT_FRAC * sc                              # от ПРИЖАТОГО окна
         радиус_стало = SELECT_FRAC * max(WINDOW_K * filt, MIN_WINDOW)
 
         print(f"\n=== такт {tick} ===")
+        print(f"  лог: есть_цель={r.get('есть_цель')} conf={r.get('conf')} "
+              f"кандидатов={r.get('кандидатов')} промахов={r.get('промахов')}")
         print(f"  ведомый размер {filt:.0f}, окно {sc:.0f} "
-              f"(без потолка было бы {max(WINDOW_K*filt, MIN_WINDOW):.0f})")
+              f"(без потолка было бы {max(WINDOW_K * filt, MIN_WINDOW):.0f})")
         print(f"  радиус приёма: было {радиус_было:.0f}, стало {радиус_стало:.0f}")
-        print(f"  в логе: есть_цель={r.get('есть_цель')} conf={r.get('conf')} "
-              f"кандидатов={r.get('кандидатов')}")
-        if len(res.boxes) == 0:
+        if not dets:
             print("  ДЕТЕКТОР НЕ НАШЁЛ НИЧЕГО — вопрос к модели, не к алгоритму")
             continue
         print(f'  {"#":>2} {"conf":>5} {"размер":>7} {"до предск.":>11} '
-              f'{"отн.":>5}  {"было":>6} {"стало":>6} {"вето А":>7}')
-        for k, b in enumerate(res.boxes):
-            x0, y0, x1, y1 = [float(v) for v in b.xyxy[0]]
-            conf = float(b.conf[0])
-            cx = cropX + (x0 + x1) / 2 * масштаб
-            cy = cropY + (y0 + y1) / 2 * масштаб
-            размер = max(x1 - x0, y1 - y0) * масштаб
-            d = math.hypot(cx - pcx, cy - pcy)
-            отн = размер / filt
+              f'{"отн.":>5}  {"было":>6} {"стало":>6} {"вето А":>8}')
+        for k, d in enumerate(dets):
+            cx = cropX + d[0] * NET * масштаб
+            cy = cropY + d[1] * NET * масштаб
+            размер = d[2] * NET * масштаб
+            dist = math.hypot(cx - pcx, cy - pcy)
+            отн = размер / filt if filt > 0 else float("nan")
             вето = "ОТСЕЧЁН" if (отн > VETO_RATIO or отн < 1 / VETO_RATIO) else "прошёл"
-            print(f"  {k:>2} {conf:>5.2f} {размер:>7.0f} {d:>11.0f} {отн:>5.2f}  "
-                  f'{"взят" if d <= радиус_было else "мимо":>6} '
-                  f'{"взят" if d <= радиус_стало else "мимо":>6} {вето:>7}')
+            print(f"  {k:>2} {d[5]:>5.2f} {размер:>7.0f} {dist:>11.0f} {отн:>5.2f}  "
+                  f'{"взят" if dist <= радиус_было else "мимо":>6} '
+                  f'{"взят" if dist <= радиус_стало else "мимо":>6} {вето:>8}')
     return 0
 
 
