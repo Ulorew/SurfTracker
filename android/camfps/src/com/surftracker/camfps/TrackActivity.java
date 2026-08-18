@@ -738,11 +738,30 @@ public class TrackActivity extends Activity {
             // Стендовая активность этого не показывала: она делала один снимок
             // и останавливала поток ДО инференса.
             int wantW = getIntent().getIntExtra("cam_w", 1920);
+            // АСПЕКТ УЧАСТВУЕТ В ВЫБОРЕ. Прежде отбор шёл по одной ширине, и
+            // 1920x1440 выигрывало у 1920x1080 просто порядком перебора — то
+            // есть аспект потока анализа был не решением, а случайностью.
+            //
+            // Он не безразличен в обе стороны: 4:3 это 2.76 Мп против 2.07, то
+            // есть треть лишней работы ISP под запись, которая всё равно 16:9;
+            // зато потолок окна трекера равен min(W,H) и падает с 1440 до 1080.
+            // В прогоне 260818_1059 сторона окна упиралась в 1440 медианно,
+            // значит смена аспекта окно ЗАТРОНЕТ, и мерить надо, а не решать.
+            double wantAsp = "16:9".equals(cfg.s("aspect")) ? 16.0 / 9.0 : 4.0 / 3.0;
             Size pick = null;
+            double pickErr = Double.MAX_VALUE;
             for (Size sz : map.getOutputSizes(ImageFormat.YUV_420_888)) {
-                if (pick == null
-                    || Math.abs(sz.getWidth() - wantW) < Math.abs(pick.getWidth() - wantW))
-                    pick = sz;
+                double asp = sz.getWidth() / (double) sz.getHeight();
+                if (Math.abs(asp - wantAsp) > 0.01) continue;   // аспект — жёсткое условие
+                double err = Math.abs(sz.getWidth() - wantW);
+                if (err < pickErr) { pickErr = err; pick = sz; }
+            }
+            if (pick == null) {           // запрошенного аспекта нет — прежнее правило
+                for (Size sz : map.getOutputSizes(ImageFormat.YUV_420_888))
+                    if (pick == null
+                        || Math.abs(sz.getWidth() - wantW) < Math.abs(pick.getWidth() - wantW))
+                        pick = sz;
+                Log.w(TAG, "аспект " + cfg.s("aspect") + " не поддержан, беру по ширине");
             }
             final int W = pick.getWidth(), H = pick.getHeight();
 
@@ -794,11 +813,26 @@ public class TrackActivity extends Activity {
                 Log.i(TAG, "поле зрения задано вручную: " + fovSet + " вместо " + hfovDeg);
                 hfovDeg = fovSet;
             }
-            final double fPx = (W / 2.0) / Math.tan(Math.toRadians(hfovDeg / 2.0));
+            // ЗУМ ВХОДИТ В ФОКУС. Кроп-регион сужается в zoom раз и растягивается
+            // на тот же выход, значит один и тот же объект занимает в zoom раз
+            // больше пикселей — то есть f в пикселях умножается на zoom. Забыть
+            // это значит отдать петле масштаб, заниженный во столько же раз, и
+            // получить K, раздутый ровно на этот множитель.
+            //
+            // Предел без домысливания: zoom = ширина матрицы / ширина выхода.
+            // Для этого аппарата матрица 4080, значит 2.125 при выходе 1920 и
+            // 1.062 при 3840. Выше него ISP интерполирует, и 4K перестаёт нести
+            // хоть что-то, чего нет в FullHD.
+            float zoom = cfg.f("zoom");
+            if (!(zoom >= 1.0f)) zoom = 1.0f;
+            final double fPx = zoom * (W / 2.0) / Math.tan(Math.toRadians(hfovDeg / 2.0));
             final double degPerPx = Math.toDegrees(1.0 / fPx);   // в центре кадра
 
             // Только вычисленное из камеры: остальное записано выше, до неё.
-            j.append(",\"сенсор\":\"").append(W).append("x").append(H)
+            j.append(",\"аспект\":\"").append(cfg.s("aspect"))
+             .append("\",\"зум\":").append(fmt(zoom))
+             .append(",\"превью\":").append(cfg.b("preview"))
+             .append(",\"сенсор\":\"").append(W).append("x").append(H)
              .append("\",\"поле_зрения_град\":").append(fmt(hfovDeg))
              .append(",\"град_на_пиксель\":").append(String.format(java.util.Locale.US, "%.5f", degPerPx));
             // Выбег, перезахват, удержание, возврат и режим без мотора отсюда
@@ -833,16 +867,25 @@ public class TrackActivity extends Activity {
             List<Surface> targets = new ArrayList<>();
             targets.add(reader.getSurface());
 
-            // Запись: превью + рекордер + анализ. Превью в наборе обязательно —
-            // это проверенная на этом аппарате комбинация потоков (см.
-            // reports/ТЕЛЕФОН.md, «PRIV 1080p + PRIV 4K + YUV max»), и без
-            // него сессия на части устройств не собирается.
-            if (video) {
+            // Запись: превью + рекордер + анализ. Комбинация «PRIV 1080p +
+            // PRIV 4K + YUV max» проверена на этом аппарате как поддержанная
+            // (reports/ТЕЛЕФОН.md) — но это доказывает, что она РАБОТАЕТ, а не
+            // что превью необходимо.
+            //
+            // ПРЕВЬЮ ЗА ФЛАГОМ. Утверждение «без него сессия не собирается»
+            // проверено не было ни разу, а слотов у этого аппарата ровно три
+            // (maxNumOutputStreams = [1,3,1]), и фиктивная поверхность занимает
+            // один из них целиком. Если сессия без превью не соберётся — это
+            // будет видно сразу и с понятной причиной.
+            boolean wantPreview = cfg.b("preview");
+            if (video && wantPreview) {
                 previewTexture = new SurfaceTexture(0);
                 previewTexture.setDefaultBufferSize(1920, 1080);
                 previewSurface = new Surface(previewTexture);
                 targets.add(previewSurface);
+            }
 
+            if (video) {
                 recorder = new MediaRecorder();
                 recorder.setVideoSource(MediaRecorder.VideoSource.SURFACE);
                 // Параметры ИЗ ПРОФИЛЯ УСТРОЙСТВА, а не назначенные руками:
@@ -933,7 +976,16 @@ public class TrackActivity extends Activity {
             CaptureRequest.Builder rq = dev.createCaptureRequest(
                     video ? CameraDevice.TEMPLATE_RECORD : CameraDevice.TEMPLATE_PREVIEW);
             rq.addTarget(reader.getSurface());
-            if (video) { rq.addTarget(previewSurface); rq.addTarget(recSurface); }
+            if (previewSurface != null) rq.addTarget(previewSurface);
+            if (video) { rq.addTarget(recSurface); }
+            if (zoom > 1.0f) {
+                try {
+                    rq.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom);
+                    Log.i(TAG, "аппаратный зум " + zoom);
+                } catch (Throwable t) {
+                    Log.e(TAG, "зум не принят: " + t);
+                }
+            }
             box[0].setRepeatingRequest(rq.build(), null, h);
             if (video) {
                 recorder.start();
