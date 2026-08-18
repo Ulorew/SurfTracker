@@ -83,6 +83,11 @@ MUTATIONS = {
     'veto0':  ('SIZE_VETO_RATIO', 1e9),
     # Уровень 2: ловятся только при включённом Калмане (а chi2 — при гейте).
     'chi2':   ('KALMAN_GATE_CHI2', 3.0),
+    # Каждая из трёх правок гейта — своей порчей. Одной общей мало: правки
+    # независимы, и «поймана» на общей не сказало бы, какая именно перенесена.
+    'gpred':  ('MAHA_R_FROM_PREDICTED_SIZE', False),
+    'grad':   ('KALMAN_GATE_ALSO_RADIUS', False),
+    'gwarm':  ('KALMAN_GATE_MIN_UPDATES', 0),
     'rpos':   ('KALMAN_R_POS_SIZE_FRAC', 0.10),
     'rlogh':  ('KALMAN_R_LOGH', 0.05),
     'accel':  ('KALMAN_SIGMA_ACCEL_MPS2', 5.0 * (2.0 / 50.0) * 2600.0),
@@ -95,6 +100,13 @@ MIN_WINDOW_MUTATION = 900
 
 
 def apply_mutation(name):
+    # Составная порча: снять правило «только сужать» И прогрев разом. Нужна
+    # ровно для одного — показать, что прогрев не мёртв, а подчинён.
+    if name == 'grad_gwarm':
+        tcfg.KALMAN_GATE_ALSO_RADIUS = False
+        tcfg.KALMAN_GATE_MIN_UPDATES = 0
+        sys.stderr.write('ПОРЧА: сужение снято И прогрев снят\n')
+        return
     if name == 'minwin':
         sys.stderr.write(f'ПОРЧА: min_window = {MIN_WINDOW_MUTATION}\n')
         return
@@ -157,6 +169,11 @@ def main():
         tcfg.KALMAN_R_POS_SIZE_FRAC = 0.30
         tcfg.KALMAN_R_LOGH = 0.25
         tcfg.KALMAN_GATE_CHI2 = 9.21
+        # Три правки гейта от 18.08 — явно, а не умолчанием: стенд обязан
+        # сличать ту конфигурацию, которую называет, даже если конфиг сменят.
+        tcfg.MAHA_R_FROM_PREDICTED_SIZE = True
+        tcfg.KALMAN_GATE_ALSO_RADIUS = True
+        tcfg.KALMAN_GATE_MIN_UPDATES = 5
         tcfg.KALMAN_ANISOTROPIC_Q = False
     if len(sys.argv) > 6:
         tcfg.ENABLE_MAHALANOBIS_GATE = (sys.argv[6] == 'true')

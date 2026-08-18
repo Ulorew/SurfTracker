@@ -37,6 +37,8 @@ public final class KalmanTracker {
     public static final double R_POS_SIZE_FRAC = 0.30;   // KALMAN_R_POS_SIZE_FRAC
     public static final double R_LOGH = 0.25;            // KALMAN_R_LOGH
     public static final double GATE_CHI2 = 9.21;         // KALMAN_GATE_CHI2, 2 dof, p=0.01
+    /** Тактов ведения, после которых ковариации можно верить. KALMAN_GATE_MIN_UPDATES. */
+    public static final int GATE_MIN_UPDATES = 5;
     public static final double LOGH_RADIAL_FRAC = 0.30;  // KALMAN_LOGH_RADIAL_FRAC
     // Метрические допущения офлайна, приведённые к угловым:
     //   2.0 м/с² на опорных 50 м -> 0.04 рад/с²
@@ -46,6 +48,8 @@ public final class KalmanTracker {
     public static final double SEED_SIZE_FALLBACK_RAD = 0.02;
 
     public boolean initialized;
+    /** Принятых измерений с последней затравки: по нему судят о сходимости. */
+    public int nUpdates;
     private final double[] x = new double[5];
     private final double[][] P = new double[5][5];
 
@@ -81,6 +85,9 @@ public final class KalmanTracker {
         P[DTH][DTH] = vMax() * vMax(); P[DPH][DPH] = vMax() * vMax();
         P[LOGH][LOGH] = R_LOGH * R_LOGH;
         initialized = true;
+        // Счёт принятых измерений начинается заново с каждой затравки: после
+        // перезахвата ковариация снова широка, и гейту снова нельзя верить.
+        nUpdates = 0;
     }
 
     // --- матрицы модели ---------------------------------------------------
@@ -106,6 +113,23 @@ public final class KalmanTracker {
         double sl = sigmaLoghRate();
         q[LOGH][LOGH] = sl * sl * dt;
         return q;
+    }
+
+    /**
+     * Размер, из которого берётся допуск ПО ПОЛОЖЕНИЮ при сопоставлении.
+     *
+     * ПРЕДСКАЗАННЫЙ размер цели, а не размер кандидата. Перенос повторяет
+     * _match_r_size офлайна: R ~ размер², и пока в допуск подставлялся размер
+     * самого кандидата, крупная чужая рамка получала более широкий допуск —
+     * гейт охотнее пропускал ровно ту подмену, ради предотвращения которой
+     * заведён. Замер на этой геометрии: асимптотика радиуса 0.91·размер, то
+     * есть предмет вдвое крупнее цели принимался из любой точки кадра.
+     *
+     * В двумерном гейте размер кандидата измерением не является вовсе:
+     * сравниваются только положения.
+     */
+    private double matchRSize(double[] xp) {
+        return Math.exp(xp[LOGH]);
     }
 
     /** Сигма положения — доля размера ЦЕЛИ: крупная цель мерится хуже. */
@@ -156,7 +180,7 @@ public final class KalmanTracker {
     public double gateDistance2(double mx, double my, double mSize, double dt) {
         double[] xp = new double[5]; double[][] Pp = new double[5][5];
         predictMoments(dt, xp, Pp);
-        double r = rPos(mSize);
+        double r = rPos(matchRSize(xp));
         double a = Pp[TH][TH] + r, b = Pp[TH][PH], c = Pp[PH][TH], d = Pp[PH][PH] + r;
         double det = a * d - b * c;
         if (Math.abs(det) < 1e-18) return Double.MAX_VALUE;
@@ -170,6 +194,7 @@ public final class KalmanTracker {
     /** Обновление по измерению (положение и размер), форма Джозефа. */
     public void update(double mx, double my, double dt, double mSize) {
         if (!initialized) { seed(mx, my, mSize); return; }
+        nUpdates++;
         double[] xp = new double[5]; double[][] Pp = new double[5][5];
         predictMoments(dt, xp, Pp);
 

@@ -35,6 +35,10 @@ CONFIGS = {
     "A_vdir":            ["--enable-a", "--enable-vdir"],
     "A_kalman":          ["--enable-a", "--filter-level", "2"],
     "A_kalman_gate":     ["--enable-a", "--filter-level", "2", "--enable-gate"],
+    # Гейт ДО правок 18.08 — строка сравнения, а не кандидат в прод. Без неё
+    # «стало лучше» опиралось бы на память, а не на число.
+    "A_kalman_gate_legacy": ["--enable-a", "--filter-level", "2", "--enable-gate",
+                              "--gate-legacy"],
     "A_kalman_gate_vdir": ["--enable-a", "--filter-level", "2", "--enable-gate",
                             "--enable-vdir"],
     # Финалист тикета "счёт кандидата": форма 2 (анизотропный махаланобис) +

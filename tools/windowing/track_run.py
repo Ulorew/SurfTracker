@@ -277,6 +277,10 @@ def main():
     ap.add_argument("--filter-level", type=int, default=None, choices=[0, 1, 2],
                      help="0 = последняя детекция, 1 = alpha-beta (по умолчанию из конфига), "
                           "2 = Калман в углах (theta, theta', phi, phi', log h)")
+    ap.add_argument("--gate-legacy", action="store_true",
+                     help="гейт в форме ДО правок 18.08: допуск от размера "
+                          "кандидата, замещение радиуса, без прогрева. "
+                          "Нужен ровно для одного — измерить, что дали правки")
     ap.add_argument("--enable-gate", action="store_true",
                      help="махаланобисов гейт вместо фиксированного радиуса отбора "
                           "(требует --filter-level 2: у alpha-beta нет ковариации)")
@@ -319,6 +323,12 @@ def main():
     if args.enable_gate and tcfg.FILTER_LEVEL != 2:
         raise SystemExit("--enable-gate без --filter-level 2: гейту нужна ковариация Калмана")
     tcfg.ENABLE_MAHALANOBIS_GATE = args.enable_gate
+    if args.gate_legacy:
+        # Все три правки разом: сравнивать надо с тем, что работало, а не с
+        # промежуточной комбинацией, которой никогда не было в проде.
+        tcfg.MAHA_R_FROM_PREDICTED_SIZE = False
+        tcfg.KALMAN_GATE_ALSO_RADIUS = False
+        tcfg.KALMAN_GATE_MIN_UPDATES = 0
     if args.enable_b and tcfg.FILTER_LEVEL == 2:
         # в Калман-ветке пауза короче: неопределённость и так растёт по Q
         tcfg.OCCLUSION_HOLD_TICKS = tcfg.KALMAN_OCCLUSION_HOLD_TICKS
@@ -347,6 +357,9 @@ def main():
         "target_select_max_dist_frac": tcfg.TARGET_SELECT_MAX_DIST_FRAC,
         "filter_level": tcfg.FILTER_LEVEL,
         "mahalanobis_gate": tcfg.ENABLE_MAHALANOBIS_GATE,
+        "gate_r_from_predicted_size": tcfg.MAHA_R_FROM_PREDICTED_SIZE,
+        "gate_also_radius": tcfg.KALMAN_GATE_ALSO_RADIUS,
+        "gate_min_updates": tcfg.KALMAN_GATE_MIN_UPDATES,
         "kalman": {
             "sigma_accel_mps2": tcfg.KALMAN_SIGMA_ACCEL_MPS2,
             "ref_distance_m": tcfg.KALMAN_REF_DISTANCE_M,

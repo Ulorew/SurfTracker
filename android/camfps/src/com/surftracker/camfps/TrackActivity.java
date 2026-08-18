@@ -9,6 +9,9 @@ import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.CaptureResult;
+import android.hardware.camera2.TotalCaptureResult;
+import android.hardware.camera2.CameraMetadata;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.Image;
 import android.media.ImageReader;
@@ -640,7 +643,7 @@ public class TrackActivity extends Activity {
             // сценарии с двумя людьми.
             + "кандидатов,до_предсказания,порог,маха_d2,состояние,промахов,"
             + "ошибка_свежая,цель_в_мире,вал_при_захвате,t_кадра_мс,"
-            + "лаг_потока,возраст_кадра_мс,толчок_фаза,в_толчке,sync_такта,заряд,"
+            + "лаг_потока,возраст_кадра_мс,зум_факт,вал_за_кадр_град,толчок_фаза,в_толчке,sync_такта,заряд,"
             // Рамка выбранной детекции в ПИКСЕЛЯХ СЕНСОРА — те же координаты,
             // в которых живёт трекер и считается winCx.
             //
@@ -825,6 +828,36 @@ public class TrackActivity extends Activity {
             // хоть что-то, чего нет в FullHD.
             float zoom = cfg.f("zoom");
             if (!(zoom >= 1.0f)) zoom = 1.0f;
+            // ЧАСЫ МЕТКИ КАДРА. Аппарат объявляет источник меток в
+            // SENSOR_INFO_TIMESTAMP_SOURCE, и у этого — REALTIME, то есть
+            // метка идёт по elapsedRealtime, а не по nanoTime.
+            //
+            // Прежде возраст кадра считался как nanoTime() - метка и
+            // отбрасывался проверкой на разумность. Проверка отбрасывала ВСЁ:
+            // в прогоне 260818_1059 колонка «возраст_кадра_мс» пуста во всех
+            // 1351 строках. Механизм выглядел существующим и не дал ни одного
+            // числа — узнать это можно было только сложив два факта из разных
+            // мест, чего никто не делал.
+            //
+            // Смещение меряется один раз: обе шкалы идут монотонно, и разница
+            // между ними меняется только на глубоком сне, которого при горящем
+            // экране нет.
+            boolean tsRealtime = false;
+            try {
+                Integer src = ch.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE);
+                tsRealtime = src != null
+                        && src == CameraMetadata.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME;
+            } catch (Throwable t) {
+                Log.e(TAG, "источник меток не прочитался: " + t);
+            }
+            final long clockOffsetNs = tsRealtime
+                    ? (android.os.SystemClock.elapsedRealtimeNanos() - System.nanoTime())
+                    : 0L;
+            Log.i(TAG, "метки кадров: " + (tsRealtime ? "REALTIME" : "MONOTONIC")
+                     + ", смещение " + (clockOffsetNs / 1000000L) + " мс");
+            j.append(",\"метки_кадров\":\"").append(tsRealtime ? "realtime" : "monotonic")
+             .append("\",\"смещение_часов_мс\":").append(clockOffsetNs / 1000000L);
+
             final double fPx = zoom * (W / 2.0) / Math.tan(Math.toRadians(hfovDeg / 2.0));
             final double degPerPx = Math.toDegrees(1.0 / fPx);   // в центре кадра
 
@@ -986,7 +1019,34 @@ public class TrackActivity extends Activity {
                     Log.e(TAG, "зум не принят: " + t);
                 }
             }
-            box[0].setRepeatingRequest(rq.build(), null, h);
+            // КОЛБЭК РЕЗУЛЬТАТОВ. Прежде здесь стоял null, то есть
+            // CaptureResult не читался вовсе и петля верила, что зум равен
+            // заказанному. При постоянном зуме это безвредно, но проверить
+            // было нечем — а без проверки «зум применился» остаётся
+            // предположением. Заодно отсюда берётся метка кадра в тех же
+            // терминах, в каких её отдаёт Image.
+            final java.util.concurrent.ConcurrentHashMap<Long, Float> zoomOf =
+                    new java.util.concurrent.ConcurrentHashMap<>();
+            box[0].setRepeatingRequest(rq.build(), new CameraCaptureSession.CaptureCallback() {
+                @Override public void onCaptureCompleted(CameraCaptureSession s3,
+                        CaptureRequest req, TotalCaptureResult res) {
+                    try {
+                        Long ts = res.get(CaptureResult.SENSOR_TIMESTAMP);
+                        Float z = res.get(CaptureResult.CONTROL_ZOOM_RATIO);
+                        if (ts != null && z != null) {
+                            zoomOf.put(ts, z);
+                            // Карта не должна расти без предела: держим
+                            // последние секунды, дальше кадры уже разобраны.
+                            if (zoomOf.size() > 240) {
+                                long old = ts - 4_000_000_000L;
+                                zoomOf.keySet().removeIf(k -> k < old);
+                            }
+                        }
+                    } catch (Throwable t) {
+                        Log.e(TAG, "разбор результата захвата: " + t);
+                    }
+                }
+            }, h);
             if (video) {
                 recorder.start();
                 // Момент начала записи. Без него наложение рамок на видео
@@ -1466,11 +1526,17 @@ public class TrackActivity extends Activity {
                 // идти по другим часам (REALTIME против MONOTONIC), и разность
                 // тогда бессмысленна; понять это можно лишь по записи. Поэтому
                 // сначала измеряем, а компенсируем — отдельным решением.
+                double zoomActual = Double.NaN;
+                long capNs = 0;
                 try {
                     long its = im.getTimestamp();
                     if (its > 0) {
-                        double age = (tf - its) / 1e6;
+                        // метка кадра -> шкала петли
+                        capNs = its - clockOffsetNs;
+                        double age = (tf - capNs) / 1e6;
                         if (age > -1000 && age < 1000) frameAgeMs = age;
+                        Float z = zoomOf.get(its);
+                        if (z != null) zoomActual = z;
                     }
                 } catch (Throwable ignored) {}
                 // УГОЛ ВАЛА НА МОМЕНТ ЗАХВАТА КАДРА.
@@ -1488,6 +1554,12 @@ public class TrackActivity extends Activity {
                 // телеметрия идёт 10 Гц, между её отсчётами вал успевает
                 // повернуться на несколько градусов при 0.3 рад/с.
                 double thetaCap = thetaAt(tf);
+                // ТОЛЬКО В ЛОГ, в управление не идёт. Сейчас угол берётся на
+                // момент ВЫЕМКИ кадра, а снят он раньше. Насколько раньше — до
+                // сих пор не было известно ни одного числа (см. выше), поэтому
+                // сначала меряем разницу, а решение о подстановке принимаем по
+                // измеренному. Порядок тот же, что и с возрастом кадра.
+                double thetaAtCapture = (capNs != 0) ? thetaAt(capNs) : Double.NaN;
                 // Годен ли снимок: на самом первом такте телеметрии ещё не
                 // было, thetaAt вернул ноль, а к моменту команды угол уже
                 // пришёл — и свежая ошибка вышла -661° при уставке -13.8 рад/с.
@@ -1955,6 +2027,11 @@ public class TrackActivity extends Activity {
                    .append((int) ((tf - t0) / 1000000L)).append(',')
                    .append(lastLag).append(',')
                    .append(Double.isNaN(frameAgeMs) ? "" : fmt(frameAgeMs)).append(',')
+                   .append(Double.isNaN(zoomActual) ? "" : fmt(zoomActual)).append(',')
+                   // разница «вал на съёмке» против «вал на выемке»: то самое,
+                   // что решает, нужна ли поправка на возраст кадра
+                   .append(Double.isNaN(thetaAtCapture) ? ""
+                           : fmt(Math.toDegrees(thetaCap - thetaAtCapture))).append(',')
                    .append(kickPhase).append(',')
                    .append(inKick ? 1 : 0).append(',')
                    .append(syncEnc ? 1 : 0).append(',')
