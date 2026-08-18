@@ -72,6 +72,11 @@ MUTATIONS = {
     # обязан их НЕ поймать, и это тоже проверяется (контроль ниже).
     'lam':    ('SIZE_LAMBDA', 2.0),
     'veto':   ('SIZE_VETO_RATIO', 1.2),
+    # Уровень 2: ловятся только при включённом Калмане (а chi2 — при гейте).
+    'chi2':   ('KALMAN_GATE_CHI2', 3.0),
+    'rpos':   ('KALMAN_R_POS_SIZE_FRAC', 0.10),
+    'rlogh':  ('KALMAN_R_LOGH', 0.05),
+    'accel':  ('KALMAN_SIGMA_ACCEL_MPS2', 5.0 * (2.0 / 50.0) * 2600.0),
 }
 
 
@@ -109,13 +114,41 @@ def read_scenarios(path):
 
 def main():
     set_level1()
-    mut = os.environ.get('PORT_CHECK_MUTATE')
-    if mut:
-        apply_mutation(mut)
     if len(sys.argv) > 3:
         tcfg.VIEW_CLAMP_KEEPS_WINDOW_INSIDE = (sys.argv[3] == 'true')
     if len(sys.argv) > 4:
         tcfg.ENABLE_SIZE_SCORING = (sys.argv[4] == 'true')
+    if len(sys.argv) > 5 and sys.argv[5] == 'true':
+        # Уровень 2. Метрические константы офлайна приводятся к тем же
+        # абсолютным единицам, в которых считает перенос: делители равны 1,
+        # числители — уже пересчитанные величины. Иначе сравнивались бы два
+        # разных фильтра (см. комментарий в PortDrive).
+        PX_PER_RAD = 2600.0
+        tcfg.FILTER_LEVEL = 2
+        tcfg.KALMAN_SIGMA_ACCEL_MPS2 = (2.0 / 50.0) * PX_PER_RAD
+        tcfg.KALMAN_REF_DISTANCE_M = 1.0
+        tcfg.KALMAN_MAX_SPEED_MPS = (20.0 / 20.0) * PX_PER_RAD
+        tcfg.KALMAN_MIN_DISTANCE_M = 1.0
+        tcfg.KALMAN_SEED_SIZE_FALLBACK = 0.02 * PX_PER_RAD
+        # СКОРОСТЬ log h БЕЗРАЗМЕРНА и с переводом в пиксели не
+        # масштабируется, а офлайн выводит её как FRAC * v_max. Раз v_max
+        # переведён в пиксели (2600), то FRAC приходится делить на тот же
+        # множитель, иначе питон получает 780 1/с вместо 0.3 и следует за
+        # размером мгновенно: сторона окна расходилась с переносом на 76 тактах
+        # при полном совпадении выбора и состояния.
+        tcfg.KALMAN_LOGH_RADIAL_FRAC = 0.30 / PX_PER_RAD
+        tcfg.KALMAN_R_POS_SIZE_FRAC = 0.30
+        tcfg.KALMAN_R_LOGH = 0.25
+        tcfg.KALMAN_GATE_CHI2 = 9.21
+        tcfg.KALMAN_ANISOTROPIC_Q = False
+    if len(sys.argv) > 6:
+        tcfg.ENABLE_MAHALANOBIS_GATE = (sys.argv[6] == 'true')
+    # Порча — ПОСЛЕДНЕЙ. Пока она стояла до настройки уровня 2, блок констант
+    # Калмана её молча затирал, и стенд «не ловил» подмены, которых сам же и
+    # лишился.
+    mut = os.environ.get('PORT_CHECK_MUTATE')
+    if mut:
+        apply_mutation(mut)
     frame, scens = read_scenarios(sys.argv[1])
     W, H, dt, min_win = frame
     hw, hh = W / 2.0, H / 2.0

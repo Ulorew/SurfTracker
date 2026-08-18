@@ -1,6 +1,7 @@
 import java.io.*;
 import java.util.*;
 import com.surftracker.camfps.Tracker;
+import com.surftracker.camfps.KalmanTracker;
 
 /**
  * Гоняет НАСТОЯЩИЙ Tracker (тот же файл, что собирается в apk) по сценариям и
@@ -26,6 +27,16 @@ public class PortDrive {
         // же, как когда-то оказался режим прижатия центра.
         if (args.length > 3)
             Tracker.ENABLE_SIZE_SCORING = Boolean.parseBoolean(args[3]);
+        if (args.length > 4) Tracker.ENABLE_KALMAN = Boolean.parseBoolean(args[4]);
+        if (args.length > 5) Tracker.ENABLE_GATE = Boolean.parseBoolean(args[5]);
+        // МАСШТАБ ЗАДАЁТСЯ ЯВНО И ОБЕИМ СТОРОНАМ.
+        //
+        // Уровень 1 масштабно-инвариантен, и стенд пользовался этим: питону
+        // подавались пиксели под видом углов. Калман инвариантности НЕ имеет —
+        // его шум задан в абсолютных единицах. Если оставить умолчания, стенд
+        // будет сравнивать два разных фильтра и радостно сходиться. 2600 —
+        // фокус в пикселях для кадра шириной 3840 при поле зрения 72.9°.
+        KalmanTracker.PX_PER_RAD = 2600.0;
         BufferedReader in = new BufferedReader(new FileReader(args[0]));
         PrintWriter out = new PrintWriter(new FileWriter(args[1]));
         out.println("scenario,tick,chosen,status,miss,side,pred_cx,pred_cy");

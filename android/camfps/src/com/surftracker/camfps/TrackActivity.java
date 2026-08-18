@@ -542,6 +542,8 @@ public class TrackActivity extends Activity {
         float coast = cfg.f("coast");
         boolean syncOn = cfg.b("sync");
         boolean sizeA = cfg.b("size_a");
+        boolean kalmanOn = cfg.b("kalman");
+        boolean gateOn = cfg.b("gate");
         float kickW = cfg.f("kick");
         int kickMs = cfg.i("kick_ms");
         float kickEvery = cfg.f("kick_s");
@@ -1349,7 +1351,17 @@ public class TrackActivity extends Activity {
             // Механизм А — статический флаг трекера: он часть ЛОГИКИ ВЫБОРА, а
             // не параметр такта, и стенд сличения переключает его так же.
             Tracker.ENABLE_SIZE_SCORING = sizeA;
-            j.append(",\"механизм_А\":").append(sizeA);
+            Tracker.ENABLE_KALMAN = kalmanOn;
+            // Гейт без Калмана не включается: ковариацию брать неоткуда.
+            Tracker.ENABLE_GATE = gateOn && kalmanOn;
+            // Масштаб для Калмана — фокус камеры в пикселях. Единственное
+            // место переноса, где масштаб важен: уровень 1 инвариантен, а шум
+            // Калмана задан в абсолютных единицах.
+            KalmanTracker.PX_PER_RAD = fPx;
+            j.append(",\"механизм_А\":").append(sizeA)
+             .append(",\"калман\":").append(kalmanOn)
+             .append(",\"гейт\":").append(gateOn && kalmanOn)
+             .append(",\"px_на_радиан\":").append(fmt(fPx));
             battStart = batteryPct();
             battStartNs = System.nanoTime();
             j.append(",\"батарея_старт\":").append(battStart);

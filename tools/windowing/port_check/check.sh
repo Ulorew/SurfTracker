@@ -1,92 +1,89 @@
 #!/bin/bash
-# Сличение телефонного переноса с офлайновым трекером.
+# Сличение телефонного переноса с офлайновым трекером ПО МАТРИЦЕ РЕЖИМОВ.
 #
-# Порядок: КОНТРОЛЬ -> порчи -> сличение. Контроль появился после того, как
-# фаза порч оказалась пустой: режим прижатия центра ей не передавался, питон
-# шёл с умолчанием True, Java с боевым false, и стороны расходились на 45
-# тактов ДО всякой порчи. Каждая строка «порча поймана» сообщала о разнице
-# конфигураций, счётчик fails не мог стать ненулевым, а ветка «СТЕНД НЕГОДЕН»
-# была мёртвым кодом.
+# Порядок в каждом сочетании: КОНТРОЛЬ -> порчи.
+#   контроль — БЕЗ порчи стороны обязаны совпасть (иначе меряем не то);
+#   порча    — с порчей обязаны разойтись (иначе стенд слеп).
+# Ни одного из условий по отдельности не хватает: фаза порч однажды уже
+# сравнивала две РАЗНЫЕ конфигурации и печатала «поймана» для пустой порчи.
 #
-# Поэтому здесь два обязательных условия, а не одно:
-#   контроль  — БЕЗ порчи стороны обязаны совпасть (иначе меряем не то);
-#   порча     — с порчей обязаны разойтись (иначе стенд слеп).
-# Ни одного из них по отдельности не хватает.
+# Матрица, а не один режим: каждый новый флаг иначе остаётся вне проверки.
 set -eu
 cd "$(dirname "$0")"
-D=$(mktemp -d)
-trap 'rm -rf "$D"' EXIT
-
+D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
 SRC=../../../android/camfps/src
 PY=$(cd ../../.. && pwd)/.venv/bin/python
-# Тот же JDK, которым собирается apk: сличать перенос компилятором из другого
-# набора значило бы допустить ещё один источник разницы в самой проверке.
 JAVAC=$(command -v javac || echo /home/ulorew/Android/jdk/bin/javac)
 JAVA=$(command -v java || echo /home/ulorew/Android/jdk/bin/java)
+A=$SRC/com/surftracker/camfps
 
 echo "== сборка =="
 "$PY" gen_scenarios.py
-"$JAVAC" -d "$D" -cp "$SRC" PortDrive.java "$SRC/com/surftracker/camfps/Tracker.java" 2>&1 | grep -v "^Note:" || true
+"$JAVAC" -d "$D" -cp "$SRC" PortDrive.java "$A/Tracker.java" "$A/KalmanTracker.java" \
+    2>&1 | grep -v "^Note:" || true
 
-MUTATIONS="frac k expand miss shrink alpha reacq tau"
-# Механизм А проверяется ТОЛЬКО когда он включён: на выключенном подмена его
-# констант обязана не менять ничего, и это отдельный контроль ниже.
-MUT_A="lam veto"
+# Какие порчи ОБЯЗАНЫ быть пойманы, а какие обязаны МОЛЧАТЬ, зависит от
+# сочетания. Константа, которой в данном режиме не пользуются, не должна менять
+# ничего — и это такая же проверка, как и обратная: механизм, влияющий в
+# выключенном виде, включён не там, где думают.
+BASE="k expand miss reacq tau"      # общие для всех режимов
+MUT_L1="shrink alpha"               # альфа-бета и EMA размера: только уровень 1
+MUT_A="lam veto"                    # механизм А
+MUT_K="rpos rlogh accel"            # Калман
+MUT_G="chi2"                        # гейт
+MUT_RADIUS="frac"                   # радиус приёма в ведении: не нужен при гейте
 bad=0
 
-# МАТРИЦА РЕЖИМОВ. Механизм А появился отдельным флагом, и без матрицы он
-# оказался бы вне сличения ровно так же, как когда-то оказался режим прижатия
-# центра: фаза порч тогда сравнивала две РАЗНЫЕ конфигурации и печатала
-# «поймана» даже для пустой порчи.
-for a in false true; do
-for mode in false true; do
-  echo
-  echo "===== прижатие=$mode  механизм А=$a ====="
-
-  # --- КОНТРОЛЬ: без порчи обязаны совпасть -------------------------------
-  "$PY" py_drive.py scenarios.txt "$D/py_${mode}_$a.csv" "$mode" "$a"
-  "$JAVA" -cp "$D" PortDrive scenarios.txt "$D/java_${mode}_$a.csv" "$mode" "$a"
-  if ! "$PY" compare.py "$D/py_${mode}_$a.csv" "$D/java_${mode}_$a.csv" --quiet; then
-    echo "  КОНТРОЛЬ ПРОВАЛЕН: стороны расходятся БЕЗ порчи."
-    echo "  Дальше мерить нечего — любая «пойманная порча» была бы этой же разницей."
-    "$PY" compare.py "$D/py_${mode}_$a.csv" "$D/java_${mode}_$a.csv" | head -12
-    exit 2
-  fi
-  echo "  контроль: без порчи расхождений нет"
-
-  # --- ПОРЧИ: каждая обязана быть поймана ---------------------------------
-  LIST="$MUTATIONS"
-  [ "$a" = "true" ] && LIST="$MUTATIONS $MUT_A"
-  for m in $LIST; do
-    PORT_CHECK_MUTATE=$m "$PY" py_drive.py scenarios.txt "$D/py_${mode}_${a}_$m.csv" "$mode" "$a" 2>/dev/null
-    if "$PY" compare.py "$D/py_${mode}_${a}_$m.csv" "$D/java_${mode}_$a.csv" --quiet; then
-      echo "  ПОРЧА '$m' НЕ ПОЙМАНА — стенд слеп к этой константе"
-      bad=$((bad+1))
-    else
-      echo "  порча '$m' поймана"
+# режим: имя | А | Калман | гейт
+for combo in "уровень1|false|false|false" \
+             "уровень1+А|true|false|false" \
+             "Калман|false|true|false" \
+             "Калман+гейт|false|true|true" \
+             "Калман+гейт+А|true|true|true"; do
+  name=${combo%%|*}; rest=${combo#*|}
+  a=${rest%%|*}; rest=${rest#*|}
+  kal=${rest%%|*}; gate=${rest##*|}
+  for mode in false true; do
+    echo
+    echo "===== $name, прижатие=$mode ====="
+    "$PY" py_drive.py scenarios.txt "$D/py.csv" "$mode" "$a" "$kal" "$gate"
+    "$JAVA" -cp "$D" PortDrive scenarios.txt "$D/java.csv" "$mode" "$a" "$kal" "$gate"
+    if ! "$PY" compare.py "$D/py.csv" "$D/java.csv" --quiet; then
+      echo "  КОНТРОЛЬ ПРОВАЛЕН: стороны расходятся БЕЗ порчи"
+      "$PY" compare.py "$D/py.csv" "$D/java.csv" | head -12
+      exit 2
     fi
-  done
+    echo "  контроль: без порчи расхождений нет"
 
-  # КОНТРОЛЬ НАОБОРОТ: при выключенном механизме А подмена ЕГО констант не
-  # должна менять ничего. Если меняет — значит он влияет и в выключенном виде.
-  if [ "$a" = "false" ]; then
-    for m in $MUT_A; do
-      PORT_CHECK_MUTATE=$m "$PY" py_drive.py scenarios.txt "$D/py_off_$m.csv" "$mode" "$a" 2>/dev/null
-      if ! "$PY" compare.py "$D/py_off_$m.csv" "$D/java_${mode}_$a.csv" --quiet; then
-        echo "  ВЫКЛЮЧЕННЫЙ механизм А всё же влияет (порча '$m' видна)"
-        bad=$((bad+1))
+    LIST="$BASE"; SILENT=""
+    if [ "$kal" = "true" ]; then LIST="$LIST $MUT_K"; SILENT="$SILENT $MUT_L1";
+                            else LIST="$LIST $MUT_L1"; fi
+    if [ "$gate" = "true" ]; then LIST="$LIST $MUT_G"; SILENT="$SILENT $MUT_RADIUS";
+                            else LIST="$LIST $MUT_RADIUS"; fi
+    if [ "$a" = "true" ]; then LIST="$LIST $MUT_A"; else SILENT="$SILENT $MUT_A"; fi
+
+    for m in $LIST; do
+      PORT_CHECK_MUTATE=$m "$PY" py_drive.py scenarios.txt "$D/m.csv" \
+          "$mode" "$a" "$kal" "$gate" 2>/dev/null
+      if "$PY" compare.py "$D/m.csv" "$D/java.csv" --quiet; then
+        echo "  ПОРЧА '$m' НЕ ПОЙМАНА"; bad=$((bad+1))
       else
-        echo "  выключенный механизм А глух к '$m' — как и должен"
+        echo "  порча '$m' поймана"
       fi
     done
-  fi
-done
+    for m in $SILENT; do
+      PORT_CHECK_MUTATE=$m "$PY" py_drive.py scenarios.txt "$D/s.csv" \
+          "$mode" "$a" "$kal" "$gate" 2>/dev/null
+      if ! "$PY" compare.py "$D/s.csv" "$D/java.csv" --quiet; then
+        echo "  '$m' ВЛИЯЕТ, хотя в этом режиме не используется"; bad=$((bad+1))
+      else
+        echo "  '$m' молчит — как и должен в этом режиме"
+      fi
+    done
+  done
 done
 
 echo
-if [ $bad -ne 0 ]; then
-  echo "СТЕНД НЕГОДЕН: $bad порч прошли незамеченными"
-  exit 2
-fi
-echo "ИТОГ: перенос совпадает с офлайновым трекером в ОБОИХ режимах,"
-echo "      и в обоих режимах стенд ловит все $(echo $MUTATIONS | wc -w) подмен констант"
+[ $bad -eq 0 ] || { echo "СТЕНД НЕГОДЕН: $bad порч прошли незамеченными"; exit 2; }
+echo "ИТОГ: перенос совпадает с офлайновым трекером во ВСЕХ сочетаниях режимов,"
+echo "      и в каждом сочетании стенд ловит подмены его собственных констант"

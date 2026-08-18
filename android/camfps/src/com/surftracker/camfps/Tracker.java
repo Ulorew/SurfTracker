@@ -107,6 +107,20 @@ public final class Tracker {
     public static final double SIZE_LAMBDA = 0.5;      // SIZE_LAMBDA
     public static final double SIZE_VETO_RATIO = 1.8;  // SIZE_VETO_RATIO
 
+    // --- УРОВЕНЬ 2: Калман и махаланобисов гейт ---------------------------
+    //
+    // Оба ВЫКЛЮЧЕНЫ по умолчанию и включаются раздельно: гейт без Калмана
+    // бессмыслен (ковариацию брать неоткуда), а Калман без гейта — законная
+    // конфигурация, и её надо уметь мерить отдельно.
+    //
+    // Состояние Калмана ЗЕРКАЛИТСЯ в cx/cy/vx/vy после каждой операции: эти
+    // поля читают и петля, и стенд, и менять их смысл значило бы переписать
+    // всё вокруг ради одной ветки.
+    public static boolean ENABLE_KALMAN = false;
+    public static boolean ENABLE_GATE = false;
+
+    private final KalmanTracker kf = new KalmanTracker();
+
     public static final int TRACKING = 0, LOST = 1;
 
     public int status = LOST;
@@ -124,6 +138,12 @@ public final class Tracker {
 
     /** Первое измерение: якоримся, скорость ноль. Строить невязку не из чего. */
     public void seed(double mx, double my, double size) {
+        if (ENABLE_KALMAN) {
+            kf.seed(mx, my, size);
+            mirror();
+            initialized = true; status = TRACKING; missCount = 0;
+            return;
+        }
         cx = mx; cy = my; vx = 0; vy = 0;
         filteredSize = size;
         initialized = true;
@@ -132,8 +152,16 @@ public final class Tracker {
     }
 
     /** Позиция через dt секунд БЕЗ нового измерения. */
-    public double predX(double dt) { return cx + vx * dt; }
-    public double predY(double dt) { return cy + vy * dt; }
+    public double predX(double dt) { return ENABLE_KALMAN ? kf.predX(dt) : cx + vx * dt; }
+    public double predY(double dt) { return ENABLE_KALMAN ? kf.predY(dt) : cy + vy * dt; }
+
+    /** Состояние Калмана -> публичные поля. Размер в этой ветке берётся ИЗ
+     *  СОСТОЯНИЯ (log h), а не из медленной EMA: два источника одной величины
+     *  рано или поздно разойдутся. */
+    private void mirror() {
+        cx = kf.cx(); cy = kf.cy(); vx = kf.vx(); vy = kf.vy();
+        filteredSize = kf.size();
+    }
 
     /**
      * Такт без измерения: предсказание становится состоянием, ПОТОМ затухает
@@ -149,10 +177,15 @@ public final class Tracker {
         // уносит окно тем дальше, чем дольше нет цели. В оригинале шаг стоит
         // внутри ветки TRACKING.
         if (status == TRACKING) {
-            cx = predX(dt); cy = predY(dt);
-            if (dt > 0 && TAU_SEC > 0) {
-                double k = Math.exp(-dt / TAU_SEC);
-                vx *= k; vy *= k;
+            if (ENABLE_KALMAN) {
+                kf.advance(dt, TAU_SEC);
+                mirror();
+            } else {
+                cx = predX(dt); cy = predY(dt);
+                if (dt > 0 && TAU_SEC > 0) {
+                    double k = Math.exp(-dt / TAU_SEC);
+                    vx *= k; vy *= k;
+                }
             }
         }
         missCount++;
@@ -171,6 +204,14 @@ public final class Tracker {
         // через четыре такта цель терялась снова — то есть дефект
         // самоподдерживающийся.
         if (!initialized || status == LOST) { seed(mx, my, size); return; }
+        if (ENABLE_KALMAN) {
+            kf.update(mx, my, dt, size);
+            mirror();
+            missCount = 0;
+            status = TRACKING;
+            clampBeliefToView();
+            return;
+        }
         double px = predX(dt), py = predY(dt);
         double rx = mx - px, ry = my - py;
         cx = px + ALPHA * rx;
@@ -264,6 +305,9 @@ public final class Tracker {
     public void clampBeliefToView(double side) {
         cx = clampX(cx, side);
         cy = clampY(cy, side);
+        // В ветке Калмана прижимается САМО состояние фильтра: офлайн делает
+        // именно так, и без этого убеждение фильтра расходится с офлайновым.
+        if (ENABLE_KALMAN && kf.initialized) kf.setPos(cx, cy);
     }
 
     // Отступ считается ОТ ЦЕНТРА кадра, а не от края — так же, как
@@ -391,6 +435,9 @@ public final class Tracker {
      * @param dets [n][3]: cx, cy, size — уже в пикселях сенсора
      * @return индекс выбранной или -1
      */
+    /** dt такта нужен гейту: ковариация предсказания зависит от него. */
+    private double gateDt = 0.0;
+
     public int selectTarget(double[][] dets, int n, double predCx, double predCy,
                              double side) {
         double frac = (status == TRACKING) ? SELECT_MAX_DIST_FRAC : REACQ_MAX_DIST_FRAC;
@@ -398,7 +445,20 @@ public final class Tracker {
         int best = -1; double bestScore = Double.MAX_VALUE;
         for (int i = 0; i < n; i++) {
             double d = Math.hypot(dets[i][0] - predCx, dets[i][1] - predCy);
-            if (d > maxDist) continue;                 // радиус приёма — как был
+            // ГЕЙТ — ИНСТРУМЕНТ РЕЖИМА ВЕДЕНИЯ. В потере окно заморожено и
+            // растёт по явному правилу, ковариация фильтра не обновляется, и
+            // отбор там идёт по радиусу — офлайн делает ровно так
+            // (uses_mahalanobis_gate требует STATUS_TRACKING).
+            if (ENABLE_GATE && ENABLE_KALMAN && status == TRACKING) {
+                // МАХАЛАНОБИСОВ ГЕЙТ вместо фиксированного радиуса: он сам
+                // расширяется, когда фильтр не уверен (долгий пропуск), и сам
+                // сужается на плотном треке. Ровно то, чего не хватило на
+                // тактах 409 и 419 прогона 18 августа: уверенные детекции
+                // (0.90 и 0.92) были отвергнуты радиусом, пока убеждение
+                // уезжало.
+                if (kf.gateDistance2(dets[i][0], dets[i][1], dets[i][2], gateDt)
+                        > KalmanTracker.GATE_CHI2) continue;
+            } else if (d > maxDist) continue;          // радиус приёма — как был
             double score = d;
             if (ENABLE_SIZE_SCORING && filteredSize > 0 && dets[i][2] > 0) {
                 double ratio = dets[i][2] / filteredSize;
@@ -441,6 +501,7 @@ public final class Tracker {
         t.predCx = planCx(dt, t.side);
         t.predCy = planCy(dt, t.side);
         t.gate = ((status == TRACKING) ? SELECT_MAX_DIST_FRAC : REACQ_MAX_DIST_FRAC) * t.side;
+        gateDt = dt;
         t.chosen = selectTarget(dets, n, t.predCx, t.predCy, t.side);
         if (t.chosen >= 0) {
             t.dist = Math.hypot(dets[t.chosen][0] - t.predCx, dets[t.chosen][1] - t.predCy);
