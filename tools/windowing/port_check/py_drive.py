@@ -68,6 +68,10 @@ MUTATIONS = {
     # пропаданием, скорость альфа-беты была нулевой, и подмена τ (хоть 0.0,
     # хоть 100.0) не меняла ни одного такта.
     'tau':    ('EXTRAPOLATION_TAU_SEC', 0.2),
+    # Механизм А: ловятся только когда он включён — на выключенном стенд
+    # обязан их НЕ поймать, и это тоже проверяется (контроль ниже).
+    'lam':    ('SIZE_LAMBDA', 2.0),
+    'veto':   ('SIZE_VETO_RATIO', 1.2),
 }
 
 
@@ -110,6 +114,8 @@ def main():
         apply_mutation(mut)
     if len(sys.argv) > 3:
         tcfg.VIEW_CLAMP_KEEPS_WINDOW_INSIDE = (sys.argv[3] == 'true')
+    if len(sys.argv) > 4:
+        tcfg.ENABLE_SIZE_SCORING = (sys.argv[4] == 'true')
     frame, scens = read_scenarios(sys.argv[1])
     W, H, dt, min_win = frame
     hw, hh = W / 2.0, H / 2.0

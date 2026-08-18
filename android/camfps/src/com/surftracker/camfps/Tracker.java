@@ -83,6 +83,30 @@ public final class Tracker {
     /** Порог подавления немаксимумов по пересечению. */
     public static final double NMS_IOU = 0.45;
 
+    // --- МЕХАНИЗМ А: штраф и вето по несоответствию размера ---------------
+    //
+    // Перенос из офлайнового прода (ENABLE_SIZE_SCORING в tracking-v2). Здесь
+    // ВЫКЛЮЧЕН по умолчанию: включение меняет решения петли, и оно должно быть
+    // отдельным, измеренным шагом, а не побочным следствием переноса.
+    //
+    // Зачем он. Выбор идёт по близости к предсказанию, и размер в нём не
+    // участвует вовсе. На прогоне 18 августа это дало две подмены цели:
+    // такт 433 — выбрана полоска 45x320 (блик в стекле) при ведомом размере
+    // 774; такт 719 — предмет 103x267 при ведомом 1244. Человек в обоих
+    // случаях был найден моделью и стоял в кадре.
+    //
+    //   ratio = размер_кандидата / размер_фильтра
+    //   ratio вне [1/1.8, 1.8]        -> ВЕТО, кандидат выбывает
+    //   счёт += 0.5 * |log(ratio)| * сторона_окна
+    //
+    // Домножение на сторону окна — чтобы слагаемое было в тех же единицах,
+    // что и расстояние; складывать безразмерный логарифм с пикселями нельзя.
+    // На тактах 433 и 719 отношения 0.41 и 0.21, то есть оба отсекаются вето,
+    // не доходя до счёта.
+    public static boolean ENABLE_SIZE_SCORING = false;
+    public static final double SIZE_LAMBDA = 0.5;      // SIZE_LAMBDA
+    public static final double SIZE_VETO_RATIO = 1.8;  // SIZE_VETO_RATIO
+
     public static final int TRACKING = 0, LOST = 1;
 
     public int status = LOST;
@@ -281,7 +305,8 @@ public final class Tracker {
      * Жадное, по убыванию уверенности. Сортировка вставками: кандидатов после
      * порога единицы, а не тысячи, и заводить ради них общий сорт незачем.
      *
-     * @param out [max][5] — cx, cy, size, ширина, высота (координаты ТЕНЗОРА).
+     * @param out [max][6] — cx, cy, size, ширина, высота, уверенность
+     *            (координаты ТЕНЗОРА; уверенность безразмерна).
      *            Размер (наибольшая сторона) ведёт трекер: окно квадратное, и
      *            мерить его по одной стороне правильно. Ширина и высота нужны
      *            только разбору записи — нарисовать настоящую рамку человека,
@@ -329,6 +354,11 @@ public final class Tracker {
             out[n][0] = cand[i][0]; out[n][1] = cand[i][1];
             out[n][2] = Math.max(cand[i][2], cand[i][3]);
             if (out[n].length > 4) { out[n][3] = cand[i][2]; out[n][4] = cand[i][3]; }
+            // Уверенность — ШЕСТЫМ столбцом, если вызывающий его завёл.
+            // Выбору цели она не нужна и в нём не участвует (правило переноса:
+            // выбор по близости, а не по уверенности), но в лог идут ВСЕ
+            // кандидаты такта, и без уверенности их потом не рассудить.
+            if (out[n].length > 5) out[n][5] = cand[i][4];
             n++;
             for (int j = i + 1; j < m; j++) {
                 if (!dead[j] && iou(cand[i], cand[j]) > NMS_IOU) dead[j] = true;
@@ -365,10 +395,17 @@ public final class Tracker {
                              double side) {
         double frac = (status == TRACKING) ? SELECT_MAX_DIST_FRAC : REACQ_MAX_DIST_FRAC;
         double maxDist = frac * side;
-        int best = -1; double bestD = Double.MAX_VALUE;
+        int best = -1; double bestScore = Double.MAX_VALUE;
         for (int i = 0; i < n; i++) {
             double d = Math.hypot(dets[i][0] - predCx, dets[i][1] - predCy);
-            if (d <= maxDist && d < bestD) { bestD = d; best = i; }
+            if (d > maxDist) continue;                 // радиус приёма — как был
+            double score = d;
+            if (ENABLE_SIZE_SCORING && filteredSize > 0 && dets[i][2] > 0) {
+                double ratio = dets[i][2] / filteredSize;
+                if (ratio > SIZE_VETO_RATIO || ratio < 1.0 / SIZE_VETO_RATIO) continue;
+                score += SIZE_LAMBDA * Math.abs(Math.log(ratio)) * side;
+            }
+            if (score < bestScore) { bestScore = score; best = i; }
         }
         return best;
     }

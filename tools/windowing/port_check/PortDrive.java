@@ -21,6 +21,11 @@ public class PortDrive {
         // разъедутся молча.
         if (args.length > 2)
             Tracker.VIEW_CLAMP_KEEPS_WINDOW_INSIDE = Boolean.parseBoolean(args[2]);
+        // Механизм А тоже приходит извне: сличение обязано идти по МАТРИЦЕ
+        // режимов, иначе включённый механизм окажется вне проверки ровно так
+        // же, как когда-то оказался режим прижатия центра.
+        if (args.length > 3)
+            Tracker.ENABLE_SIZE_SCORING = Boolean.parseBoolean(args[3]);
         BufferedReader in = new BufferedReader(new FileReader(args[0]));
         PrintWriter out = new PrintWriter(new FileWriter(args[1]));
         out.println("scenario,tick,chosen,status,miss,side,pred_cx,pred_cy");
@@ -49,7 +54,7 @@ public class PortDrive {
                 continue;
             }
             int n = Integer.parseInt(p[0]);
-            double[][] dets = new double[Math.max(n, 1)][3];
+            double[][] dets = new double[Math.max(n, 1)][3];   // cx, cy, size
             for (int i = 0; i < n; i++) {
                 dets[i][0] = Double.parseDouble(p[1 + i * 3]);
                 dets[i][1] = Double.parseDouble(p[2 + i * 3]);

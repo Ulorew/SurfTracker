@@ -541,6 +541,7 @@ public class TrackActivity extends Activity {
         // возврат невозможным.
         float coast = cfg.f("coast");
         boolean syncOn = cfg.b("sync");
+        boolean sizeA = cfg.b("size_a");
         float kickW = cfg.f("kick");
         int kickMs = cfg.i("kick_ms");
         float kickEvery = cfg.f("kick_s");
@@ -645,7 +646,18 @@ public class TrackActivity extends Activity {
             // неверно: пишется detsPx, то есть уже пересчитанное в сенсор.
             // Разбор, поверивший комментарию, собрал бы все рамки в левом
             // верхнем углу кадра — правдоподобная картинка, неверная целиком.
-            + "bx,by,размер_детекции,ширина_детекции,высота_детекции,размер_фильтра\n");
+            + "bx,by,размер_детекции,ширина_детекции,высота_детекции,размер_фильтра,"
+            // ВСЕ кандидаты такта, а не только выбранный.
+            //
+            // Без них правило выбора нельзя проверить на уже снятых прогонах:
+            // в логе стоит решение, но не то, из чего оно принималось. А
+            // кандидатов мало — за восьмиминутный прогон 1485 детекций на 1351
+            // такт, — так что цена столбца копеечная, а без него любое
+            // изменение правила требует нового выхода с телефоном.
+            //
+            // Формат: cx:cy:ширина:высота:уверенность, кандидаты через «|».
+            // Запятых внутри нет намеренно — иначе поедет сам csv.
+            + "детекции\n");
 
         CameraDevice dev = null;
         BluetoothSocket sock = null;
@@ -1080,8 +1092,8 @@ public class TrackActivity extends Activity {
             // сценарии: tools/windowing/port_check/check.py.
             Tracker trk = new Tracker(W, H);
             final int MAX_DET = 16;
-            float[][] dets = new float[MAX_DET][5];
-            double[][] detsPx = new double[MAX_DET][5];
+            float[][] dets = new float[MAX_DET][6];
+            double[][] detsPx = new double[MAX_DET][6];
             long prevTickNs = 0;
 
             int scanPos = 0;               // фаза пилы обзора при долгой потере
@@ -1334,6 +1346,10 @@ public class TrackActivity extends Activity {
             if (recStartNs != 0)
                 j.append(",\"видео_смещение_мс\":").append((t0 - recStartNs) / 1000000L);
             syncEnc = syncOn;
+            // Механизм А — статический флаг трекера: он часть ЛОГИКИ ВЫБОРА, а
+            // не параметр такта, и стенд сличения переключает его так же.
+            Tracker.ENABLE_SIZE_SCORING = sizeA;
+            j.append(",\"механизм_А\":").append(sizeA);
             battStart = batteryPct();
             battStartNs = System.nanoTime();
             j.append(",\"батарея_старт\":").append(battStart);
@@ -1485,6 +1501,7 @@ public class TrackActivity extends Activity {
                         // Ширина и высота — только для разбора записи.
                         detsPx[q][3] = dets[q][3] * NET * scale;
                         detsPx[q][4] = dets[q][4] * NET * scale;
+                        detsPx[q][5] = dets[q][5];            // уверенность как есть
                     }
                     // Затравка открывается заново после ДОЛГОЙ потери.
                     //
@@ -1882,7 +1899,15 @@ public class TrackActivity extends Activity {
                    // из максимума не восстанавливается.
                    .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][3]) : "").append(',')
                    .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][4]) : "").append(',')
-                   .append(fmt(trk.filteredSize)).append('\n');
+                   .append(fmt(trk.filteredSize)).append(',');
+                // Все кандидаты такта: cx:cy:ширина:высота:уверенность, через «|».
+                for (int q = 0; q < nDet; q++) {
+                    if (q > 0) csv.append('|');
+                    csv.append(fmt(detsPx[q][0])).append(':').append(fmt(detsPx[q][1]))
+                       .append(':').append(fmt(detsPx[q][3])).append(':')
+                       .append(fmt(detsPx[q][4])).append(':').append(fmt(detsPx[q][5]));
+                }
+                csv.append('\n');
                 frames++;
 
                 // ГОЛОСОМ, ЕСЛИ ЦЕЛИ НЕТ. Наблюдатель стоит вне кадра и экрана
