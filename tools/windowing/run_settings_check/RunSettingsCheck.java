@@ -119,19 +119,26 @@ public class RunSettingsCheck {
         }
         eq("параметров на экране", RunSettings.SPEC.length, 21);
 
-        System.out.println("== defaults: команда может потребовать умолчания ==");
-        // Команды с ноутбука передают 5-7 ключей из двадцати; для остальных
-        // прежняя гарантия «не передал = умолчание» сменилась на «что натыкано
-        // на телефоне». Ключ defaults возвращает прежнее поведение целиком.
-        Map1 intentD = new Map1().put("defaults", "true").put("seconds", "180");
-        Map1 savedD  = new Map1().put("dry", "true").put("k", "9.9").put("home", "false");
-        // с игнорированием сохранённого источник saved просто не передаётся
-        eq("dry не протечёт", RunSettings.resolve(intentD, null, "dry"), "false");
-        eq("k из умолчания", RunSettings.resolve(intentD, null, "k"), "1.2");
-        eq("home из умолчания", RunSettings.resolve(intentD, null, "home"), "false");
-        eq("переданное всё равно работает", RunSettings.resolve(intentD, null, "seconds"), "180");
-        // а БЕЗ ключа сохранённое по-прежнему в силе
-        eq("без defaults сохранённое живо", RunSettings.resolve(intentD, savedD, "dry"), "true");
+        System.out.println("== defaults: команда требует умолчаний ==");
+        // Проверяется НАСТОЯЩИЙ предикат RunSettings.ignoreSaved, а не его
+        // пересказ. Прежняя редакция сама подставляла saved=null и
+        // «подтверждала» то, чего не вызывала: опечатка в имени ключа
+        // оставляла стенд зелёным, а механизм мёртвым.
+        Map1 saved2 = new Map1().put("dry", "true").put("k", "9.9").put("home", "false");
+        Map1 withFlag = new Map1().put("defaults", "true").put("seconds", "180");
+        Map1 noFlag   = new Map1().put("seconds", "180");
+        eq("ключ распознан", RunSettings.ignoreSaved(withFlag), true);
+        eq("без ключа — сохранённое живо", RunSettings.ignoreSaved(noFlag), false);
+        eq("defaults=false не игнорирует",
+                RunSettings.ignoreSaved(new Map1().put("defaults", "false")), false);
+        eq("пустой источник", RunSettings.ignoreSaved(null), false);
+        // и сквозь resolve: так, как это делает Cfg
+        RunSettings.Source s1 = RunSettings.ignoreSaved(withFlag) ? null : saved2;
+        eq("dry не протечёт", RunSettings.resolve(withFlag, s1, "dry"), "false");
+        eq("k из умолчания", RunSettings.resolve(withFlag, s1, "k"), "1.2");
+        eq("переданное работает", RunSettings.resolve(withFlag, s1, "seconds"), "180");
+        RunSettings.Source s2 = RunSettings.ignoreSaved(noFlag) ? null : saved2;
+        eq("без ключа сохранённое в силе", RunSettings.resolve(noFlag, s2, "dry"), "true");
 
         System.out.println("== поле зрения ==");
         // Умолчание 0 = брать у камеры. Проверено детектором на участке

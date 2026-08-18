@@ -367,13 +367,17 @@ public class ReviewActivity extends Activity {
 
         // Окно модели — белым. Его вертикаль может быть неизвестна в старых
         // логах; тогда ставим по середине кадра и говорим об этом в подписи.
-        double wcx = model.toViewX(t.winCx, vw);
-        double wcy = (t.winCy >= 0) ? model.toViewY(t.winCy, vh) : vh / 2;
-        double half = model.toViewX(t.win / 2.0, vw);
+        // НАСТОЯЩАЯ вырезка, а не окно без прижатия: приложение берёт кроп
+        // как clamp(winCx - Sc/2, 0, W - Sc). Прежде рисовалось winCx ± Sc/2,
+        // и у края кадра прямоугольник уезжал наружу — на прогоне 16 августа
+        // правый край оказывался на 518 пикселей вне кадра, то есть картинка
+        // отвечала неверно на главный вопрос «цель внутри вырезки или нет».
+        double cl = model.toViewX(model.cropLeft(t), vw);
+        double ct = model.toViewY(model.cropTop(t), vh);
+        double side = model.toViewX(t.win, vw);
         p.setColor(Color.WHITE);
         p.setStrokeWidth((float) Math.max(2, vw / 400));
-        c.drawRect((float) (wcx - half), (float) (wcy - half),
-                   (float) (wcx + half), (float) (wcy + half), p);
+        c.drawRect((float) cl, (float) ct, (float) (cl + side), (float) (ct + side), p);
 
         // Цель. Красная на такте потери — глаз находит её раньше, чем читает
         // подпись, а разбор начинается именно с «где потеряли».

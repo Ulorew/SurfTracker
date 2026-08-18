@@ -612,6 +612,7 @@ public class TrackActivity extends Activity {
             // сценарии с двумя людьми.
             + "кандидатов,до_предсказания,порог,состояние,промахов,"
             + "ошибка_свежая,цель_в_мире,вал_при_захвате,t_кадра_мс,"
+            + "лаг_потока,возраст_кадра_мс,"
             // Рамка выбранной детекции в ПИКСЕЛЯХ СЕНСОРА — те же координаты,
             // в которых живёт трекер и считается winCx.
             //
@@ -1262,9 +1263,29 @@ public class TrackActivity extends Activity {
                     cueBase = tsec + 0.06 * script[scriptAt][1].length() + 0.6;
                     scriptAt++;
                 }
+                // Диагностика, НЕ участвующая в управлении: целый лаг
+                // корреляции потока и возраст кадра (сколько прошло от съёмки
+                // до выемки). Возраст в петлю не подставляется намеренно —
+                // источник времени кадра может идти по другим часам, и
+                // наивная компенсация испортит больше, чем починит. Сначала
+                // померить, потом компенсировать.
+                int lastLag = 0;
+                double frameAgeMs = Double.NaN;
+
                 Image im = latest.getAndSet(null);
                 if (im == null) { Thread.sleep(3); continue; }
                 long tf = System.nanoTime();
+                // Возраст кадра — ТОЛЬКО В ЛОГ. Отметка времени кадра может
+                // идти по другим часам (REALTIME против MONOTONIC), и разность
+                // тогда бессмысленна; понять это можно лишь по записи. Поэтому
+                // сначала измеряем, а компенсируем — отдельным решением.
+                try {
+                    long its = im.getTimestamp();
+                    if (its > 0) {
+                        double age = (tf - its) / 1e6;
+                        if (age > -1000 && age < 1000) frameAgeMs = age;
+                    }
+                } catch (Throwable ignored) {}
                 // УГОЛ ВАЛА НА МОМЕНТ ЗАХВАТА КАДРА.
                 //
                 // Прежде tf вычислялся и не использовался нигде, а угол брался
@@ -1313,7 +1334,10 @@ public class TrackActivity extends Activity {
                             int row0 = (c * NET + y) * NET;
                             for (int x = 0; x < STRIP; x++) colCur[x] += fb.get(row0 + x0 + x);
                         }
-                    if (colPrev != null) shiftPx = xcorr(colPrev, colCur, 40);
+                    if (colPrev != null) {
+                        shiftPx = xcorr(colPrev, colCur, 40);
+                        lastLag = lastXcorrLag;   // целый лаг — только в лог
+                    }
                     float[] tmp = colPrev; colPrev = colCur;
                     colCur = (tmp != null) ? tmp : new float[STRIP];
                     flowAccPx += shiftPx;
@@ -1444,30 +1468,19 @@ public class TrackActivity extends Activity {
                     // энкодеру, а не угадывается по картинке. Когда угол не
                     // изменился, формула тождественно равна прежней —
                     // sign*K*ошибка, — поэтому поведение без поворота то же.
+                    // Расчёт уставки живёт в LoopControl — там его достаёт
+                    // стенд tools/windowing/loop_check. Внутри активности его
+                    // не проверял никто: выключение синхронизации целиком не
+                    // меняло вывод ни одного из пяти стендов.
                     boolean syncOk = syncEnc && thetaCapOk && telNs != 0 && !dry
                             && (System.nanoTime() - telNs) < 300_000_000L;
-                    double fresh = 0;
-                    if (syncOk) {
-                        double tgtWorld = thetaCap + sign * Math.toRadians(errDeg);
-                        fresh = tgtWorld - thetaAt(System.nanoTime());
-                        // Здравый смысл поверх арифметики: свежая ошибка не
-                        // может превышать поле зрения плюс поворот за такт.
-                        // Больше — значит рассинхрон, а не цель на краю света,
-                        // и командовать по такому числу нельзя.
-                        if (Math.abs(Math.toDegrees(fresh)) > 90.0) {
-                            syncOk = false;
-                            syncSkips++;
-                        } else {
-                            errFreshDeg = Math.toDegrees(fresh);
-                            w = K * fresh;
-                            tgtWorldRad = tgtWorld;
-                        }
-                    }
-                    if (!syncOk) {
-                        errFreshDeg = errDeg * sign;
-                        w = sign * K * Math.toRadians(errDeg);
-                        tgtWorldRad = Double.NaN;
-                    }
+                    LoopControl.Out lc = LoopControl.command(
+                            errDeg, thetaCap, thetaAt(System.nanoTime()), K, sign, syncOk);
+                    w = lc.w;
+                    errFreshDeg = lc.errFreshDeg;
+                    tgtWorldRad = lc.tgtWorldRad;
+                    if (lc.rejected) syncSkips++;
+
                     // Окно ведёт ТРЕКЕР: центр — предсказание, сторона — из
                     // фильтра размера. Прежняя телефонная версия ставила окно
                     // по последней детекции, то есть на такт позади цели.
@@ -1649,7 +1662,7 @@ public class TrackActivity extends Activity {
                 lastLoop = now;
                 csv.append(frames).append(',').append((int) ((now - t0) / 1e6)).append(',')
                    .append(hit ? 1 : 0).append(',').append(fmt(bestC)).append(',')
-                   .append((int) cxSensor).append(',').append(fmt(errDeg)).append(',')
+                   .append(fmt(cxSensor)).append(',').append(fmt(errDeg)).append(',')
                    .append(fmt(w)).append(',')
                    .append(gotTel ? fmt(th) : "").append(',')
                    .append(gotTel ? fmt(wr) : "").append(',')
@@ -1684,6 +1697,8 @@ public class TrackActivity extends Activity {
                    // детекция взялась: при сдвиге цели до 123 пикселей за такт
                    // рамка отстаёт и на резком движении вылетает за цель.
                    .append((int) ((tf - t0) / 1000000L)).append(',')
+                   .append(lastLag).append(',')
+                   .append(Double.isNaN(frameAgeMs) ? "" : fmt(frameAgeMs)).append(',')
                    .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][0]) : "").append(',')
                    .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][1]) : "").append(',')
                    .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][2]) : "").append(',')
@@ -1975,6 +1990,11 @@ public class TrackActivity extends Activity {
      * различать доли этого. Профили центрируются перед корреляцией — иначе
      * общий уровень яркости даст ложный максимум на нулевом сдвиге.
      */
+    /** Целый лаг последней корреляции. Только для диагностики: по одному
+     *  дробному сдвигу нельзя отличить залипший на целом пик от плохого
+     *  подпикселя, а именно это и обсуждается вокруг недосчёта потока. */
+    static volatile int lastXcorrLag = 0;
+
     static double xcorr(float[] a, float[] b, int maxLag) {
         int n = a.length;
         double ma = 0, mb = 0;
@@ -1990,6 +2010,7 @@ public class TrackActivity extends Activity {
             c[lag + maxLag] = s;
             if (s > best) { best = s; bestLag = lag; }
         }
+        lastXcorrLag = bestLag;
         int k = bestLag + maxLag;
         if (k <= 0 || k >= 2 * maxLag) return bestLag;
         double y0 = c[k - 1], y1 = c[k], y2 = c[k + 1];
@@ -2069,8 +2090,6 @@ public class TrackActivity extends Activity {
             // комнате «Без мотора», выехал в поле, запустил обычной командой —
             // Bluetooth не открывается, вал стоит весь сеанс, и сказать из
             // командной строки «игнорируй сохранённое» было нечем.
-            final boolean ignoreSaved = ex != null && ex.containsKey("defaults")
-                    && RunSettings.asBool(String.valueOf(ex.get("defaults")));
             intent = new RunSettings.Source() {
                 public boolean has(String k) { return ex != null && ex.containsKey(k); }
                 public String get(String k) {
@@ -2078,7 +2097,8 @@ public class TrackActivity extends Activity {
                     return v == null ? null : String.valueOf(v);
                 }
             };
-            saved = ignoreSaved ? null : new RunSettings.Source() {
+            // Предикат живёт в RunSettings — там его достаёт стенд.
+            saved = RunSettings.ignoreSaved(intent) ? null : new RunSettings.Source() {
                 public boolean has(String k) { return p != null && p.contains(k); }
                 public String get(String k) { return p == null ? null : p.getString(k, null); }
             };

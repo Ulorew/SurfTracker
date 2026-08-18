@@ -259,6 +259,27 @@ public final class ReviewModel {
         return (sensorY * scale - crop) * (viewH / (double) videoH);
     }
 
+    /**
+     * Левый/верхний угол НАСТОЯЩЕЙ вырезки, пиксели сенсора.
+     *
+     * Приложение берёт кроп как clamp(winCx - Sc/2, 0, W - Sc): окно
+     * прижимается к кадру. Разбор же рисовал winCx ± Sc/2 БЕЗ прижатия, и у
+     * края кадра прямоугольник уезжал за его границу — на прогоне 16 августа
+     * настоящая вырезка была [480,1920], а нарисовано [739,2179], то есть
+     * правый край на 518 пикселей вне кадра. Ответ «цель внутри вырезки или
+     * снаружи» такая картинка даёт неверный.
+     */
+    public double cropLeft(Tick t) {
+        double half = t.win / 2.0;
+        return Math.max(0, Math.min(sensorW - t.win, t.winCx - half));
+    }
+
+    public double cropTop(Tick t) {
+        double half = t.win / 2.0;
+        double cy = (t.winCy >= 0) ? t.winCy : sensorH / 2.0;
+        return Math.max(0, Math.min(sensorH - t.win, cy - half));
+    }
+
     /** Подпись такта для экрана разбора. */
     public static String caption(Tick t, int idx, int total) {
         StringBuilder s = new StringBuilder();

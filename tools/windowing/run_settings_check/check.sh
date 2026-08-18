@@ -13,7 +13,8 @@ JAVA=$(command -v java || echo /home/ulorew/Android/jdk/bin/java)
 echo "== различающая сила стенда =="
 fails=0
 for m in "интент-игнорируется:s/if (intent != null \&\& intent.has(key)) {/if (false) {/" \
-         "умолчание-длительности:s/\"seconds\",  INT,   \"Длительность, с\", \"60\"/\"seconds\",  INT,   \"Длительность, с\", \"90\"/"; do
+         "умолчание-длительности:s/\"seconds\",  INT,   \"Длительность, с\", \"60\"/\"seconds\",  INT,   \"Длительность, с\", \"90\"/" \
+         "ключ-defaults-мёртв:s@return v != null \&\& asBool(v);@return false;@"; do
   name="${m%%:*}"; expr="${m#*:}"
   M="$D/$name"; mkdir -p "$M/com/surftracker/camfps"
   sed "$expr" "$SRC/com/surftracker/camfps/RunSettings.java" \
