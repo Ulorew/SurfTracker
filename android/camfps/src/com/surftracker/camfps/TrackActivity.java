@@ -902,11 +902,19 @@ public class TrackActivity extends Activity {
             final double degPerPx = Math.toDegrees(1.0 / fPx);   // в центре кадра
 
             // Только вычисленное из камеры: остальное записано выше, до неё.
+            // ПОЛЕ ЗРЕНИЯ ПИШЕТСЯ ДЕЙСТВУЮЩЕЕ, а не паспортное. Прогон с
+            // зумом 2.125 записывал в отчёт 72.92° — поле объектива без зума,
+            // тогда как камера видела 38.3°. Число выглядело измеренным и
+            // относилось не к этому прогону; тот же класс, что пустая колонка
+            // возраста кадра и кэш температуры.
+            double hfovEff = 2 * Math.toDegrees(Math.atan(
+                    Math.tan(Math.toRadians(hfovDeg / 2.0)) / zoom));
             j.append(",\"аспект\":\"").append(cfg.s("aspect"))
              .append("\",\"зум\":").append(fmt(zoom))
              .append(",\"превью\":").append(cfg.b("preview"))
              .append(",\"сенсор\":\"").append(W).append("x").append(H)
-             .append("\",\"поле_зрения_град\":").append(fmt(hfovDeg))
+             .append("\",\"поле_зрения_град\":").append(fmt(hfovEff))
+             .append(",\"поле_объектива_град\":").append(fmt(hfovDeg))
              .append(",\"град_на_пиксель\":").append(String.format(java.util.Locale.US, "%.5f", degPerPx));
             // Выбег, перезахват, удержание, возврат и режим без мотора отсюда
             // УБРАНЫ: они пишутся выше, до камеры. Дублировать их здесь нельзя
