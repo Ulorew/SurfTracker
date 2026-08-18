@@ -638,7 +638,7 @@ public class TrackActivity extends Activity {
             // близок к предсказанию. Без них нельзя отличить «вёл того же»
             // от «в кадре был только один» — а именно это и проверяется на
             // сценарии с двумя людьми.
-            + "кандидатов,до_предсказания,порог,состояние,промахов,"
+            + "кандидатов,до_предсказания,порог,маха_d2,состояние,промахов,"
             + "ошибка_свежая,цель_в_мире,вал_при_захвате,t_кадра_мс,"
             + "лаг_потока,возраст_кадра_мс,толчок_фаза,в_толчке,sync_такта,заряд,"
             // Рамка выбранной детекции в ПИКСЕЛЯХ СЕНСОРА — те же координаты,
@@ -1498,7 +1498,8 @@ public class TrackActivity extends Activity {
                 prevTickNs = nowTickNs;
                 if (dtTick <= 0 || dtTick > 2.0) dtTick = 0.2;
                 int chosenDet = -1;
-                double distToPred = Double.NaN, gateNow = 0;
+                double distToPred = Double.NaN, gateNow = Double.NaN;
+                double mahaD2 = Double.NaN;
                 boolean stepped = false;
                 // Сколько длится потеря — нужно ЗДЕСЬ, до решения трекера:
                 // затравка после долгой потери открывается по этому же числу.
@@ -1554,6 +1555,7 @@ public class TrackActivity extends Activity {
                         chosenDet = tk.chosen;
                         distToPred = tk.dist;
                         gateNow = tk.gate;
+                        mahaD2 = tk.gateD2;
                         stepped = true;
 
                         // Затравка по уверенности осталась КРАЙНЕЙ мерой: она
@@ -1881,7 +1883,10 @@ public class TrackActivity extends Activity {
                    .append(fmt(wSmooth)).append(',').append(fmt(shrink)).append(',')
                    .append(nDet).append(',')
                    .append(Double.isNaN(distToPred) ? "" : fmt(distToPred))
-                   .append(',').append(fmt(gateNow))
+                   // Пусто, а не ноль: при гейте радиуса приёма не существует, и
+                   // ноль читался бы как «порог нулевой», а не «неприменим».
+                   .append(',').append(Double.isNaN(gateNow) ? "" : fmt(gateNow))
+                   .append(',').append(Double.isNaN(mahaD2) ? "" : fmt(mahaD2))
                    .append(',').append(trk.status == Tracker.TRACKING ? "вед" : "потеря")
                    .append(',').append(trk.missCount).append(',')
                    .append(Double.isNaN(errFreshDeg) ? "" : fmt(errFreshDeg)).append(',')

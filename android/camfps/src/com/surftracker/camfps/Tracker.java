@@ -435,11 +435,19 @@ public final class Tracker {
      * @param dets [n][3]: cx, cy, size — уже в пикселях сенсора
      * @return индекс выбранной или -1
      */
-    /** dt такта нужен гейту: ковариация предсказания зависит от него. */
-    private double gateDt = 0.0;
-
-    public int selectTarget(double[][] dets, int n, double predCx, double predCy,
-                             double side) {
+    /**
+     * dt ПАРАМЕТРОМ, а не полем. Пока такт лежал в поле gateDt, прямой вызов
+     * selectTarget давал ДРУГОЙ гейт молча: ковариация предсказания зависит
+     * от dt, и на чистом состоянии радиус приёма выходил 257 px против 1019
+     * при step(0.25) и 3954 при step(1.0). Хуже всего, что ловушка молчала на
+     * длинном ровном прогоне (после тридцати тактов ведения прямой вызов
+     * давал верные 214.6) и врала ровно там, где меряют с чистого листа.
+     * Соседние planCx/planCy берут dt явно, эталон track_logic тоже.
+     *
+     * Метод закрыт: единственный законный вход — step().
+     */
+    private int selectTarget(double[][] dets, int n, double predCx, double predCy,
+                             double side, double dt) {
         double frac = (status == TRACKING) ? SELECT_MAX_DIST_FRAC : REACQ_MAX_DIST_FRAC;
         double maxDist = frac * side;
         int best = -1; double bestScore = Double.MAX_VALUE;
@@ -456,7 +464,7 @@ public final class Tracker {
                 // тактах 409 и 419 прогона 18 августа: уверенные детекции
                 // (0.90 и 0.92) были отвергнуты радиусом, пока убеждение
                 // уезжало.
-                if (kf.gateDistance2(dets[i][0], dets[i][1], dets[i][2], gateDt)
+                if (kf.gateDistance2(dets[i][0], dets[i][1], dets[i][2], dt)
                         > KalmanTracker.GATE_CHI2) continue;
             } else if (d > maxDist) continue;          // радиус приёма — как был
             double score = d;
@@ -476,7 +484,14 @@ public final class Tracker {
         public double side;          // сторона окна, от которой мерился приём
         public double predCx, predCy;// центр плана (он же центр приёма)
         public double dist = Double.NaN;  // до предсказания, ДО обновления фильтра
-        public double gate;          // радиус приёма на этом такте
+        // Радиус приёма — ТОЛЬКО когда он и вправду решает. При включённом
+        // гейте радиуса не существует как числа: граница зависит от размера
+        // КАЖДОГО кандидата (370 px для мелкого и 2015 для втрое крупного при
+        // одной и той же стороне окна 1440). Прежде сюда безусловно писалось
+        // 0.3*side, и строка лога выходила самопротиворечивой: «до
+        // предсказания» 700 больше «порога» 432, а цель помечена выбранной.
+        public double gate = Double.NaN;   // радиус приёма, NaN при гейте
+        public double gateD2 = Double.NaN; // квадрат расстояния Махаланобиса выбранной
         public int status;           // состояние ПОСЛЕ такта
         public int miss;             // промахов подряд ПОСЛЕ такта
     }
@@ -500,11 +515,15 @@ public final class Tracker {
         clampBeliefToView(t.side);          // как plan_window: прижать, потом предсказывать
         t.predCx = planCx(dt, t.side);
         t.predCy = planCy(dt, t.side);
-        t.gate = ((status == TRACKING) ? SELECT_MAX_DIST_FRAC : REACQ_MAX_DIST_FRAC) * t.side;
-        gateDt = dt;
-        t.chosen = selectTarget(dets, n, t.predCx, t.predCy, t.side);
+        boolean byGate = ENABLE_GATE && ENABLE_KALMAN && status == TRACKING;
+        if (!byGate)
+            t.gate = ((status == TRACKING) ? SELECT_MAX_DIST_FRAC : REACQ_MAX_DIST_FRAC) * t.side;
+        t.chosen = selectTarget(dets, n, t.predCx, t.predCy, t.side, dt);
         if (t.chosen >= 0) {
             t.dist = Math.hypot(dets[t.chosen][0] - t.predCx, dets[t.chosen][1] - t.predCy);
+            if (byGate)
+                t.gateD2 = kf.gateDistance2(dets[t.chosen][0], dets[t.chosen][1],
+                                            dets[t.chosen][2], dt);
             update(dets[t.chosen][0], dets[t.chosen][1], dt, dets[t.chosen][2]);
         } else if (initialized) {
             advance(dt);
