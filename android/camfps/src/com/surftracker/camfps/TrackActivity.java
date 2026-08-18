@@ -285,20 +285,60 @@ public class TrackActivity extends Activity {
     static final double SEARCH_SPEED = 0.15;                     // рад/с, медленно
     static final double SEARCH_SPAN_RAD = Math.toRadians(60.0);  // полусектор
 
+    // КОЛЬЦО ТЕЛЕМЕТРИИ. Без него thetaAt умеет смотреть только ВПЕРЁД, и
+    // «угол вала на момент съёмки» получить нельзя в принципе: кадр снят
+    // раньше последнего отсчёта телеметрии (возраст кадра ~220 мс при периоде
+    // телеметрии 100 мс), то есть запрашиваемый момент всегда в прошлом,
+    // строка `if (age < 0) age = 0` возвращала последний угол, и колонка
+    // «вал_за_кадр_град» печатала тождественный ноль во всех 1417 строках
+    // четырёх прогонов. Механизм выглядел существующим и не давал ни одного
+    // числа — та же семья, что пустой возраст кадра и кэш температуры.
+    //
+    // Две секунды истории при 10 Гц — двадцать отсчётов, с запасом на любой
+    // разумный возраст кадра.
+    static final int TEL_RING = 32;
+    final long[] telRingNs = new long[TEL_RING];
+    final float[] telRingTh = new float[TEL_RING];
+    final float[] telRingW  = new float[TEL_RING];
+    volatile int telRingPos = 0;
+
+    void telPush(long ns, float th, float w) {
+        int i = telRingPos % TEL_RING;
+        telRingNs[i] = ns; telRingTh[i] = th; telRingW[i] = w;
+        telRingPos++;
+    }
+
     /**
-     * Угол вала на заданный момент, рад.
+     * Угол вала на заданный момент, рад. Умеет и вперёд, и НАЗАД.
      *
-     * Телеметрия приходит 10 Гц; между отсчётами угол берётся экстраполяцией
-     * по последней РАМПОВОЙ скорости (её присылает прошивка — это то, что вал
-     * реально отрабатывает, а не то, что мы просили). Экстраполяция ограничена
-     * 300 мс: дальше она домысливает больше, чем знает.
+     * Вперёд — экстраполяция по последней РАМПОВОЙ скорости (её присылает
+     * прошивка: это то, что вал реально отрабатывает, а не то, что мы
+     * просили), ограниченная 300 мс — дальше она домысливает больше, чем
+     * знает.
+     *
+     * Назад — по кольцу отсчётов: берётся ближайший НЕ ПОЗЖЕ запрошенного
+     * момента и доводится его же рамповой скоростью. Если запрошенный момент
+     * старше всего кольца, возвращается самый старый угол без доводки:
+     * домысливать назад за пределы записанного нечем.
      */
     double thetaAt(long ns) {
-        long age = ns - telNs;
         if (telNs == 0) return lastTheta;
-        if (age < 0) age = 0;
-        if (age > 300_000_000L) age = 300_000_000L;
-        return lastTheta + lastWRamp * (age / 1e9);
+        if (ns >= telNs) {
+            long age = Math.min(ns - telNs, 300_000_000L);
+            return lastTheta + lastWRamp * (age / 1e9);
+        }
+        // назад: ищем последний отсчёт с меткой <= ns
+        long bestNs = 0; float bestTh = lastTheta, bestW = lastWRamp;
+        long oldestNs = Long.MAX_VALUE; float oldestTh = lastTheta;
+        int n = Math.min(telRingPos, TEL_RING);
+        for (int k = 0; k < n; k++) {
+            long t = telRingNs[k];
+            if (t == 0) continue;
+            if (t < oldestNs) { oldestNs = t; oldestTh = telRingTh[k]; }
+            if (t <= ns && t > bestNs) { bestNs = t; bestTh = telRingTh[k]; bestW = telRingW[k]; }
+        }
+        if (bestNs == 0) return oldestTh;     // запрошено раньше всего кольца
+        return bestTh + bestW * ((ns - bestNs) / 1e9);
     }
     static final UUID SPP = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
     static final int NET = 640;
@@ -1424,6 +1464,7 @@ public class TrackActivity extends Activity {
                                     }
                                     lastStatus = t.status; lastTheta = t.theta; lastWRamp = t.wRamp;
                                     telCount++; telNs = System.nanoTime();
+                                    telPush(telNs, t.theta, t.wRamp);
                                     int stt = t.status;
                                     if ((stt & ProtoV2.ST_WATCHDOG) != 0) bWd++;
                                     if ((stt & ProtoV2.ST_EXTRAP_CAP) != 0) bCap++;
@@ -2029,7 +2070,10 @@ public class TrackActivity extends Activity {
                    .append(',').append(trk.missCount).append(',')
                    .append(Double.isNaN(errFreshDeg) ? "" : fmt(errFreshDeg)).append(',')
                    .append(Double.isNaN(tgtWorldRad) ? "" : fmt(tgtWorldRad)).append(',')
-                   .append(fmt(thetaCap)).append(',')
+                   // ПУСТО, а не ноль, когда телеметрии нет вовсе: в прогоне
+                   // без мотора ноль читался как «вал не двигался», хотя на
+                   // деле измерять было нечего.
+                   .append(thetaCapOk ? fmt(thetaCap) : "").append(',')
                    // ВРЕМЯ КАДРА, а не конца такта.
                    //
                    // t_ms пишется в конце такта, то есть примерно на
@@ -2044,7 +2088,7 @@ public class TrackActivity extends Activity {
                    .append(Double.isNaN(zoomActual) ? "" : fmt(zoomActual)).append(',')
                    // разница «вал на съёмке» против «вал на выемке»: то самое,
                    // что решает, нужна ли поправка на возраст кадра
-                   .append(Double.isNaN(thetaAtCapture) ? ""
+                   .append((!thetaCapOk || Double.isNaN(thetaAtCapture)) ? ""
                            : fmt(Math.toDegrees(thetaCap - thetaAtCapture))).append(',')
                    .append(kickPhase).append(',')
                    .append(inKick ? 1 : 0).append(',')

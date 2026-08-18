@@ -395,6 +395,16 @@ class TrackState:
 
         # --- отбор кандидатов: дистанция/гейт -> окклюзия -> счёт с вето ----
         max_dist = max_frac * accept_side
+        # ПОТОЛОК ОТ КАДРА. Расширение на промахах не ограничено ничем, и без
+        # этой строки радиус после долгой потери превосходит кадр в десятки
+        # раз. Дальше полудиагонали цели быть не может.
+        #
+        # Границы кадра могут быть не заданы (петля без вида) — тогда и
+        # ограничивать нечем: молча подставлять число было бы хуже.
+        if self.view_half_w is not None and self.view_half_h is not None:
+            диагональ = 2 * math.hypot(self.view_half_w, self.view_half_h)
+            max_dist = min(max_dist, диагональ *
+                           getattr(self.cfg, "TARGET_RADIUS_VIEW_DIAG_FRAC", 0.5))
         by_radius = [d for d in detections
                      if dist(pred_cx, pred_cy, *_det_center(d)) <= max_dist]
         gated = None

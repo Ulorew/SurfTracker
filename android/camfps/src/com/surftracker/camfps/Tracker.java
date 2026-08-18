@@ -266,6 +266,9 @@ public final class Tracker {
      * Размер ПРЕДСКАЗАННЫЙ (ведёт фильтр), а не размер кандидата. Урок выучен
      * трижды: счёт кандидата, гейт, теперь радиус.
      */
+    /** Доля диагонали кадра — потолок радиуса приёма. TARGET_RADIUS_VIEW_DIAG_FRAC. */
+    public static final double RADIUS_VIEW_DIAG_FRAC = 0.5;
+
     public double acceptanceSide() {
         double base = Math.max(WINDOW_K * filteredSize, MIN_WINDOW_PX);
         int steps = Math.min(missCount, MAX_EXPAND_STEPS);
@@ -471,7 +474,16 @@ public final class Tracker {
                              double side, double dt) {
         double frac = (status == TRACKING) ? SELECT_MAX_DIST_FRAC : REACQ_MAX_DIST_FRAC;
         // ОТ СТОРОНЫ ПРИЁМА, не от прижатой стороны окна (см. acceptanceSide).
-        double maxDist = frac * acceptanceSide();
+        //
+        // ...НО С ПОТОЛКОМ ОТ КАДРА. Сторона приёма умножается на
+        // EXPAND_PER_MISS^промах и не ограничена ничем: при 25 промахах подряд
+        // (реальный максимум прогона 260818_1059) радиус выходит 33 000 px, то
+        // есть в 23 раза больше диагонали кадра. Дальше полудиагонали цели
+        // физически быть не может, а на телефоне вето по размеру и гейт по
+        // умолчанию выключены — второго ограничителя нет вовсе, и после долгой
+        // потери принялась бы любая детекция в кадре.
+        double maxDist = Math.min(frac * acceptanceSide(),
+                RADIUS_VIEW_DIAG_FRAC * Math.hypot(frameW, frameH));
         int best = -1; double bestScore = Double.MAX_VALUE;
         for (int i = 0; i < n; i++) {
             double d = Math.hypot(dets[i][0] - predCx, dets[i][1] - predCy);

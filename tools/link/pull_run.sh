@@ -69,3 +69,11 @@ else
 fi
 echo
 ls -la "$LOCAL"
+
+# ЗДОРОВЬЕ ЛОГА сразу после стягивания. Немая колонка — это не мелочь: за одни
+# сутки трижды выяснялось, что величина выглядит измеренной, а её нет.
+PY="$ROOT/.venv/bin/python"
+[ -x "$PY" ] && [ -f "$DEST/$NAME/log.csv" ] && {
+    echo
+    "$PY" "$ROOT/tools/link/log_health.py" "$DEST/$NAME" | sed -n '/НЕМЫЕ/,$p'
+}

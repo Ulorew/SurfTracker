@@ -38,6 +38,9 @@ sys.path.insert(0, os.path.join(ROOT, "tools", "windowing", "nms_check"))
 WINDOW_K = 3.5           # TRACK_WINDOW_K
 MIN_WINDOW = 640         # DETECT_MIN_WINDOW_PX
 SELECT_FRAC = 0.30       # TARGET_SELECT_MAX_DIST_FRAC
+EXPAND_PER_MISS = 1.15   # WINDOW_EXPAND_PER_MISS
+MAX_EXPAND = 64          # MAX_EXPAND_STEPS
+DIAG_FRAC = 0.5          # TARGET_RADIUS_VIEW_DIAG_FRAC
 VETO_RATIO = 1.8         # SIZE_VETO_RATIO
 NET = 640
 MAX_DET = 16
@@ -116,8 +119,18 @@ def main():
         # составлялся в конце прошлого. Сверено по логу: p50 = 1.8 px.
         pcx, pcy = число(prev, "winCx"), число(prev, "winCy")
         sc, filt = число(prev, "Sc"), число(prev, "размер_фильтра")
-        путь = os.path.join(frames, f"{tick:05d}.jpg")
-        if not os.path.exists(путь):
+        # PNG ПРЕДПОЧТИТЕЛЬНЕЕ. Кадры модели пишутся в JPEG качества 60, и
+        # сжатие смещает уверенности: на сличении с лослесс-дампами того же
+        # прогона JPEG сдвигал 0.646 в 0.451 и однажды РОДИЛ кандидата 0.365
+        # там, где телефон не нашёл ничего. Направление опасное — не только
+        # потеря детекции, но и приписанная.
+        путь = None
+        for имя in (f"{tick:05d}.png", f"{tick:05d}.jpg"):
+            к = os.path.join(frames, имя)
+            if os.path.exists(к):
+                путь = к
+                break
+        if путь is None:
             print(f"\n=== такт {tick}: нет кадра {путь} ===")
             continue
 
@@ -129,15 +142,33 @@ def main():
         cols = [[float(raw[row][a]) for row in range(5)] for a in range(raw.shape[1])]
         dets = nms_ref.nms(cols, MAX_DET)
 
+        # РАСШИРЕНИЕ НА ПРОМАХАХ учитывается в ОБЕИХ колонках. Прежде «было»
+        # брало сторону из лога (в ней расширение уже сидит), а «стало»
+        # считалось по своей формуле без него — две соседние колонки одной
+        # таблицы жили по разным правилам, и на такте 409 печаталось 1239
+        # вместо 1425. Промахи берутся из ПРЕДЫДУЩЕЙ строки: это состояние ДО
+        # такта, от него и считался приём.
+        промахов = int(число(prev, "промахов", 0))
+        рост = EXPAND_PER_MISS ** min(промахов, MAX_EXPAND)
         радиус_было = SELECT_FRAC * sc                              # от ПРИЖАТОГО окна
-        радиус_стало = SELECT_FRAC * max(WINDOW_K * filt, MIN_WINDOW)
+        радиус_стало = min(SELECT_FRAC * max(WINDOW_K * filt, MIN_WINDOW) * рост,
+                           DIAG_FRAC * math.hypot(W, H))
 
         print(f"\n=== такт {tick} ===")
         print(f"  лог: есть_цель={r.get('есть_цель')} conf={r.get('conf')} "
               f"кандидатов={r.get('кандидатов')} промахов={r.get('промахов')}")
+        if путь.endswith(".jpg"):
+            print("  ВНИМАНИЕ: кадр в JPEG q60, уверенности смещены сжатием")
         print(f"  ведомый размер {filt:.0f}, окно {sc:.0f} "
               f"(без потолка было бы {max(WINDOW_K * filt, MIN_WINDOW):.0f})")
         print(f"  радиус приёма: было {радиус_было:.0f}, стало {радиус_стало:.0f}")
+        # СЛИЧЕНИЕ С ЛОГОМ. Инструмент, чьи детекции расходятся с записанными,
+        # отвечает не про этот прогон. Прежде расхождение печаталось рядом на
+        # экране и молчало.
+        было = число(r, "кандидатов", float("nan"))
+        if not math.isnan(было) and len(dets) != int(было):
+            print(f"  РАСХОЖДЕНИЕ С ЛОГОМ: в записи {int(было)} кандидатов, "
+                  f"здесь {len(dets)} — репроигрыш не воспроизводит прогон")
         if not dets:
             print("  ДЕТЕКТОР НЕ НАШЁЛ НИЧЕГО — вопрос к модели, не к алгоритму")
             continue
