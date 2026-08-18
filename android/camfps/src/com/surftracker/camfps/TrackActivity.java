@@ -163,6 +163,10 @@ public class TrackActivity extends Activity {
                         sb.setOnClickListener(x -> finish());
                     }
                 }
+                // Заряд опрашивается раз в пять секунд: чаще незачем, а
+                // дёргать системный приёмник каждые полсекунды — лишняя работа
+                // в такте, который и так на грани.
+                if (++battTick % 10 == 0) battNow = batteryPct();
                 if (!isFinishing()) h.postDelayed(this, 500);
             }
         });
@@ -253,6 +257,10 @@ public class TrackActivity extends Activity {
     volatile int syncSkips = 0;
     /** Сколько раз цель взята КРАЙНЕЙ мерой — по уверенности. В run.json. */
     volatile int reseeds = 0;
+    /** Заряд на старте прогона и время снимка — для расхода за час. */
+    volatile int battStart = -1, battNow = -1;
+    volatile long battStartNs = 0;
+    int battTick = 0;
     long lastHitMs = 0, lastCueMs = 0, runStartMs = 0;
     /** Поиск вращением: угол начала, направление, скорость и полусектор. */
     double searchBase = Double.NaN;
@@ -615,7 +623,7 @@ public class TrackActivity extends Activity {
             // сценарии с двумя людьми.
             + "кандидатов,до_предсказания,порог,состояние,промахов,"
             + "ошибка_свежая,цель_в_мире,вал_при_захвате,t_кадра_мс,"
-            + "лаг_потока,возраст_кадра_мс,толчок_фаза,в_толчке,sync_такта,"
+            + "лаг_потока,возраст_кадра_мс,толчок_фаза,в_толчке,sync_такта,заряд,"
             // Рамка выбранной детекции в ПИКСЕЛЯХ СЕНСОРА — те же координаты,
             // в которых живёт трекер и считается winCx.
             //
@@ -1080,6 +1088,29 @@ public class TrackActivity extends Activity {
                 {"12","Стойте. Не шевелитесь"},
                 {"25","Осталось половина. Стойте"},
                 {"20","Продолжайте стоять"}};
+            // ПОЛНЫЙ ПРОГОН. Восемь минут — это уже не проверка механизма, а
+            // проба изделия целиком: нагрев, расход заряда, удержание кадров
+            // при записи, поведение на разных дистанциях. Реплики раскиданы
+            // так, чтобы за прогон встретились все режимы, ради которых петля
+            // и делалась, а не восемь минут одинаковой ходьбы.
+            else if (scen.equals("полный")) script = new String[][]{
+                {"0","Встаньте в кадр"},
+                {"10","Идите поперёк кадра не спеша"},
+                {"25","Идите обратно"},
+                {"25","Подойдите ближе к камере"},
+                {"20","Отойдите подальше"},
+                {"20","Идите быстрым шагом поперёк"},
+                {"20","И обратно так же быстро"},
+                {"20","Стойте на месте"},
+                {"20","Уйдите из кадра на несколько секунд"},
+                {"12","Вернитесь"},
+                {"20","Идите по диагонали к камере"},
+                {"20","Отойдите по диагонали"},
+                {"20","Ходите свободно, как получится"},
+                {"60","Продолжайте ходить"},
+                {"60","Продолжайте, осталось немного"},
+                {"60","Стойте на месте"},
+                {"30","Продолжайте стоять"}};
             // ПРОХОД И СТОП — единственный режим, где синхронизацию вообще
             // можно проверить.
             //
@@ -1289,6 +1320,9 @@ public class TrackActivity extends Activity {
             if (recStartNs != 0)
                 j.append(",\"видео_смещение_мс\":").append((t0 - recStartNs) / 1000000L);
             syncEnc = syncOn;
+            battStart = batteryPct();
+            battStartNs = System.nanoTime();
+            j.append(",\"батарея_старт\":").append(battStart);
             // ЧЕРЕДОВАНИЕ ВНУТРИ ОДНОГО ПРОГОНА, а не два прогона подряд.
             //
             // Два прогона разводит всё: скорость ходьбы, освещение, нагрев,
@@ -1804,6 +1838,7 @@ public class TrackActivity extends Activity {
                    .append(kickPhase).append(',')
                    .append(inKick ? 1 : 0).append(',')
                    .append(syncEnc ? 1 : 0).append(',')
+                   .append(battNow).append(',')
                    .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][0]) : "").append(',')
                    .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][1]) : "").append(',')
                    .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][2]) : "").append(',')
@@ -1987,6 +2022,18 @@ public class TrackActivity extends Activity {
              // прогона, и разбор по ключу нашёл бы её вместо фактической.
              .append(",\"длительность_с\":").append(fmt((System.nanoTime() - t0) / 1e9))
              .append(",\"батарея_нагрев\":").append(fmt(batteryTempC()))
+             .append(",\"батарея_конец\":").append(batteryPct())
+             .append(",\"батарея_потрачено\":")
+             .append(battStart >= 0 ? (battStart - batteryPct()) : -1)
+             // Расход в час — то, чем меряют «на сколько хватит». На коротком
+             // прогоне число грубое: шаг индикатора заряда 1%, и на пяти
+             // минутах это уже 12% в час погрешности. Поэтому оно и пишется
+             // рядом с длительностью, а не вместо неё.
+             .append(",\"батарея_в_час\":")
+             .append(battStart >= 0 && battStartNs != 0
+                     ? fmt((battStart - batteryPct())
+                           / Math.max((System.nanoTime() - battStartNs) / 3.6e12, 1e-9))
+                     : "-1")
              .append("}");
             j.append(",\"ok\":true");
         } catch (Throwable t) {
@@ -2354,6 +2401,22 @@ public class TrackActivity extends Activity {
      * телефон грелся на каждом длинном прогоне, и это уже влияло на результат
      * (троттлинг инференса), но нигде не записывалось.
      */
+    /**
+     * Заряд, проценты. Пишется вместе с температурой: нагрев и расход —
+     * разные вещи, и для полевого прогона важнее второе. На вопрос «на сколько
+     * хватит аккумулятора» температура не отвечает.
+     */
+    int batteryPct() {
+        try {
+            android.content.Intent bi = registerReceiver(null,
+                    new android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED));
+            if (bi == null) return -1;
+            int lvl = bi.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1);
+            int sc = bi.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, 100);
+            return (lvl < 0 || sc <= 0) ? -1 : Math.round(lvl * 100f / sc);
+        } catch (Throwable t) { return -1; }
+    }
+
     float batteryTempC() {
         try {
             android.content.Intent bi = registerReceiver(null,
