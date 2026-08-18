@@ -1535,7 +1535,21 @@ public class TrackActivity extends Activity {
                         capNs = its - clockOffsetNs;
                         double age = (tf - capNs) / 1e6;
                         if (age > -1000 && age < 1000) frameAgeMs = age;
+                        // СОПОСТАВЛЕНИЕ ПО БЛИЖАЙШЕЙ МЕТКЕ, не по точной.
+                        // Точное совпадение промахивалось на каждом пятом
+                        // такте (314 из 387 в прогоне 260818_1757): результат
+                        // захвата приходит своим чередом и может отстать от
+                        // выемки кадра. При переменном зуме это означало бы
+                        // каждый пятый кадр с неизвестным масштабом.
                         Float z = zoomOf.get(its);
+                        if (z == null) {
+                            long best = Long.MAX_VALUE;
+                            for (java.util.Map.Entry<Long, Float> e : zoomOf.entrySet()) {
+                                long dz = Math.abs(e.getKey() - its);
+                                if (dz < best) { best = dz; z = e.getValue(); }
+                            }
+                            if (best > 100_000_000L) z = null;   // дальше 100 мс — не тот кадр
+                        }
                         if (z != null) zoomActual = z;
                     }
                 } catch (Throwable ignored) {}

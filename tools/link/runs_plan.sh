@@ -120,15 +120,16 @@ case "${1:-список}" in
 превью-есть)
     echo "СЦЕНА НЕПОДВИЖНА, в кадре никого. 90 с, запись 4K. Мотор НЕ нужен."
     echo "Пара к «превью-нет»: то же место, тот же свет, не переставлять телефон."
+    echo "СТАРТ не нажимать — прогон пойдёт сам: нажатие сдвинуло бы аппарат."
     set -- --ei seconds 90 --ez video true --es quality 2160 --ez preview true \
-           --ez rec false --ez dry true --es tag превью_есть
+           --ez rec false --ez dry true --ez auto true --es tag превью_есть
     ;;
 
 превью-нет)
     echo "То же самое, ТЕЛЕФОН НЕ ТРОГАТЬ между прогонами. Превью отключено."
     echo "Если сессия не соберётся — так и будет сказано, это тоже ответ."
     set -- --ei seconds 90 --ez video true --es quality 2160 --ez preview false \
-           --ez rec false --ez dry true --es tag превью_нет
+           --ez rec false --ez dry true --ez auto true --es tag превью_нет
     ;;
 
 # --- КАМЕРА: аспект потока анализа -----------------------------------------

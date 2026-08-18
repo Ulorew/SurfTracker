@@ -9,6 +9,24 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 . ~/Android/env.sh 2>/dev/null || true
 
+# ПРОГОН БЕЗ МОТОРА не трогает плату вовсе, и требовать от неё ответа значит
+# требовать включённого стенда там, где он не нужен. Пропускается ТОЛЬКО часть
+# про плату: телефон всё равно проверяется, иначе прогон уйдёт в пустоту.
+#
+# Это не смягчение правила «проверку нельзя проглядеть»: условие пропуска —
+# не «человек решил», а сам состав прогона, и оно печатается.
+DRY=0
+prev=""
+for a in "$@"; do
+    [ "$prev" = "dry" ] && [ "$a" = "true" ] && DRY=1
+    prev="$a"
+done
+
+if [ "$DRY" = "1" ]; then
+    echo "ПРОГОН БЕЗ МОТОРА: проверка платы пропущена, стенд не нужен."
+    adb devices | grep -q "device$" || {
+        echo "ЗАПУСК ОТМЕНЁН: телефон не виден в adb."; exit 1; }
+else
 "$ROOT/tools/link/preflight.sh" || {
     echo
     echo "ЗАПУСК ОТМЕНЁН: предполёт не пройден."
@@ -17,6 +35,7 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
     echo "телефон отвалился от adb."
     exit 1
 }
+fi
 
 adb shell am force-stop com.surftracker.camfps >/dev/null 2>&1 || true
 adb shell am start -n com.surftracker.camfps/.TrackActivity "$@" >/dev/null
