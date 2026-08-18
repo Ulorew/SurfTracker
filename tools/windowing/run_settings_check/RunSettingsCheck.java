@@ -117,7 +117,9 @@ public class RunSettingsCheck {
                 failed++; System.out.println("  ПЛОХО умолчание " + i.key + " не число");
             }
         }
-        eq("параметров на экране", RunSettings.SPEC.length, 21);
+        // Число параметров пришпилено намеренно: молча пропавший параметр — это
+        // молча пропавшая настройка прогона. Растёт вместе с экраном.
+        eq("параметров на экране", RunSettings.SPEC.length, 24);
 
         System.out.println("== defaults: команда требует умолчаний ==");
         // Проверяется НАСТОЯЩИЙ предикат RunSettings.ignoreSaved, а не его
