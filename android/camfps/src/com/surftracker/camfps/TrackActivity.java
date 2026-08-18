@@ -498,6 +498,7 @@ public class TrackActivity extends Activity {
             // RUNNING_ONE, и каждая следующая попытка «НОВЫЙ ПРОГОН» молча
             // закрывалась. Это и есть «второй прогон не стартует».
             stopRequested = true;
+            stoppedByBackground = true;
             wCmd = 0.0f; wCmdNs = System.nanoTime();
             Log.i(TAG, "уход в фон: прогон остановлен");
         }
@@ -505,6 +506,8 @@ public class TrackActivity extends Activity {
 
     /** Петля запущена: до этого момента приостановка активности ничего не значит. */
     volatile boolean started;
+    /** Прогон оборвался уходом в фон — попадает в причину отказа в артефакте. */
+    volatile boolean stoppedByBackground;
 
     void run() {
         if (!RUNNING_ONE.compareAndSet(false, true)) {
@@ -683,7 +686,7 @@ public class TrackActivity extends Activity {
             // сценарии с двумя людьми.
             + "кандидатов,до_предсказания,порог,маха_d2,состояние,промахов,"
             + "ошибка_свежая,цель_в_мире,вал_при_захвате,t_кадра_мс,"
-            + "лаг_потока,возраст_кадра_мс,зум_факт,вал_за_кадр_град,толчок_фаза,в_толчке,sync_такта,заряд,"
+            + "лаг_потока,возраст_кадра_мс,зум_факт,выдержка_мс,iso,вал_за_кадр_град,толчок_фаза,в_толчке,sync_такта,заряд,"
             // Рамка выбранной детекции в ПИКСЕЛЯХ СЕНСОРА — те же координаты,
             // в которых живёт трекер и считается winCx.
             //
@@ -1075,12 +1078,26 @@ public class TrackActivity extends Activity {
             // терминах, в каких её отдаёт Image.
             final java.util.concurrent.ConcurrentHashMap<Long, Float> zoomOf =
                     new java.util.concurrent.ConcurrentHashMap<>();
+            final java.util.concurrent.ConcurrentHashMap<Long, Long> expOf =
+                    new java.util.concurrent.ConcurrentHashMap<>();
+            final java.util.concurrent.ConcurrentHashMap<Long, Integer> isoOf =
+                    new java.util.concurrent.ConcurrentHashMap<>();
             box[0].setRepeatingRequest(rq.build(), new CameraCaptureSession.CaptureCallback() {
                 @Override public void onCaptureCompleted(CameraCaptureSession s3,
                         CaptureRequest req, TotalCaptureResult res) {
                     try {
                         Long ts = res.get(CaptureResult.SENSOR_TIMESTAMP);
                         Float z = res.get(CaptureResult.CONTROL_ZOOM_RATIO);
+                        // ВЫДЕРЖКА И ЧУВСТВИТЕЛЬНОСТЬ. Без них «света хватало»
+                        // остаётся оценкой на глаз: часть механизмов ISP
+                        // (ремозаика квад-байера, шумодав) включается по
+                        // освещённости, и, не зная её, легко принять
+                        // отключённый механизм за отсутствующий. Плюс выдержка
+                        // прямо задаёт смаз при панораме.
+                        Long expNs = res.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+                        Integer iso = res.get(CaptureResult.SENSOR_SENSITIVITY);
+                        if (ts != null && expNs != null) expOf.put(ts, expNs);
+                        if (ts != null && iso != null) isoOf.put(ts, iso);
                         if (ts != null && z != null) {
                             zoomOf.put(ts, z);
                             // Карта не должна расти без предела: держим
@@ -1088,6 +1105,8 @@ public class TrackActivity extends Activity {
                             if (zoomOf.size() > 240) {
                                 long old = ts - 4_000_000_000L;
                                 zoomOf.keySet().removeIf(k -> k < old);
+                                expOf.keySet().removeIf(k -> k < old);
+                                isoOf.keySet().removeIf(k -> k < old);
                             }
                         }
                     } catch (Throwable t) {
@@ -1575,7 +1594,8 @@ public class TrackActivity extends Activity {
                 // идти по другим часам (REALTIME против MONOTONIC), и разность
                 // тогда бессмысленна; понять это можно лишь по записи. Поэтому
                 // сначала измеряем, а компенсируем — отдельным решением.
-                double zoomActual = Double.NaN;
+                double zoomActual = Double.NaN, expMs = Double.NaN;
+                int isoNow = -1;
                 long capNs = 0;
                 try {
                     long its = im.getTimestamp();
@@ -1600,6 +1620,10 @@ public class TrackActivity extends Activity {
                             if (best > 100_000_000L) z = null;   // дальше 100 мс — не тот кадр
                         }
                         if (z != null) zoomActual = z;
+                        Long e = expOf.get(its);
+                        if (e != null) expMs = e / 1e6;
+                        Integer q = isoOf.get(its);
+                        if (q != null) isoNow = q;
                     }
                 } catch (Throwable ignored) {}
                 // УГОЛ ВАЛА НА МОМЕНТ ЗАХВАТА КАДРА.
@@ -2094,6 +2118,8 @@ public class TrackActivity extends Activity {
                    .append(lastLag).append(',')
                    .append(Double.isNaN(frameAgeMs) ? "" : fmt(frameAgeMs)).append(',')
                    .append(Double.isNaN(zoomActual) ? "" : fmt(zoomActual)).append(',')
+                   .append(Double.isNaN(expMs) ? "" : fmt(expMs)).append(',')
+                   .append(isoNow >= 0 ? String.valueOf(isoNow) : "").append(',')
                    // разница «вал на съёмке» против «вал на выемке»: то самое,
                    // что решает, нужна ли поправка на возраст кадра
                    .append((!thetaCapOk || Double.isNaN(thetaAtCapture)) ? ""
@@ -2310,7 +2336,21 @@ public class TrackActivity extends Activity {
                            / Math.max((System.nanoTime() - battStartNs) / 3.6e12, 1e-9))
                      : "-1")
              .append("}");
-            j.append(",\"ok\":true");
+            // ПРОГОН БЕЗ ЕДИНОГО ТАКТА — НЕ УСПЕХ.
+            //
+            // Телефон, ушедший в дрёму, останавливает цикл на первой же
+            // секунде («уход в фон: прогон остановлен»), и до этой правки
+            // артефакт всё равно писал ok=true при нуле кадров. Пустой прогон
+            // выглядел удавшимся, и отличить его от настоящего можно было лишь
+            // заметив ноль в другом поле — ровно та семья ошибок, из-за
+            // которой сегодня трижды принимали отсутствие данных за данные.
+            if (frames == 0)
+                j.append(",\"ok\":false,\"ошибка\":\"ни одного такта: ")
+                 .append(stoppedByBackground ? "телефон ушёл в фон (дрёма или другое окно)"
+                                             : "кадры от камеры не пришли")
+                 .append("\"");
+            else
+                j.append(",\"ok\":true");
         } catch (Throwable t) {
             Log.e(TAG, "слежение: " + t, t);
             uiError = String.valueOf(t);
