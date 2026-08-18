@@ -519,6 +519,9 @@ public class TrackActivity extends Activity {
         // возврат невозможным.
         float coast = cfg.f("coast");
         boolean syncOn = cfg.b("sync");
+        float kickW = cfg.f("kick");
+        int kickMs = cfg.i("kick_ms");
+        float kickEvery = cfg.f("kick_s");
         boolean searchOn = cfg.b("search");
 
         // РАСШИРЕНИЕ ОКНА ПРИ ДОЛГОЙ ПОТЕРЕ. Окно слежения сужает поле зрения
@@ -612,7 +615,7 @@ public class TrackActivity extends Activity {
             // сценарии с двумя людьми.
             + "кандидатов,до_предсказания,порог,состояние,промахов,"
             + "ошибка_свежая,цель_в_мире,вал_при_захвате,t_кадра_мс,"
-            + "лаг_потока,возраст_кадра_мс,"
+            + "лаг_потока,возраст_кадра_мс,толчок_фаза,в_толчке,sync_такта,"
             // Рамка выбранной детекции в ПИКСЕЛЯХ СЕНСОРА — те же координаты,
             // в которых живёт трекер и считается winCx.
             //
@@ -1286,6 +1289,17 @@ public class TrackActivity extends Activity {
             if (recStartNs != 0)
                 j.append(",\"видео_смещение_мс\":").append((t0 - recStartNs) / 1000000L);
             syncEnc = syncOn;
+            // ЧЕРЕДОВАНИЕ ВНУТРИ ОДНОГО ПРОГОНА, а не два прогона подряд.
+            //
+            // Два прогона разводит всё: скорость ходьбы, освещение, нагрев,
+            // положение стенда. Тот же урок уже был на калибровке зубцового
+            // момента — там перешли на чередование блоков в одной записи.
+            // Здесь толчок делает машина, значит возмущение одинаково, и
+            // остаётся чередовать только режим.
+            final boolean kicking = kickW > 0.001f;
+            if (kicking) j.append(",\"толчок\":").append(fmt(kickW))
+                          .append(",\"толчок_мс\":").append(kickMs)
+                          .append(",\"толчок_каждые_с\":").append(fmt(kickEvery));
             j.append(",\"синхронизация\":").append(syncOn)
              .append(",\"настройки_с_экрана\":").append(cfg.fromSaved());
             runStartMs = System.currentTimeMillis();
@@ -1650,6 +1664,26 @@ public class TrackActivity extends Activity {
                     }
                 }
 
+                // ТОЛЧОК. Стенд отклоняется сам, потом петля возвращает его
+                // на цель — это и есть переход, который мерится. Направление
+                // чередуется, чтобы стенд не уползал в одну сторону.
+                int kickPhase = -1;
+                boolean inKick = false;
+                if (kicking && !flow) {
+                    double since = (System.nanoTime() - t0) / 1e9;
+                    int cycle = (int) (since / Math.max(kickEvery, 1.0));
+                    double inCycle = since - cycle * Math.max(kickEvery, 1.0);
+                    kickPhase = cycle;
+                    // Режим меняется ОТ ТОЛЧКА К ТОЛЧКУ: чётные с
+                    // синхронизацией, нечётные без. Пары идут вплотную, между
+                    // ними ничего не успевает измениться.
+                    syncEnc = syncOn && (cycle % 2 == 0);
+                    if (inCycle * 1000.0 < kickMs && since > 3.0) {
+                        inKick = true;
+                        w = ((cycle % 4 < 2) ? +1 : -1) * kickW;
+                    }
+                }
+
                 // Уставка только ОБНОВЛЯЕТСЯ. Отправкой занят отдельный поток на
                 // ровных 10 Гц — см. ниже, зачем.
                 // Предел ДЛИТЕЛЬНОЙ скорости. Три дефекта первой редакции,
@@ -1767,6 +1801,9 @@ public class TrackActivity extends Activity {
                    .append((int) ((tf - t0) / 1000000L)).append(',')
                    .append(lastLag).append(',')
                    .append(Double.isNaN(frameAgeMs) ? "" : fmt(frameAgeMs)).append(',')
+                   .append(kickPhase).append(',')
+                   .append(inKick ? 1 : 0).append(',')
+                   .append(syncEnc ? 1 : 0).append(',')
                    .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][0]) : "").append(',')
                    .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][1]) : "").append(',')
                    .append(chosenDet >= 0 ? fmt(detsPx[chosenDet][2]) : "").append(',')
