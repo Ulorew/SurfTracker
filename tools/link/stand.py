@@ -41,7 +41,11 @@ class Link:
                                socket.BTPROTO_RFCOMM)
         self.s.settimeout(timeout)
         self.s.connect((mac, 1))
-        self.s.settimeout(0.5)
+        # ПРИЁМ НЕБЛОКИРУЮЩИЙ. С таймаутом 0.5 с каждый проход цикла, куда
+        # ещё не пришли данные, ЖДАЛ полсекунды — опрос падал с заданных
+        # 50 Гц до 5.8, и в лог шло вчетверо меньше проб, чем заказано.
+        # Снаружи это выглядело как «плата медленная», а медленным был клиент.
+        self.s.setblocking(False)
         self.buf = bytearray()
         self.seq = 0
         self.crc_bad = 0
@@ -51,11 +55,21 @@ class Link:
         self.seq = (self.seq + 1) & 0x7F
         return self.seq
 
+    def _send(self, data):
+        """Отправка на неблокирующем сокете: буфер передатчика может быть полон."""
+        for _ in range(200):
+            try:
+                self.s.sendall(data)
+                return
+            except BlockingIOError:
+                time.sleep(0.001)
+        raise OSError("передатчик не разгружается 200 мс")
+
     def cmd(self, code, param):
-        self.s.sendall(build_cmd(self._next_seq(), code, float(param)))
+        self._send(build_cmd(self._next_seq(), code, float(param)))
 
     def req(self, omega=0.0, omega_dot=0.0):
-        self.s.sendall(build_req(self._next_seq(), omega, omega_dot))
+        self._send(build_req(self._next_seq(), omega, omega_dot))
 
     def drain(self):
         """Забрать всё, что пришло, и разобрать на кадры. -> список пакетов.
@@ -70,9 +84,7 @@ class Link:
                 if not chunk:
                     break
                 self.buf += chunk
-                if len(chunk) < 4096:
-                    break
-        except socket.timeout:
+        except (BlockingIOError, socket.timeout):
             pass
         out = []
         while self.buf:
@@ -174,14 +186,17 @@ PLANS = {
     "hold":     [("baseline_off", MODE_FIGHT, 0.0, 0.0, 20),
                  ("hold_2v",      MODE_HOLD,  2.0, 0.0, 30),
                  ("after_off",    MODE_FIGHT, 0.0, 0.0, 20)],
+    # Короткая проба перед полным вращением: убедиться, что вал ИДЁТ и
+    # ничего не срывается, прежде чем крутить минуту.
+    "probe":    [("probe_spin",   MODE_SPIN,  2.0, 0.30, 10)],
     # Тест В: вращение. Даёт линейность и мост между шкалами трактов.
-    "spin":     [("spin_slow",    MODE_SPIN,  2.0, 0.30, 60)],
+    "spin":     [("spin_slow",    MODE_SPIN,  2.0, 0.15, 60)],
     # Тест А без рук: между замерами вал переставляется вращением.
     "positions": [],       # собирается ниже, чтобы не плодить копипасту
 }
 for _i in range(6):
     PLANS["positions"] += [
-        (f"move_{_i}",  MODE_SPIN, 2.0, 0.30, 4),
+        (f"move_{_i}",  MODE_SPIN, 2.0, 0.15, 4),
         (f"pos_{_i}",   MODE_HOLD, 2.0, 0.0,  12),
     ]
 
