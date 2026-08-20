@@ -41,6 +41,7 @@ static const uint8_t CMD_MODE = 0x01;   // 0 бой, 1 удержание, 2 в�
 static const uint8_t CMD_RAW  = 0x02;   // 1 = слать в телеметрию СЫРОЙ угол
 static const uint8_t CMD_DIAG = 0x03;   // 1 = отвечать диагностикой вместо телеметрии
 static const uint8_t CMD_VOLT = 0x04;   // напряжение стенда, В (жёстко ограничено)
+static const uint8_t CMD_SPIN = 0x05;   // скорость для MODE_SPIN, рад/с
 
 static const uint8_t MODE_FIGHT = 0;    // боевой: как будто стенда нет
 static const uint8_t MODE_HOLD  = 1;    // поле стоит, ток течёт, вал удерживается

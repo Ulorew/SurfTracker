@@ -11,6 +11,21 @@ MAGIC_REQ, MAGIC_TEL = 0xA5, 0x5A
 REQ_LEN, TEL_LEN = 11, 12
 VERSION = 0
 
+# --- СТЕНД: отдельные типы пакетов, боевой путь не тронут -------------------
+# Длина CMD равна REQ намеренно: приёмник накапливает кадр одинаково и
+# различает типы только по первому байту.
+MAGIC_CMD, MAGIC_DIAG = 0xC3, 0x5C
+CMD_LEN, DIAG_LEN = 11, 24
+
+CMD_MODE, CMD_RAW, CMD_DIAG, CMD_VOLT, CMD_SPIN = 0x01, 0x02, 0x03, 0x04, 0x05
+MODE_FIGHT, MODE_HOLD, MODE_SPIN = 0, 1, 2
+
+# Флаги диагностики
+DF_CAP_BAD  = 1 << 0    # захват не дал годного кадра
+DF_ISR_BAD  = 1 << 1    # импульс вне границ датчика
+DF_CAP_LOST = 1 << 2    # CC1OF: кадр пропущен аппаратно
+DF_NO_EDGES = 1 << 3    # фронтов с прошлой записи НЕ БЫЛО — тракт мёртв
+
 ST_WATCHDOG   = 1 << 0
 ST_EXTRAP_CAP = 1 << 1
 ST_RAMP_SAT   = 1 << 2
@@ -42,6 +57,33 @@ def parse_tel(buf):
         return None
     th, wr = struct.unpack("<ff", buf[2:10])
     return buf[1] & 0x7F, th, wr, buf[10]
+
+
+def build_cmd(seq, code, param, version=VERSION):
+    """Команда стенда. Телефон её не шлёт никогда — только стендовый скрипт."""
+    body = bytes([MAGIC_CMD, ((version & 1) << 7) | (seq & 0x7F), code])
+    body += struct.pack("<f", param) + bytes(3)      # резерв под будущее
+    return body + bytes([crc8(body)])
+
+
+def parse_diag(buf):
+    """-> dict | None. СЫРЫЕ величины обоих трактов, угол НЕ посчитан.
+
+    Угол сознательно не считается на плате: формулу применяет разборщик, и
+    тогда видно, какой именно формулой получено число, а поменять её можно
+    без перепрошивки.
+
+    ВНИМАНИЕ на поле isr_period: прошивка период ISR-тракта НЕ МЕРЯЕТ (боевой
+    MagneticSensorPWM его не использует), и на этом месте идёт ВОЗРАСТ
+    ЗАХВАТА в тиках TIM2 — сколько прошло с начала кадра. Имя поля осталось
+    от раскладки пакета; читать его как период нельзя.
+    """
+    if len(buf) != DIAG_LEN or buf[0] != MAGIC_DIAG or crc8(buf[:-1]) != buf[-1]:
+        return None
+    t_us, isr_high, cap_age, cap_high, cap_period = struct.unpack("<IIIII", buf[2:22])
+    return dict(seq=buf[1] & 0x7F, t_us=t_us, isr_high=isr_high,
+                cap_age=cap_age, cap_high=cap_high, cap_period=cap_period,
+                flags=buf[22])
 
 
 def build_tel(seq, theta, omega_ramp, status):

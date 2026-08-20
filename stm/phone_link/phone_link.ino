@@ -186,10 +186,16 @@ static void captureBegin() {
   // PA15 после сброса отдан под JTDI. Отладке по SWD (PA13/PA14) это не
   // мешает, но пин надо явно перевести в AF1 = TIM2_CH1.
   GPIO_InitTypeDef g = {0};
-  g.Pin = GPIO_PIN_15; g.Mode = GPIO_MODE_AF_PP; g.Pull = GPIO_NOPULL;
+  // ПОДТЯЖКА ВВЕРХ, а не NOPULL: после сброса на PA15 подтяжка есть, а провод
+  // общий с PB8 — сняв её, мы изменили бы условия на узле для ОБОИХ трактов и
+  // сравнивали бы уже не способы чтения, а разные электрические режимы.
+  g.Pin = GPIO_PIN_15; g.Mode = GPIO_MODE_AF_PP; g.Pull = GPIO_PULLUP;
   g.Speed = GPIO_SPEED_FREQ_HIGH; g.Alternate = GPIO_AF1_TIM2;
   HAL_GPIO_Init(GPIOA, &g);
-  TIM2->CR1 = 0; TIM2->PSC = 0; TIM2->ARR = 0xFFFFFFFF;
+  // Каналы и подчинённый режим ГАСЯТСЯ ПЕРЕД настройкой: поля CC1S/CC2S
+  // записываемы только при выключенном канале (CCxE = 0).
+  TIM2->CR1 = 0; TIM2->CCER = 0; TIM2->SMCR = 0;
+  TIM2->PSC = 0; TIM2->ARR = 0xFFFFFFFF;
   TIM2->CCMR1 = (1u << 0) | (2u << 4) | (2u << 8) | (2u << 12);
   TIM2->CCER  = TIM_CCER_CC1E | TIM_CCER_CC2E | TIM_CCER_CC2P;
   TIM2->SMCR  = (5u << TIM_SMCR_TS_Pos) | (4u << TIM_SMCR_SMS_Pos);
@@ -198,15 +204,36 @@ static void captureBegin() {
 
 // fresh: был ли НОВЫЙ захват с прошлого чтения. Без него зависший датчик
 // неотличим от неподвижного вала — регистры замрут на последнем значении.
-static bool captureRead(uint32_t *period, uint32_t *high, bool *fresh) {
-  if (fresh) *fresh = (TIM2->SR & TIM_SR_CC1IF) != 0;  // чтение CCR1 сбросит флаг
-  uint32_t p = 0, h = 0;
-  for (int i = 0; i < 4; i++) {          // перечитывание В ЦИКЛЕ, см. отчёт
-    p = TIM2->CCR1; h = TIM2->CCR2;
-    if (p == TIM2->CCR1) break;          // за время чтения кадр не сменился
-  }
+static bool captureRead(uint32_t *period, uint32_t *high, uint32_t *age,
+                         bool *lost) {
+  // СОГЛАСОВАННОСТЬ ПАРЫ ПРОВЕРЯЕТСЯ ПО CC2IF, а не по «CCR1 не изменился».
+  //
+  // Проверка стабильности CCR1 опасное окно НЕ ВИДИТ: CCR2 обновляется по
+  // спаду, CCR1 — только по следующему нарастающему фронту, и между ними CCR1
+  // как раз СТАБИЛЕН. Значит смесь «импульс нового кадра, период старого»
+  // проходила бы проверку молча, а ширина этого окна равна (1 - скважность),
+  // то есть ЗАВИСИТ ОТ УГЛА: артефакт был бы систематическим и коррелированным
+  // с измеряемой величиной. На неподвижном валу невидим вовсе.
+  //
+  // Порядок строгий: сначала СНИМОК SR, потом CCR2 (его чтение сбросит CC2IF),
+  // потом CCR1. Флаг CC2IF в снимке говорит, защёлкнут ли импульс ТЕКУЩЕГО
+  // кадра; если нет — пара несогласована, и это уходит в признак негодности,
+  // а не заминается. Ждать в цикле нельзя: цикл управления встал бы.
+  uint32_t sr = TIM2->SR;
+  uint32_t h = TIM2->CCR2;
+  uint32_t p = TIM2->CCR1;
+  const bool paired = (sr & TIM_SR_CC2IF) != 0;
+  // CNT — НАСТОЯЩИЙ возраст захвата в тиках, вместо булева «свежо». По нему
+  // видно, сколько прошло с начала кадра, и зависший датчик отличается от
+  // неподвижного вала числом, а не флагом.
+  if (age) *age = TIM2->CNT;
+  // CC1OF — единственный аппаратный признак ПРОПУЩЕННОГО кадра. Чтением CCR1
+  // он НЕ снимается, поэтому сбрасывается явно: иначе залипнет навсегда и
+  // перестанет что-либо значить.
+  if (lost) *lost = (sr & TIM_SR_CC1OF) != 0;
+  TIM2->SR = ~TIM_SR_CC1OF;
   *period = p; *high = h;
-  return (p > 136000UL) && (p < 212500UL) && (h > 0) && (h < p);  // 800..1250 мкс
+  return paired && (p > 136000UL) && (p < 212500UL) && (h > 0) && (h < p);
 }
 
 #if MOTOR_ENABLED
@@ -301,25 +328,108 @@ static void sendTelemetry(uint8_t seq) {
   LINK.write(out, proto::TEL_LEN);
 }
 
+// Диагностика вместо телеметрии, когда стенд её просит. Несёт СЫРЫЕ величины
+// обоих трактов: тики захвата и микросекунды прерывания как есть.
+//
+// isr_edges ОБЯЗАТЕЛЕН в этом пакете. Без счётчика фронтов ни разу не
+// сработавший обработчик неотличим от исправного: его переменные просто
+// сохранят стартовые значения, и тракт будет выглядеть живым. Это ровно та
+// семья ошибок, которой сегодня уже стоила пустая колонка возраста кадра.
+static void sendDiag(uint8_t seq) {
+  uint32_t cp = 0, ch = 0, age = 0; bool lost = false;
+  bool cap_ok = captureRead(&cp, &ch, &age, &lost);
+
+  noInterrupts();
+  uint32_t ih = sensor.pulse_length_us;
+  uint32_t edges = pwm_edges;
+  interrupts();
+
+  // Годность ISR-тракта проверяется ТОЙ ЖЕ мерой, что в бою (statusByte):
+  // импульс в границах датчика. Период прошивка не меряет вовсе, поэтому
+  // проверять его здесь значило бы судить боевой тракт по чужой мерке.
+  const bool isr_ok = (ih >= SENS_MIN_US && ih <= SENS_MAX_US);
+  static uint32_t edges_prev = 0;
+  const bool no_edges = (edges == edges_prev);
+  edges_prev = edges;
+
+  uint8_t flags = (cap_ok ? 0 : 1) | (isr_ok ? 0 : 2)
+                 | (lost ? 4 : 0) | (no_edges ? 8 : 0);
+  uint8_t out[proto::DIAG_LEN];
+  // Период ISR-тракта прошивка не меряет — на его месте идёт возраст захвата
+  // в тиках TIM2. Разборщик обязан знать это из формата, а не догадываться.
+  proto::buildDiag(out, seq, micros(), ih, age, ch, cp, flags);
+  LINK.write(out, proto::DIAG_LEN);
+}
+
 // ============================ ПРИЁМ ============================
 //
 // Ресинхронизация по МАГИКУ, а не по длине: при потере одного байта
 // выравнивание по длине залипает навсегда.
+static inline bool isFrameStart(uint8_t b) {
+  return b == proto::MAGIC_REQ || b == proto::MAGIC_CMD;
+}
+
 static void rxShift() {
   for (uint8_t i = 1; i < rxn; i++) rxbuf[i - 1] = rxbuf[i];
   rxn--;
-  while (rxn > 0 && rxbuf[0] != proto::MAGIC_REQ) {
+  while (rxn > 0 && !isFrameStart(rxbuf[0])) {
     for (uint8_t i = 1; i < rxn; i++) rxbuf[i - 1] = rxbuf[i];
     rxn--;
+  }
+}
+
+// Применение команды стенда. Все проверки ЗДЕСЬ, а не у отправителя: канал
+// может врать, а плата отвечает за вал.
+static void applyCmd(uint8_t code, float param) {
+  if (isnan(param) || isinf(param)) return;
+  stand_cmd_ms = millis();
+  switch (code) {
+    case proto::CMD_MODE: {
+      uint8_t m = (uint8_t)param;
+      if (m <= proto::MODE_SPIN) stand_mode = m;
+      break;
+    }
+    case proto::CMD_RAW:  stand_raw  = (param != 0.0f); break;
+    case proto::CMD_DIAG: stand_diag = (param != 0.0f); break;
+    case proto::CMD_VOLT:
+      // Только ВНИЗ от потолка: поднять напряжение командой нельзя ни при
+      // каком значении в пакете.
+      if (param > 0.1f && param <= STAND_VOLT_MAX) stand_volt = param;
+      break;
+    case proto::CMD_SPIN:
+      // Скорость СВОИМ кодом, а не хитрым кодированием внутри CMD_MODE.
+      // Экономия на кодах обошлась бы дороже: правило «param больше двух
+      // означает режим со скоростью param минус десять» через месяц читается
+      // как опечатка, а ошибка в нём двигает вал.
+      if (fabsf(param) <= STAND_SPIN_MAX) stand_param = param;
+      break;
+    default: break;                       // неизвестный код — молча игнор
   }
 }
 
 static void pump() {
   while (LINK.available() > 0) {
     uint8_t b = (uint8_t)LINK.read();
-    if (rxn == 0 && b != proto::MAGIC_REQ) continue;
+    if (rxn == 0 && !isFrameStart(b)) continue;
     rxbuf[rxn++] = b;
-    if (rxn < proto::REQ_LEN) continue;
+    if (rxn < proto::REQ_LEN) continue;    // CMD_LEN равна REQ_LEN намеренно
+
+    // КОМАНДА СТЕНДА разбирается ПЕРВОЙ и ответа не требует: телефон её не
+    // шлёт никогда, а стендовый скрипт узнаёт результат из следующей же
+    // телеметрии. Так боевой путь ниже остаётся ровно таким, каким был.
+    if (rxbuf[0] == proto::MAGIC_CMD) {
+      uint8_t cseq = 0, code = 0, cver = 0; float param = 0;
+      if (proto::parseCmd(rxbuf, &cseq, &code, &param, &cver)
+          && cver == proto::VERSION) {
+        applyCmd(code, param);
+        rxn = 0;
+        if (stand_diag) sendDiag(cseq); else sendTelemetry(cseq);
+      } else {
+        crc_err_count++;
+        rxShift();
+      }
+      continue;
+    }
 
     uint8_t seq = 0, ver = 0;
     float w = 0, wd = 0;
@@ -339,7 +449,7 @@ static void pump() {
     // случае: иначе телефон не сможет сопоставить кадр по seq и посчитать
     // потери, а устаревшие кадры выглядели бы для него как пропавшие.
     C.accept(seq, w, wd, millis());
-    sendTelemetry(seq);
+    if (stand_diag) sendDiag(seq); else sendTelemetry(seq);
   }
 }
 
@@ -350,6 +460,11 @@ void setup() {
 
   sensor.init();
   sensor.enableInterrupt(doPWM);
+  // ВТОРОЙ ТРАКТ ЗАПУСКАЕТСЯ ЗДЕСЬ. Без этого вызова captureRead() читал бы
+  // регистры незапущенного таймера и отдавал нули — то есть тракт «был бы» в
+  // коде и молчал в данных. Ровно та семья ошибок, которой за сутки стоили
+  // пустая колонка возраста кадра и нулевая колонка угла вала.
+  captureBegin();
 
 #if MOTOR_ENABLED
   // Датчик НЕ связывается с мотором и initFOC() НЕ зовётся: контур
@@ -418,7 +533,32 @@ void loop() {
   //
   // Симптом ошибки: driver.init()=1, motor.init()=1, enabled=1, shaft_angle
   // растёт ровно на заданной скорости, а на фазах 0 В и вал стоит.
-  if (motor_on) {
+  // ---- СТЕНДОВЫЕ РЕЖИМЫ -----------------------------------------------
+  //
+  // ПРЕДОХРАНИТЕЛЬ: режим гаснет сам, если команды перестали приходить. Это
+  // не удобство, а условие безопасности — оборванный кабель, упавший скрипт
+  // или закрытый ноутбук иначе оставили бы вал под током до разряда батареи.
+  // Проверка стоит ЗДЕСЬ, в цикле, а не в приёме: приём при обрыве просто не
+  // вызывается, и любая логика внутри него бессильна.
+  if (stand_mode != proto::MODE_FIGHT
+      && (millis() - stand_cmd_ms) > STAND_TIMEOUT_MS) {
+    stand_mode = proto::MODE_FIGHT;
+    stand_param = 0.0f;
+  }
+
+  if (stand_mode != proto::MODE_FIGHT) {
+    // Стенд ведёт вал сам, боевой закон при этом не трогается вовсе: C.w_ramp
+    // продолжает считаться и уходить в телеметрию, так что телефон видит
+    // ровно то же, что видел бы всегда.
+    motor.voltage_limit = stand_volt;          // не выше STAND_VOLT_MAX
+    motor.enable();
+    motor.loopFOC();
+    // MODE_HOLD — скорость ноль: поле стоит на месте, ток через обмотки идёт,
+    // вал удерживается магнитно. Это и есть замер наводки БЕЗ вращения:
+    // единственное отличие от покоя — работающая силовая часть.
+    motor.move(stand_mode == proto::MODE_SPIN ? stand_param : 0.0f);
+  } else if (motor_on) {
+    motor.voltage_limit = VOLTAGE_LIMIT;       // вернуть боевое
     motor.loopFOC();
     motor.move(C.w_ramp);
   }
