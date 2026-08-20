@@ -488,6 +488,12 @@ void setup() {
   motor.voltage_limit  = VOLTAGE_LIMIT;
   motor.velocity_limit = HW_LIMIT;
   motor.init();
+  // ГАСИМ ПОЛЕ СРАЗУ ПОСЛЕ init(). Библиотека в конце своего init() зовёт
+  // enable() сама (BLDCMotor.cpp:108), и без этой строки плата выходит из
+  // сброса с током в обмотках: поле встаёт на нулевой угол и притягивает к
+  // нему ротор. Рывок измерен в АНТИЗУБЦАХ — -19.2° за две секунды, а на валу
+  // камера. Сброс случается при каждой заливке и при каждом включении питания.
+  motor.disable();
 #endif
 
   ctl::Params cp = ctl::defaults();
@@ -561,9 +567,17 @@ void loop() {
   // Лечится не добавлением ещё одного disable(), а тем, что решение о
   // питании принимается В ОДНОМ месте и из обоих источников сразу.
   static uint32_t nonzero_ms = 0;
-  static bool field_on = true;
-  if (fabsf(C.w_ramp) > 1e-3f) nonzero_ms = millis();
-  const bool fight_wants = (millis() - nonzero_ms) < IDLE_OFF_MS;
+  static bool had_nonzero = false;
+  static bool field_on = false;          // setup() гасит поле явно, см. ниже
+  if (fabsf(C.w_ramp) > 1e-3f) { nonzero_ms = millis(); had_nonzero = true; }
+  // ЖДЁМ ПЕРВОЙ НЕНУЛЕВОЙ УСТАВКИ, а не просто считаем время от нуля.
+  //
+  // Без had_nonzero сразу после сброса выходило (millis() - 0) < IDLE_OFF_MS,
+  // то есть поле включалось на четыре секунды САМО, вставало на нулевой угол
+  // и притягивало к нему ротор. В АНТИЗУБЦАХ этот рывок измерен: -19.2° за
+  // первые две секунды. На валу камера, а сброс происходит при каждой
+  // заливке прошивки и при каждом отключении питания.
+  const bool fight_wants = had_nonzero && (millis() - nonzero_ms) < IDLE_OFF_MS;
   const bool stand_wants = (stand_mode != proto::MODE_FIGHT);
   const bool want_on = fight_wants || stand_wants;
 
