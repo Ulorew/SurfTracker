@@ -147,10 +147,15 @@ static const uint16_t MED_STEP_MS = 20;
 // Режимы для замеров живут в БОЕВОЙ прошивке намеренно. Отдельная стендовая
 // ветка разошлась бы с боевой на первой же правке, и мерили бы мы не то, что
 // летает. Ценой за это — предохранители ниже, каждый обязателен.
+// Умолчание напряжения ИМЕНЕМ, а не числом: то же значение нужно ещё и
+// предохранителю ниже, чтобы вернуть его при выходе из режима. Двумя литералами
+// это разъехалось бы на первой же правке потолка, причём молча.
+static const float STAND_VOLT_DEFAULT = 2.0f;
+
 static uint8_t  stand_mode   = proto::MODE_FIGHT;
 static bool     stand_raw    = false;    // сырой угол в телеметрию вместо медианы
 static bool     stand_diag   = false;    // отвечать диагностикой вместо телеметрии
-static float    stand_volt   = 2.0f;     // напряжение стенда
+static float    stand_volt   = STAND_VOLT_DEFAULT;   // напряжение стенда
 static float    stand_param  = 0.0f;     // скорость для MODE_SPIN, рад/с
 static uint32_t stand_cmd_ms = 0;        // когда пришла последняя команда
 
@@ -368,7 +373,20 @@ static void sendDiag(uint8_t seq) {
   uint8_t out[proto::DIAG_LEN];
   // Период ISR-тракта прошивка не меряет — на его месте идёт возраст захвата
   // в тиках TIM2. Разборщик обязан знать это из формата, а не догадываться.
-  proto::buildDiag(out, seq, micros(), ih, age, ch, cp, flags);
+  //
+  // ХВОСТ — ПРИМЕНЁННОЕ, читается прямо из живых переменных стенда. Именно это
+  // хост обязан писать в лог замера: свой заказ он и так знает, а вот дошёл ли
+  // тот до платы и не был ли отклонён молча (напряжение вне (0.1, 2.0], скорость
+  // вне +-1.0) — видно только отсюда.
+  //
+  // Все три поля отдаются КАК ЕСТЬ, из живых переменных, а не «как это сейчас
+  // доходит до фаз». Это подтверждение УСТАВОК стенда, и именно в таком виде
+  // оно ловит обе беды сразу: и отклонённый заказ, и величину, пережившую
+  // выход из режима. Скорость вне MODE_SPIN на вал не идёт (там move(0)), но
+  // видеть, вернулась ли она к нулю, надо — режим лежит в том же пакете
+  // байтом раньше, так что спутать «задано» и «крутится» не выйдет.
+  proto::buildDiag(out, seq, micros(), ih, age, ch, cp, flags,
+                   stand_mode, stand_volt, stand_param);
   LINK.write(out, proto::DIAG_LEN);
 }
 
@@ -393,29 +411,37 @@ static void rxShift() {
 // может врать, а плата отвечает за вал.
 static void applyCmd(uint8_t code, float param) {
   if (isnan(param) || isinf(param)) return;
-  stand_cmd_ms = millis();
+  // СТОРОЖ ПРОДЛЕВАЕТ ТОЛЬКО ПРИНЯТАЯ КОМАНДА. Раньше stand_cmd_ms обновлялся
+  // ДО switch, и сторож держал вал под током по кадрам, ни один из которых
+  // плата не применила: неизвестный код (чужая версия скрипта, съехавший
+  // разбор) или отклонённое значение выглядели для предохранителя точно так
+  // же, как исправная работа. Теперь тишина по смыслу равна тишине в канале —
+  // режим гаснет сам.
+  bool applied = false;
   switch (code) {
     case proto::CMD_MODE: {
       uint8_t m = (uint8_t)param;
-      if (m <= proto::MODE_SPIN) stand_mode = m;
+      if (m <= proto::MODE_SPIN) { stand_mode = m; applied = true; }
       break;
     }
-    case proto::CMD_RAW:  stand_raw  = (param != 0.0f); break;
-    case proto::CMD_DIAG: stand_diag = (param != 0.0f); break;
+    case proto::CMD_RAW:  stand_raw  = (param != 0.0f); applied = true; break;
+    case proto::CMD_DIAG: stand_diag = (param != 0.0f); applied = true; break;
     case proto::CMD_VOLT:
       // Только ВНИЗ от потолка: поднять напряжение командой нельзя ни при
-      // каком значении в пакете.
-      if (param > 0.1f && param <= STAND_VOLT_MAX) stand_volt = param;
+      // каком значении в пакете. Отказ виден хосту по полю подтверждения в
+      // DIAG — раньше он был молчаливым и неотличимым от применения.
+      if (param > 0.1f && param <= STAND_VOLT_MAX) { stand_volt = param; applied = true; }
       break;
     case proto::CMD_SPIN:
       // Скорость СВОИМ кодом, а не хитрым кодированием внутри CMD_MODE.
       // Экономия на кодах обошлась бы дороже: правило «param больше двух
       // означает режим со скоростью param минус десять» через месяц читается
       // как опечатка, а ошибка в нём двигает вал.
-      if (fabsf(param) <= STAND_SPIN_MAX) stand_param = param;
+      if (fabsf(param) <= STAND_SPIN_MAX) { stand_param = param; applied = true; }
       break;
-    default: break;                       // неизвестный код — молча игнор
+    default: break;                       // неизвестный код — сторож НЕ продлеваем
   }
+  if (applied) stand_cmd_ms = millis();
 }
 
 static void pump() {
@@ -543,14 +569,29 @@ void loop() {
   // сбрасывала лишь stand_mode, и два из них переживали таймаут: диагностика
   // оставалась включённой навсегда, а её условие «режим не боевой» при чисто
   // диагностическом сеансе не выполнялось НИ РАЗУ. Телефон при этом получал
-  // 24-байтные пакеты вместо 12-байтных, и примерно один из пяти тысяч
+  // 27-байтные пакеты вместо 12-байтных, и примерно один из пяти тысяч
   // проходил его проверку CRC как «телеметрия» с мусорными значениями.
+  //
+  // НАПРЯЖЕНИЕ ГАСИТСЯ ТОЖЕ, и условие считает его наравне с остальными. Вторая
+  // редакция сбрасывала stand_param, stand_raw, stand_diag и режим, но не
+  // stand_volt — а условие смотрело только на режим и два флага. После штатного
+  // выхода из режима все три слагаемых становились ложными НАВСЕГДА, тело не
+  // выполнялось больше ни разу, и напряжение прошлого сеанса жило до сброса
+  // платы. Следующий сеанс, не задавший CMD_VOLT явно, тихо шёл на чужой
+  // уставке: замер выглядел сделанным при 2.0 В, а был при 0.6 В.
+  //
+  // Лечится тем, что условие проверяет РОВНО ТО, что тело сбрасывает: пока
+  // хоть одна стендовая величина не в умолчании, блоку есть что делать.
   const bool stand_stale = (millis() - stand_cmd_ms) > STAND_TIMEOUT_MS;
-  if (stand_stale && (stand_mode != proto::MODE_FIGHT || stand_raw || stand_diag)) {
+  const bool stand_dirty = stand_mode != proto::MODE_FIGHT || stand_raw || stand_diag
+                        || fabsf(stand_param) > 0.0f
+                        || fabsf(stand_volt - STAND_VOLT_DEFAULT) > 1e-6f;
+  if (stand_stale && stand_dirty) {
     stand_mode  = proto::MODE_FIGHT;
     stand_param = 0.0f;
     stand_raw   = false;
     stand_diag  = false;
+    stand_volt  = STAND_VOLT_DEFAULT;
   }
 
   // ---- ПИТАНИЕ ФАЗ: ОДНА ТОЧКА РЕШЕНИЯ ---------------------------------

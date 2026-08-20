@@ -137,13 +137,26 @@ def segment(link, w, label, mode, volt, spin, seconds, hz, raw=False):
     last_cmd = t0
     period = 1.0 / hz
     n_ok = 0
+    mism = []
     nxt = t0
     while True:
         now = time.time()
         if now - t0 >= seconds:
             break
         if now - last_cmd >= CMD_REFRESH_S:
-            link.cmd(CMD_MODE, float(mode))     # обновить сторож
+            # ПЕРЕОТПРАВЛЯЮТСЯ ВСЕ УСТАВКИ, а не один режим. Сторож платы
+            # гасит ЧЕТЫРЕ переключателя разом (режим, скорость, сырой угол,
+            # диагностику), а поддержка взводила один. Одна задержка канала
+            # больше 2 с — и дальше отрезок шёл бы так: диагностика выключена
+            # (в лог молча идёт меньше строк, ответы становятся телеметрией и
+            # отбрасываются), скорость обнулена, а режим взведён обратно. То
+            # есть НЕПОДВИЖНОЕ ПОЛЕ с постоянным током в одну пару обмоток —
+            # ровно тот отказ, ради которого написан блок питания фаз.
+            link.cmd(CMD_VOLT, volt)
+            link.cmd(CMD_SPIN, spin)
+            link.cmd(CMD_RAW, 1.0 if raw else 0.0)
+            link.cmd(CMD_DIAG, 1.0)
+            link.cmd(CMD_MODE, float(mode))
             last_cmd = now
         if now >= nxt:
             link.req(0.0, 0.0)
@@ -154,9 +167,35 @@ def segment(link, w, label, mode, volt, spin, seconds, hz, raw=False):
             p2 = dict(p)
             p2.update(label=label, mode=MODE_NAME[mode], volt=volt,
                       spin=spin, t_host=round(now - t0, 4))
+            # СЛИЧЕНИЕ ЗАКАЗАННОГО С ПРИМЕНЁННЫМ. Колонки mode/volt/spin —
+            # это то, что хост ПОПРОСИЛ; ack_* — то, в чём плата была на
+            # момент отсчёта. Пока подтверждения не было, расхождение
+            # выглядело неотличимо от нормы ПО ПОСТРОЕНИЮ: потерянная или
+            # отклонённая команда давала замер в чужом режиме под правильной
+            # подписью.
+            if p2.get("ack_mode") is not None:
+                if (p2["ack_mode"] != mode
+                        or abs(p2.get("ack_volt", 0.0) - volt) > 0.011
+                        or abs(p2.get("ack_spin", 0.0) - spin) > 0.011):
+                    mism.append((p2["t_host"], p2.get("ack_mode_name"),
+                                 p2.get("ack_volt"), p2.get("ack_spin")))
             w.writerow(p2)
             n_ok += 1
         time.sleep(0.001)
+
+    # ОЖИДАЕМОЕ ЧИСЛО ПРОБ СЛИЧАЕТСЯ С ПОЛУЧЕННЫМ. Раньше n_ok возвращался и
+    # нигде не сравнивался ни с чем — величина посчитана и не прочитана. А
+    # тихая недостача строк это и есть признак того, что диагностика на плате
+    # погасла посреди отрезка.
+    want = int(seconds * hz)
+    if n_ok < want * 0.8:
+        print(f"      ВНИМАНИЕ: проб {n_ok}, ожидалось около {want}"
+              f" ({100.0 * n_ok / want:.0f}%) — часть отрезка диагностики не было")
+    if mism:
+        t, m, v, sp = mism[0]
+        print(f"      РАСХОЖДЕНИЕ ЗАКАЗА И ПОДТВЕРЖДЕНИЯ: {len(mism)} проб из"
+              f" {n_ok}; первое на {t:.2f} с — плата была в режиме {m},"
+              f" U={v}, w={sp}")
     return n_ok
 
 
@@ -200,7 +239,12 @@ for _i in range(6):
         (f"pos_{_i}",   MODE_HOLD, 2.0, 0.0,  12),
     ]
 
-FIELDS = ["label", "mode", "volt", "spin", "t_host", "seq", "t_us",
+# ЗАКАЗАННОЕ И ПРИМЕНЁННОЕ ЛЕЖАТ РЯДОМ И РАЗНЫМИ ИМЕНАМИ. mode/volt/spin —
+# просьба хоста, ack_* — ответ платы. Складывать их в одну колонку значило бы
+# снова сделать расхождение невидимым.
+FIELDS = ["label", "mode", "volt", "spin",
+          "ack_mode_name", "ack_volt", "ack_spin",
+          "t_host", "seq", "t_us",
           "isr_high", "cap_age", "cap_high", "cap_period", "flags"]
 
 

@@ -12,6 +12,7 @@
 #pragma once
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 
 namespace proto {
 
@@ -34,7 +35,13 @@ static const uint8_t VERSION   = 0;
 static const uint8_t MAGIC_CMD  = 0xC3;
 static const uint8_t MAGIC_DIAG = 0x5C;
 static const uint8_t CMD_LEN    = 11;
-static const uint8_t DIAG_LEN   = 24;
+// DIAG вырос с 24 до 27 байт: три последних байта перед CRC — ПОДТВЕРЖДЕНИЕ
+// применённых настроек (режим, напряжение, скорость). Без них потерянный или
+// отклонённый платой CMD неотличим от применённого, и хост пишет в лог тот
+// режим, который ЗАКАЗАЛ, а не тот, в котором плата была. Это главная семья
+// ошибок проекта: «величина выглядит установленной, а её нет».
+// REQ и TEL не тронуты ни на байт — боевой тракт про это расширение не знает.
+static const uint8_t DIAG_LEN   = 27;
 
 // Коды команд. Параметр — float, смысл зависит от кода.
 static const uint8_t CMD_MODE = 0x01;   // 0 бой, 1 удержание, 2 вращение
@@ -46,6 +53,41 @@ static const uint8_t CMD_SPIN = 0x05;   // скорость для MODE_SPIN, р
 static const uint8_t MODE_FIGHT = 0;    // боевой: как будто стенда нет
 static const uint8_t MODE_HOLD  = 1;    // поле стоит, ток течёт, вал удерживается
 static const uint8_t MODE_SPIN  = 2;    // вращение с заданной скоростью
+
+// ---- КОДИРОВАНИЕ ПОДТВЕРЖДЕНИЯ -------------------------------------------
+//
+// Сотые, а не float: три байта против двенадцати, а разрешение 0.01 В и
+// 0.01 рад/с мельче любой величины, которую стенд умеет заказать. Кодирование
+// живёт ЗДЕСЬ, в общем заголовке, а не в прошивке: иначе округление на плате
+// и на хосте разошлось бы, и подтверждение врало бы на единицу младшего
+// разряда — то есть выглядело бы почти правдой, что хуже явной ошибки.
+//
+// Прижатие к потолку тоже здесь и намеренно ТИХОЕ: это отображение величины
+// в байт, а не предохранитель. Предохранители стоят в applyCmd, и заказ выше
+// потолка туда просто не проходит; сюда значение попадает уже принятым.
+static const uint8_t ACK_VOLT_MAX = 200;   // 2.00 В — правило владельца
+static const int8_t  ACK_SPIN_MAX = 100;   // +-1.00 рад/с — потолок стенда
+
+/** Напряжение -> сотые вольта, 0..200. NaN и отрицательное дают 0.
+ *  Прижатие идёт ДО умножения: так бесконечность не доезжает до lroundf,
+ *  где её результат не определён. */
+inline uint8_t ackVolt(float v) {
+  if (!(v > 0.0f)) return 0;               // ловит и NaN, и минус
+  if (v > 2.0f) return ACK_VOLT_MAX;       // сюда же и бесконечность
+  return (uint8_t)lroundf(v * 100.0f);     // половина — ОТ нуля, как в питоне
+}
+
+/** Скорость -> сотые рад/с, -100..100. NaN даёт 0. */
+inline int8_t ackSpin(float w) {
+  if (w != w) return 0;                    // NaN
+  if (w >  1.0f) return  ACK_SPIN_MAX;
+  if (w < -1.0f) return -ACK_SPIN_MAX;
+  return (int8_t)lroundf(w * 100.0f);
+}
+
+/** Обратные преобразования — для тестов и заглушек на хосте. */
+inline float ackVoltToFloat(uint8_t b) { return (float)b * 0.01f; }
+inline float ackSpinToFloat(int8_t b)  { return (float)b * 0.01f; }
 
 // Биты статуса. Свободных НЕТ: заняты все восемь.
 static const uint8_t ST_WATCHDOG   = 1 << 0;
@@ -118,9 +160,17 @@ inline bool parseCmd(const uint8_t *f, uint8_t *seq, uint8_t *code, float *param
 // какой именно формулой получено число, и её можно поменять, не перешивая
 // плату. Плюс сравнение трактов остаётся честным: обе величины сняты в одном
 // проходе, из одного кадра.
+//
+// ХВОСТ ПАКЕТА — ПОДТВЕРЖДЕНИЕ ПРИМЕНЁННОГО, а не заказанного. Плата молча
+// отклоняет напряжение вне (0.1, 2.0] и скорость вне +-1.0, а команда может
+// вообще не долететь; без этих трёх байт хост записывал бы в лог свой заказ и
+// разбирал бы потом замер, сделанный не в том режиме. Поля добавлены В КОНЕЦ,
+// перед CRC: смещения всех старых полей сохранены, и разница видна только по
+// длине кадра.
 inline void buildDiag(uint8_t *out, uint8_t seq, uint32_t t_us,
                        uint32_t isr_high, uint32_t isr_period,
-                       uint32_t cap_high, uint32_t cap_period, uint8_t flags) {
+                       uint32_t cap_high, uint32_t cap_period, uint8_t flags,
+                       uint8_t ack_mode, float ack_volt, float ack_spin) {
   out[0] = MAGIC_DIAG;
   out[1] = seq & 0x7F;
   memcpy(out + 2,  &t_us, 4);
@@ -129,6 +179,9 @@ inline void buildDiag(uint8_t *out, uint8_t seq, uint32_t t_us,
   memcpy(out + 14, &cap_high, 4);
   memcpy(out + 18, &cap_period, 4);
   out[22] = flags;
+  out[23] = ack_mode;                        // режим, В КОТОРОМ ПЛАТА СЕЙЧАС
+  out[24] = ackVolt(ack_volt);               // сотые вольта, 0..200
+  out[25] = (uint8_t)ackSpin(ack_spin);      // сотые рад/с, -100..100 (int8)
   out[DIAG_LEN - 1] = crc8(out, DIAG_LEN - 1);
 }
 
