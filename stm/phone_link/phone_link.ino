@@ -142,9 +142,72 @@ static const uint16_t MED_STEP_MS = 20;
 // предела уставки и от бага моста, а не участвует в обычном цикле.
 
 // ============================ ЖЕЛЕЗО ============================
+// ============================ СТЕНД ============================
+//
+// Режимы для замеров живут в БОЕВОЙ прошивке намеренно. Отдельная стендовая
+// ветка разошлась бы с боевой на первой же правке, и мерили бы мы не то, что
+// летает. Ценой за это — предохранители ниже, каждый обязателен.
+static uint8_t  stand_mode   = proto::MODE_FIGHT;
+static bool     stand_raw    = false;    // сырой угол в телеметрию вместо медианы
+static bool     stand_diag   = false;    // отвечать диагностикой вместо телеметрии
+static float    stand_volt   = 2.0f;     // напряжение стенда
+static float    stand_param  = 0.0f;     // скорость для MODE_SPIN, рад/с
+static uint32_t stand_cmd_ms = 0;        // когда пришла последняя команда
+
+// ПРЕДОХРАНИТЕЛЬ 1: стендовый режим сам гаснет, если команды перестали идти.
+// Оборванный кабель или упавший скрипт иначе оставили бы вал крутиться до
+// разряда батареи. Две секунды — заметно дольше периода опроса (5-100 мс) и
+// заметно короче, чем нужно, чтобы что-то испортить.
+static const uint32_t STAND_TIMEOUT_MS = 2000;
+// ПРЕДОХРАНИТЕЛЬ 2: потолок напряжения. Правило владельца — 2 В при долгой
+// непрерывной работе; команда может только УМЕНЬШИТЬ, но не поднять.
+static const float STAND_VOLT_MAX = 2.0f;
+// ПРЕДОХРАНИТЕЛЬ 3: потолок скорости стенда. Развёртки идут на 0.15-0.3 рад/с;
+// втрое больше — заведомо достаточный запас и заведомо безопасная величина.
+static const float STAND_SPIN_MAX = 1.0f;
+
 MagneticSensorPWM sensor = MagneticSensorPWM(SENSOR_PIN, SENS_MIN_US, SENS_MAX_US);
 volatile uint32_t pwm_edges = 0;
 void doPWM() { pwm_edges++; sensor.handlePWM(); }
+
+// ---- ВТОРОЙ ТРАКТ: аппаратный захват TIM2 на PA15 --------------------------
+//
+// Читается ВСЕГДА, но в управлении и телеметрии НЕ УЧАСТВУЕТ — только в
+// диагностике. Цена чтения два регистра, поэтому держать его включённым
+// дешевле, чем заводить отдельную прошивку ради сравнения.
+//
+// PA15 это TIM2_CH1 (проверено по PeripheralPins ядра 2.10.1), а SENSOR_PIN
+// PB8 — TIM4_CH3. Режим PWM input работает только от TI1/TI2, поэтому
+// аппаратный захват возможен именно на PA15 и невозможен на PB8. Энкодер
+// запаян на оба пина: один выход на два высокоомных входа.
+static void captureBegin() {
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_TIM2_CLK_ENABLE();
+  // PA15 после сброса отдан под JTDI. Отладке по SWD (PA13/PA14) это не
+  // мешает, но пин надо явно перевести в AF1 = TIM2_CH1.
+  GPIO_InitTypeDef g = {0};
+  g.Pin = GPIO_PIN_15; g.Mode = GPIO_MODE_AF_PP; g.Pull = GPIO_NOPULL;
+  g.Speed = GPIO_SPEED_FREQ_HIGH; g.Alternate = GPIO_AF1_TIM2;
+  HAL_GPIO_Init(GPIOA, &g);
+  TIM2->CR1 = 0; TIM2->PSC = 0; TIM2->ARR = 0xFFFFFFFF;
+  TIM2->CCMR1 = (1u << 0) | (2u << 4) | (2u << 8) | (2u << 12);
+  TIM2->CCER  = TIM_CCER_CC1E | TIM_CCER_CC2E | TIM_CCER_CC2P;
+  TIM2->SMCR  = (5u << TIM_SMCR_TS_Pos) | (4u << TIM_SMCR_SMS_Pos);
+  TIM2->CR1  |= TIM_CR1_CEN;
+}
+
+// fresh: был ли НОВЫЙ захват с прошлого чтения. Без него зависший датчик
+// неотличим от неподвижного вала — регистры замрут на последнем значении.
+static bool captureRead(uint32_t *period, uint32_t *high, bool *fresh) {
+  if (fresh) *fresh = (TIM2->SR & TIM_SR_CC1IF) != 0;  // чтение CCR1 сбросит флаг
+  uint32_t p = 0, h = 0;
+  for (int i = 0; i < 4; i++) {          // перечитывание В ЦИКЛЕ, см. отчёт
+    p = TIM2->CCR1; h = TIM2->CCR2;
+    if (p == TIM2->CCR1) break;          // за время чтения кадр не сменился
+  }
+  *period = p; *high = h;
+  return (p > 136000UL) && (p < 212500UL) && (h > 0) && (h < p);  // 800..1250 мкс
+}
 
 #if MOTOR_ENABLED
 BLDCMotor      motor  = BLDCMotor(POLE_PAIRS);

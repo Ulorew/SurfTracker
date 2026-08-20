@@ -43,3 +43,4 @@ tools/X-AnyLabeling/
 output/
 stm/backup/*/*.elf
 stm/backup/*/*.hex
+stm/*/build/

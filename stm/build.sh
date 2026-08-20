@@ -20,7 +20,11 @@
 #
 # Библиотека SurfProtoV2 подключается симлинком из stm/libraries: держать её
 # копию в ~/Arduino значило бы иметь две правды об одном протоколе.
-set -eu
+# pipefail ОБЯЗАТЕЛЕН. Без него статус конвейера берётся у ПОСЛЕДНЕЙ команды,
+# то есть у `tail`, и он всегда 0 — провалившаяся компиляция выглядела бы
+# удачной, а `upload` без --input-dir залил бы на плату ПРЕДЫДУЩИЙ бинарник из
+# кэша. Проверка воркфлоу это воспроизвела.
+set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CLI="$HOME/Android/arduino/arduino-cli"
 FQBN="STMicroelectronics:stm32:Disco:pnum=B_G431B_ESC1"
@@ -45,7 +49,16 @@ mkdir -p "$SB/libraries"
 ln -sfn "$ROOT/stm/libraries/SurfProtoV2" "$SB/libraries/SurfProtoV2"
 
 echo "== сборка $1 =="
-"$CLI" compile -b "$FQBN" "$SKETCH" 2>&1 | grep -vE "^$|pragma message|note:|\^" | tail -6
+# Бинарь кладётся в ЯВНЫЙ каталог, и заливается потом ровно он: без
+# --input-dir upload берёт файл из кэша arduino-cli, который может быть от
+# прошлой удачной сборки.
+OUT="$SKETCH/build"
+rm -rf "$OUT"
+"$CLI" compile -b "$FQBN" --output-dir "$OUT" "$SKETCH" 2>&1 \
+    | grep -vE "^$|pragma message|note:|\^" | tail -6
+BIN="$OUT/$(basename "$SKETCH").ino.bin"
+[ -s "$BIN" ] || { echo "ОТКАЗ: бинарь не собрался ($BIN)"; exit 1; }
+echo "  бинарь: $BIN ($(stat -c %s "$BIN") байт)"
 
 if [ "${2:-}" = "--прошить" ]; then
     # ПРОШИВКА — ДЕЙСТВИЕ С ЖЕЛЕЗОМ. Плата под напряжением, на валу мотор;
@@ -58,5 +71,5 @@ if [ "${2:-}" = "--прошить" ]; then
     printf "продолжить? [да/нет] "
     read -r ответ
     [ "$ответ" = "да" ] || { echo "отменено"; exit 1; }
-    "$CLI" upload -b "$FQBN" "$SKETCH" 2>&1 | tail -4
+    "$CLI" upload -b "$FQBN" --input-dir "$OUT" "$SKETCH" 2>&1 | tail -4
 fi
