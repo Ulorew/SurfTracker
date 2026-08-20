@@ -4,7 +4,7 @@
 # тайловый обход в 15 плиток на такте 3 Гц стоил бы часы без выигрыша в
 # точности оценки доли.
 set -u
-cd ~/Projects/SurfTracker/v1_local
+cd ~/Projects/SurfTracker/old/v1_local   # эпоха v1: перенесена в old/ при уборке 21.08
 PY=~/miniconda3/envs/torch/bin/python
 W=models/night_legacy_s3_best.pt
 OUT=windowing/output/yt_presence

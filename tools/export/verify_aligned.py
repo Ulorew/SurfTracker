@@ -21,8 +21,8 @@ eval_track.py не трогается вовсе: подменяется тол�
     .venv-export/bin/python verify_aligned.py \\
         --weights ../../models/night_legacy_s3_best.pt \\
         --models-dir ../../export/models \\
-        --images ../../Datasets/dataset_v6/images/val \\
-        --labels ../../Datasets/dataset_v6/labels/val
+        --images ../../old/Datasets/dataset_v6/images/val \\
+        --labels ../../old/Datasets/dataset_v6/labels/val
 """
 import argparse
 import json
