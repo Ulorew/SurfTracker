@@ -41,3 +41,5 @@ tools/X-AnyLabeling/
 # секреты
 # Экспорт: артефакты тяжёлые и воспроизводятся скриптами; в репозитории
 output/
+stm/backup/*/*.elf
+stm/backup/*/*.hex
