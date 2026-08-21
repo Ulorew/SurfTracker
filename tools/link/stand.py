@@ -218,9 +218,18 @@ def segment(link, w, label, mode, volt, spin, seconds, hz, raw=False):
             # отклонённая команда давала замер в чужом режиме под правильной
             # подписью.
             if p2.get("ack_mode") is not None:
-                if (p2["ack_mode"] != mode
-                        or abs(p2.get("ack_volt", 0.0) - volt) > 0.011
-                        or abs(p2.get("ack_spin", 0.0) - spin) > 0.011):
+                # НАПРЯЖЕНИЕ И СКОРОСТЬ СЛИЧАЮТСЯ ТОЛЬКО В СТЕНДОВЫХ РЕЖИМАХ.
+                # В боевом плата их не применяет вовсе: напряжение берётся
+                # боевое, скорость приходит уставкой. Плата честно отвечает
+                # своим хранимым stand_volt (умолчание 2.0 В), а хост просит
+                # 0.0 — и первая же редакция проверки объявила расхождением
+                # ВСЕ 1762 пробы подряд. Проверка, которая срабатывает всегда,
+                # ничем не лучше проверки, которая не срабатывает никогда.
+                mism_mode = p2["ack_mode"] != mode
+                mism_par = (mode != MODE_FIGHT
+                            and (abs(p2.get("ack_volt", 0.0) - volt) > 0.011
+                                 or abs(p2.get("ack_spin", 0.0) - spin) > 0.011))
+                if mism_mode or mism_par:
                     mism.append((p2["t_host"], p2.get("ack_mode_name"),
                                  p2.get("ack_volt"), p2.get("ack_spin")))
             w.writerow(p2)
