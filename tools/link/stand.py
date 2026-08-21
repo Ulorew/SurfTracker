@@ -108,6 +108,50 @@ class Link:
             del self.buf[:need]
         return out
 
+    def probe_version(self, timeout_s=3.0):
+        """Какой длины DIAG говорит плата. -> (длина или None, пояснение).
+
+        ЗАЧЕМ ОТДЕЛЬНАЯ ПРОВЕРКА. Прежний различитель прошивки — «отвечает ли
+        плата на команду 0xC3» — стал негодным: на неё отвечают ОБЕ новые
+        версии, и та, что несёт подтверждение уставок, и та, что нет.
+
+        А несовпадение версий даёт не мусор, а МОЛЧАНИЕ: 24-байтные кадры не
+        добирают до 27, CRC не сходится, приёмник вечно ресинхронизируется.
+        Снаружи это выглядит как «связь пропала», и искать будут в радио, в
+        питании, в чём угодно — но не в том, что стороны собирают кадры разной
+        длины. Дешевле спросить один раз на старте.
+        """
+        self.cmd(CMD_DIAG, 1.0)
+        time.sleep(0.2)
+        self.drain()                      # выбросить ответ на саму команду
+        self.buf.clear()
+        self.req(0.0, 0.0)
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            try:
+                chunk = self.s.recv(4096)
+                if chunk:
+                    self.buf += chunk
+            except (BlockingIOError, socket.timeout):
+                pass
+            if self.buf and self.buf[0] == MAGIC_DIAG and len(self.buf) >= DIAG_LEN:
+                n = len(self.buf)
+                self.cmd(CMD_DIAG, 0.0)
+                self.buf.clear()
+                return DIAG_LEN, f"плата ответила диагностикой, кадр >= {DIAG_LEN} байт"
+            if self.buf and self.buf[0] == MAGIC_TEL and len(self.buf) >= TEL_LEN:
+                # Диагностику не включила вовсе — команду не поняла.
+                self.buf.clear()
+                return None, "плата ответила телеметрией: команду диагностики не поняла"
+            time.sleep(0.01)
+        self.cmd(CMD_DIAG, 0.0)
+        got = len(self.buf)
+        self.buf.clear()
+        if got:
+            return got, (f"накопилось {got} байт и кадр не собрался: похоже на "
+                         f"СТАРУЮ прошивку с кадром {got} байт против наших {DIAG_LEN}")
+        return None, "плата не ответила вовсе"
+
     def close(self):
         try:
             self.s.close()
@@ -261,6 +305,16 @@ def main():
 
     print(f"план '{a.plan}', опрос {a.hz:.0f} Гц -> {out}")
     link = Link(a.mac)
+
+    # СВЕРКА ВЕРСИЙ ДО ПЕРВОГО ЗАМЕРА, а не после. Прогон на несовпадающих
+    # версиях даёт пустой файл и час поисков не там.
+    n, why = link.probe_version()
+    if n != DIAG_LEN:
+        link.close()
+        sys.exit(f"ОТКАЗ: версии прошивки и хоста расходятся.\n  {why}\n"
+                 f"  Хост ждёт кадр {DIAG_LEN} байт. Залейте текущую прошивку:\n"
+                 f"    ./stm/build.sh phone_link --прошить")
+    print(f"  версия сошлась: {why}")
     total = 0
     try:
         with open(out, "w", newline="") as f:
