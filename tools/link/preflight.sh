@@ -12,9 +12,9 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 MAC=${1:-38:18:2B:30:7D:86}
 
 echo "1/2 плата отвечает по протоколу?"
-"$ROOT/.venv/bin/python" - "$MAC" << 'PY'
+"$ROOT/.venv/bin/python" - "$MAC" "$ROOT/tools/link" << 'PY'
 import sys, time, socket
-sys.path.insert(0, "tools/link")
+sys.path.insert(0, sys.argv[2])
 from proto_v2 import *
 mac = sys.argv[1]
 try:
@@ -46,12 +46,49 @@ s.close()
 if got < 15:
     print(f"   ОТВЕТОВ {got}/20 — на плате не боевая прошивка либо канал мёртв")
     sys.exit(3)
-print(f"   ответов {got}/20, энкодер {'жив' if last[3] & ST_ENC_OK else 'МОЛЧИТ'}, "
+enc_ok = bool(last[3] & ST_ENC_OK)
+print(f"   ответов {got}/20, энкодер {'жив' if enc_ok else 'МОЛЧИТ'}, "
       f"угол {last[1]:+.3f} рад")
+
+# ЭНКОДЕР ВХОДИТ В ПРИГОВОР, а не только в печать. Раньше строка «энкодер
+# МОЛЧИТ» печаталась, и предполёт всё равно объявлял себя пройденным — то есть
+# проверка, результат которой никем не читается.
+if not enc_ok:
+    print("   ЭНКОДЕР МОЛЧИТ: угол не измеряется, прогон уйдёт в пустоту")
+    sys.exit(5)
+
+# ВЕРСИЯ ПРОШИВКИ СВЕРЯЕТСЯ ПО ДЛИНЕ КАДРА ДИАГНОСТИКИ. Несовпадение версий
+# даёт не мусор, а МОЛЧАНИЕ канала, и искать будут в радио и в питании.
+try:
+    s2 = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+    s2.settimeout(6)
+    s2.connect((mac, 1))
+    s2.sendall(build_cmd(1, CMD_DIAG, 1.0)); time.sleep(0.3)
+    try: s2.recv(256)
+    except socket.timeout: pass
+    s2.sendall(build_req(9, 0.0, 0.0)); time.sleep(0.4)
+    d = s2.recv(256)
+    s2.sendall(build_cmd(2, CMD_DIAG, 0.0)); time.sleep(0.2)
+    s2.close()
+except OSError as e:
+    print("   ВЕРСИЮ ПРОВЕРИТЬ НЕ УДАЛОСЬ:", e); sys.exit(6)
+if not d or d[0] != MAGIC_DIAG or len(d) < DIAG_LEN:
+    print(f"   ВЕРСИЯ РАЗОШЛАСЬ: кадр {len(d) if d else 0} байт против нужных {DIAG_LEN}")
+    sys.exit(6)
+print(f"   версия сошлась: кадр диагностики {DIAG_LEN} байт")
 PY
 rc=$?
-[ $rc -ne 0 ] && { echo "ПРЕДПОЛЁТ НЕ ПРОЙДЕН. Залейте phone_link:"; \
-  echo "  cd $ROOT/stm && arduino-cli upload -b STMicroelectronics:stm32:Disco:pnum=B_G431B_ESC1,upload_method=swdMethod -p /dev/ttyACM0 phone_link"; exit $rc; }
+# КОМАНДА ВОССТАНОВЛЕНИЯ — РАБОЧАЯ. Прежняя печатала arduino-cli, которого нет
+# в PATH (он в ~/Android/arduino/), и флаг --input-dir, которого не существует.
+# То есть подсказка вела в тупик ровно тогда, когда она нужна.
+if [ $rc -ne 0 ]; then
+  echo "ПРЕДПОЛЁТ НЕ ПРОЙДЕН."
+  echo "Залить боевую прошивку (рабочий путь — openocd с верификацией):"
+  echo "  handoff/ПОЛЕ_ЗАПУСК.md, раздел 1 — там команда целиком"
+  echo "Частые причины: снято 12 В; на плате диагностический скетч;"
+  echo "энкодер молчит; версия прошивки разошлась с хостом."
+  exit $rc
+fi
 
 echo "2/2 телефон на связи?"
 . ~/Android/env.sh 2>/dev/null
