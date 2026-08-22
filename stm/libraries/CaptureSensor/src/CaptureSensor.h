@@ -138,7 +138,8 @@ struct CaptureStatus {
   uint32_t period;    //!< CCR1: период кадра в тиках TIM2
   uint32_t high;      //!< CCR2: ширина импульса в тиках TIM2
   uint32_t age;       //!< CNT: тиков с последнего нарастающего фронта
-  bool paired;        //!< период и импульс из ОДНОГО кадра
+  bool paired;        //!< пару можно разобрать (см. readRaw)
+  bool prev_frame;    //!< ширина из ПРЕДЫДУЩЕГО кадра; возраст уже поправлен
   bool period_ok;     //!< период в границах CAPSENS_PERIOD_MIN/MAX
   bool width_ok;      //!< 0 < high < period
   bool edges;         //!< фронты есть (возраст не превысил потолок)

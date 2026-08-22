@@ -159,7 +159,8 @@ class Link:
             pass
 
 
-def segment(link, w, label, mode, volt, spin, seconds, hz, raw=False):
+def segment(link, w, label, mode, volt, spin, seconds, hz, raw=False,
+            run_t0=None):
     """Один отрезок плана. Возвращает (принято, отбраковано)."""
     volt = min(float(volt), VOLT_MAX)
     spin = max(-SPIN_MAX, min(float(spin), SPIN_MAX))
@@ -178,6 +179,13 @@ def segment(link, w, label, mode, volt, spin, seconds, hz, raw=False):
     link.drain()                       # выбросить ответы на сами команды
 
     t0 = time.time()
+    # ЧАСЫ ХОСТА — СКВОЗНЫЕ ОТ НАЧАЛА ПРОГОНА, а не от начала отрезка.
+    # Отсчёт от отрезка превращал колонку t_host в ПИЛУ: на девятиотрезковой
+    # лестнице она сбрасывалась восемь раз. Мост между часами хоста и платы
+    # считался по ней и печатал ход 0.012 вместо 1.0 с уверенным баннером —
+    # то есть проверка не молчала, а врала.
+    if run_t0 is None:
+        run_t0 = t0
     last_cmd = t0
     period = 1.0 / hz
     n_ok = 0
@@ -210,7 +218,7 @@ def segment(link, w, label, mode, volt, spin, seconds, hz, raw=False):
                 continue
             p2 = dict(p)
             p2.update(label=label, mode=MODE_NAME[mode], volt=volt,
-                      spin=spin, t_host=round(now - t0, 4))
+                      spin=spin, t_host=round(now - run_t0, 4))
             # СЛИЧЕНИЕ ЗАКАЗАННОГО С ПРИМЕНЁННЫМ. Колонки mode/volt/spin —
             # это то, что хост ПОПРОСИЛ; ack_* — то, в чём плата была на
             # момент отсчёта. Пока подтверждения не было, расхождение
@@ -339,8 +347,10 @@ def main():
         with open(out, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
             w.writeheader()
+            run_t0 = time.time()
             for label, mode, volt, spin, secs in PLANS[a.plan]:
-                total += segment(link, w, label, mode, volt, spin, secs, a.hz)
+                total += segment(link, w, label, mode, volt, spin, secs, a.hz,
+                                 run_t0=run_t0)
                 f.flush()
     finally:
         safe_off(link)

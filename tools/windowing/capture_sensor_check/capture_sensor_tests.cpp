@@ -64,14 +64,16 @@ struct Sim {
     return (uint32_t)llround(duty_of(turn) * (double)period);
   }
   void clear_sr() { t.SR.set(0); }
-  /** Опрос в ВЫСОКОЙ фазе кадра: пара из одного кадра. */
-  void poll_paired(double turn, bool cc2if_set = true) {
+  /** Опрос в ВЫСОКОЙ фазе: CCR2 ещё от ПРЕДЫДУЩЕГО кадра.
+   *  Пара согласована, но отсчёт старше на целый кадр. */
+  void poll_stale(double turn, bool cc2if_set = true) {
     uint32_t h = high_of(turn);
     t.CCR1.set(period); t.CCR2.set(h); t.CNT.set(h / 2);
     t.SR.set(cc2if_set ? TIM_SR_CC2IF : 0);
   }
-  /** Опрос в НИЗКОЙ фазе: импульс уже от СЛЕДУЮЩЕГО кадра, период от старого. */
-  void poll_mixed(double turn_next, bool cc2if_set = true) {
+  /** Опрос в НИЗКОЙ фазе: ширина уже ТЕКУЩЕГО кадра, период с прошлого.
+   *  Отсчёт СВЕЖИЙ; период датчика стабилен (дрейф 0.02%), так что годен. */
+  void poll_fresh(double turn_next, bool cc2if_set = true) {
     uint32_t h = high_of(turn_next);
     t.CCR1.set(period); t.CCR2.set(h); t.CNT.set(h + (period - h) / 2);
     t.SR.set(cc2if_set ? TIM_SR_CC2IF : 0);
@@ -100,7 +102,7 @@ static void test_scale() {
   Sim s; Probe p(&s.t);
   const double turns[] = {0.0, 0.125, 0.25, 0.5, 0.75, 0.999};
   for (double u : turns) {
-    s.poll_paired(u);
+    s.poll_stale(u);
     double a = p.getSensorAngle() * DEG;      // градусы
     double want = u * 360.0;
     if (fabs(wrap_deg(a - want)) > 0.05) {
@@ -141,7 +143,7 @@ static void test_seam() {
   double prev = 0.0; bool have = false;
   for (int i = -6; i <= 6; i++) {
     double u = i * du; while (u < 0.0) u += 1.0;
-    s.poll_paired(u);
+    s.poll_stale(u);
     double a = p.getSensorAngle() * DEG;
     ok(a >= 0.0 && a < 360.0, "угол на шве вышел из [0, 360)");
     if (have) {
@@ -156,49 +158,82 @@ static void test_seam() {
   }
 }
 
-// =================================================== 4. несогласованная пара
+// ============================================ 4. два режима защёлкивания
 //
-// Опрос в мёртвом участке кадра: в CCR2 уже импульс СЛЕДУЮЩЕГО кадра, в CCR1
-// ещё период предыдущего. Такое чтение обязано называться негодным.
-static void test_mixed_pair() {
-  cur = "несогласованная пара";
+// ОБА ГОДНЫ, и различаются только возрастом. Прежняя редакция класса браковала
+// СВЕЖИЙ случай и принимала УСТАРЕВШИЙ — для контура управления выбор ровно
+// наоборот. Доля брака при этом равнялась (1 - скважность), то есть зависела
+// от УГЛА: на нижней части оборота тракт слеп почти всегда.
+//
+// Отказ воспроизведён на железе 22.08 (looprate_g431): скважность 0.156,
+// paired=0, четыре негодных чтения подряд на полностью исправном тракте.
+static void test_two_latch_modes() {
+  cur = "два режима защёлкивания";
   Sim s; Probe p(&s.t);
   CaptureStatus st;
 
-  s.poll_mixed(0.4);
+  s.poll_fresh(0.4);
   p.readRaw(st);
-  ok(!st.paired, "разнокадровая пара обязана быть названа несогласованной");
-  ok(!st.ok, "разнокадровое чтение обязано быть негодным");
-  ok(st.period_ok, "период здесь исправен — беда именно в паре");
+  ok(st.ok, "свежее чтение (ширина текущего кадра) обязано быть годным");
+  ok(!st.prev_frame, "свежее чтение не должно помечаться как устаревшее");
 
-  s.poll_paired(0.4);
+  s.poll_stale(0.4);
   p.readRaw(st);
-  ok(st.paired, "однокадровая пара обязана приниматься");
-  ok(st.ok, "исправное чтение обязано быть годным");
+  ok(st.ok, "устаревшее на кадр чтение тоже годно");
+  ok(st.prev_frame, "устаревшее чтение обязано быть ПОМЕЧЕНО");
+
+  // ВОЗРАСТ ОБЯЗАН БЫТЬ ПОПРАВЛЕН. Без поправки потребитель решит, что
+  // отсчёт свежее, чем он есть, ровно на кадр — а на этом возрасте стоит и
+  // экстраполяция угла, и оценка скорости.
+  uint32_t h = s.high_of(0.4);
+  ok(st.age >= s.period, "возраст устаревшего чтения обязан включать целый кадр");
+  ok(st.age == h / 2 + s.period, "возраст обязан быть ровно CNT + период кадра");
+}
+
+// ================================= 4b. НЕ СЛЕПНУТЬ НА МАЛОЙ СКВАЖНОСТИ
+//
+// Регрессия на воспроизведённый отказ. При малой скважности почти все опросы
+// попадают в низкую фазу кадра; если класс их бракует, годность рушится
+// именно там, где вал стоит в нижней части оборота.
+static void test_low_duty_not_blind() {
+  cur = "малая скважность";
+  Sim s; Probe p(&s.t);
+  CaptureStatus st;
+
+  int good = 0;
+  const int N = 200;
+  for (int i = 0; i < N; i++) {
+    // Скважность 0.156 — ровно та, на которой отказало железо.
+    if (i % 10 == 0) s.poll_stale(0.13);   // редкие попадания в высокую фазу
+    else             s.poll_fresh(0.13);
+    if (p.readRaw(st)) good++;
+    p.getSensorAngle();
+  }
+  ok(good == N, "при малой скважности годными обязаны быть ВСЕ чтения");
+  ok(p.isHealthy(), "годность не должна падать из-за положения вала");
 }
 
 // ==================================================== 5. частота опроса
 //
-// ПОЧЕМУ ПРЕЖНЯЯ ПРОВЕРКА ПО CC2IF НЕ РАБОТАЛА. Флаг CC2IF отвечает на вопрос
-// «был ли спад с моего прошлого чтения», то есть зависит от ЧАСТОТЫ ОПРОСА, а
-// не от данных: при редком опросе он взведён всегда (проверка тождественно
-// истинна), при частом — почти никогда (тождественно ложна). Приговор класса
-// обязан от него не зависеть вовсе.
+// ПОЧЕМУ ПРОВЕРКА ПО CC2IF НЕ ГОДИЛАСЬ. Флаг отвечает на вопрос «был ли спад
+// с моего прошлого чтения», то есть зависит от ЧАСТОТЫ ОПРОСА, а не от
+// данных: при редком опросе взведён всегда, при частом почти никогда.
+// Приговор класса обязан от него не зависеть вовсе.
 static void test_poll_rate_independence() {
   cur = "частота опроса";
   Sim s; Probe p(&s.t);
-  CaptureStatus st;
+  CaptureStatus a, b;
 
-  // Редкий опрос: между чтениями ~20 кадров, спады были, CC2IF взведён.
-  s.poll_mixed(0.6, /*cc2if_set=*/true);
-  p.readRaw(st);
-  ok(!st.ok, "при редком опросе взведённый CC2IF не должен оправдывать смесь кадров");
+  // Одни и те же данные, разное состояние CC2IF -> одинаковый приговор.
+  s.poll_fresh(0.6, /*cc2if_set=*/true);   p.readRaw(a);
+  s.poll_fresh(0.6, /*cc2if_set=*/false);  p.readRaw(b);
+  ok(a.ok == b.ok, "приговор не должен зависеть от CC2IF (свежее чтение)");
+  ok(a.ok, "свежее чтение годно при любом CC2IF");
 
-  // Частый опрос: спада с прошлого чтения не было, CC2IF чист — но пара
-  // однокадровая, и чтение обязано быть принято.
-  s.poll_paired(0.6, /*cc2if_set=*/false);
-  p.readRaw(st);
-  ok(st.ok, "при частом опросе чистый CC2IF не должен браковать исправную пару");
+  s.poll_stale(0.6, /*cc2if_set=*/true);   p.readRaw(a);
+  s.poll_stale(0.6, /*cc2if_set=*/false);  p.readRaw(b);
+  ok(a.ok == b.ok, "приговор не должен зависеть от CC2IF (устаревшее чтение)");
+  ok(a.prev_frame && b.prev_frame, "пометка устаревшего тоже не зависит от CC2IF");
 }
 
 // ==================================================== 6. период вне границ
@@ -208,19 +243,19 @@ static void test_period_bounds() {
   CaptureStatus st;
 
   s.period = 100000;   // 588 мкс — ниже нижней границы 136000 тиков
-  s.poll_paired(0.3);
+  s.poll_stale(0.3);
   p.readRaw(st);
   ok(!st.period_ok, "короткий период обязан быть назван негодным");
   ok(!st.ok, "чтение с коротким периодом обязано быть негодным");
 
   s.period = 300000;   // 1765 мкс — выше верхней границы 212500 тиков
-  s.poll_paired(0.3);
+  s.poll_stale(0.3);
   p.readRaw(st);
   ok(!st.period_ok, "длинный период обязан быть назван негодным");
   ok(!st.ok, "чтение с длинным периодом обязано быть негодным");
 
   s.period = SIM_PERIOD;
-  s.poll_paired(0.3);
+  s.poll_stale(0.3);
   p.readRaw(st);
   ok(st.period_ok, "нормальный период обязан приниматься");
 
@@ -253,7 +288,7 @@ static void test_no_edges() {
   ok(!st.edges && !st.ok, "долгое молчание обязано оставаться негодным");
 
   // Живой датчик: возраст меньше кадра, фронты есть.
-  s.poll_paired(0.3);
+  s.poll_stale(0.3);
   p.readRaw(st);
   ok(st.edges, "на живом датчике признак фронтов обязан быть истинным");
 }
@@ -268,16 +303,16 @@ static void test_health() {
 
   ok(!p.isHealthy(), "до первого чтения датчик обязан считаться негодным");
 
-  for (int i = 0; i < 20; i++) { s.poll_paired(0.001 * i); p.getSensorAngle(); }
+  for (int i = 0; i < 20; i++) { s.poll_stale(0.001 * i); p.getSensorAngle(); }
   ok(p.isHealthy(), "на исправных данных годность обязана быть ИСТИННОЙ");
   ok(p.badStreak() == 0, "счётчик негодных обязан обнуляться исправным чтением");
 
   // Одиночный провал (попадание в мёртвый участок кадра) годность НЕ роняет:
   // при частом опросе такое случается сотни раз в секунду и на исправном
   // железе, а выключение контура от каждого — это ложная тревога.
-  s.poll_mixed(0.5); p.getSensorAngle();
+  s.poll_fresh(0.5); p.getSensorAngle();
   ok(p.isHealthy(), "одиночное негодное чтение не должно ронять годность");
-  s.poll_paired(0.5); p.getSensorAngle();
+  s.poll_stale(0.5); p.getSensorAngle();
 
   // Замерший датчик: годность обязана упасть.
   for (int i = 0; i < 40; i++) { s.poll_dead(CAPSENS_AGE_MAX_TICKS + 7); p.getSensorAngle(); }
@@ -286,13 +321,13 @@ static void test_health() {
   // Возврат требует нескольких подряд годных чтений, а не одного: одиночное
   // правдоподобное чтение бывает и у мёртвого датчика (CNT 32-битный и раз в
   // 25.3 с проходит через ноль).
-  s.poll_paired(0.5); p.getSensorAngle();
+  s.poll_stale(0.5); p.getSensorAngle();
   ok(!p.isHealthy(), "одно годное чтение не должно возвращать годность");
-  for (int i = 0; i < 3; i++) { s.poll_paired(0.5); p.getSensorAngle(); }
+  for (int i = 0; i < 3; i++) { s.poll_stale(0.5); p.getSensorAngle(); }
   ok(p.isHealthy(), "после нескольких годных подряд годность обязана вернуться");
 
   // Удержание угла: на негодном чтении отдаётся ПОСЛЕДНИЙ ГОДНЫЙ, не ноль.
-  s.poll_paired(0.25);
+  s.poll_stale(0.25);
   float good = p.getSensorAngle();
   s.poll_dead(CAPSENS_AGE_MAX_TICKS + 7);
   float held = p.getSensorAngle();
@@ -309,7 +344,7 @@ static void test_no_waiting() {
   cur = "цена чтения";
   Sim s; Probe p(&s.t);
 
-  s.poll_paired(0.3);
+  s.poll_stale(0.3);
   HostReg::reads = 0; HostReg::writes = 0;
   p.getSensorAngle();
   unsigned long r_good = HostReg::reads, w_good = HostReg::writes;
@@ -347,7 +382,8 @@ int main() {
   test_scale();
   test_bridge_constants();
   test_seam();
-  test_mixed_pair();
+  test_two_latch_modes();
+  test_low_duty_not_blind();
   test_poll_rate_independence();
   test_period_bounds();
   test_no_edges();

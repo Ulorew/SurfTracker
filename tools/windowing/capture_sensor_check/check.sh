@@ -39,7 +39,7 @@ echo
 
 # мутация -> тест, который обязан упасть
 declare -A EXPECT=(
-  [CAPSENS_MUT_NO_PAIR_CHECK]="несогласованная пара"
+  [CAPSENS_MUT_NO_AGE_FIX]="два режима защёлкивания"
   [CAPSENS_MUT_NO_PERIOD_CHECK]="период вне границ"
   [CAPSENS_MUT_NO_EDGE_CHECK]="фронтов нет"
   [CAPSENS_MUT_NAIVE_SLOPE]="перевод скважности"
@@ -47,7 +47,7 @@ declare -A EXPECT=(
 )
 
 echo "--- мутации: каждая обязана уронить СВОЙ тест ---"
-for m in CAPSENS_MUT_NO_PAIR_CHECK CAPSENS_MUT_NO_PERIOD_CHECK \
+for m in CAPSENS_MUT_NO_AGE_FIX CAPSENS_MUT_NO_PERIOD_CHECK \
          CAPSENS_MUT_NO_EDGE_CHECK CAPSENS_MUT_NAIVE_SLOPE \
          CAPSENS_MUT_HEALTH_ALWAYS_OK; do
     want="${EXPECT[$m]}"
