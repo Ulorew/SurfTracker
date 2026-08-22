@@ -21,7 +21,14 @@ from diag_metrics import (cap_frac, isr_deg, unwrap, sd, split_runs,
 
 BAND_LO, BAND_HI = 1.0, 20.0
 NEBW_HANN = 1.5        # шумовая полоса окна Ханна
-GAIN = 362.4          # измеренный мост, середина двух прогонов
+# НАКЛОН МОСТА — ОДИН ИСТОЧНИК НА ВЕСЬ ПИТОН. Число жило в двух местах
+# (здесь 362.4 и CAPSENS_DEG_PER_DUTY = 362.7 в классе), расходясь на 0.083%.
+# На плавность это влияет ничтожно, но это ровно тот класс дефекта, из-за
+# которого правят мёртвую ветку.
+# ВНИМАНИЕ: третья копия живёт в stm/libraries/CaptureSensor/src/CaptureSensor.h
+# и должна быть приведена к этому же значению вручную — межъязыковой границы
+# импорт не пересекает.
+GAIN = 362.07         # свежий замер v2_spin; прежние 362.4/362.7 отозваны
 
 
 def sample_ts(r):
@@ -86,12 +93,18 @@ def band_rms(xs, fs, lo=BAND_LO, hi=BAND_HI):
         power += p
         lines.append((p, k * df))
     lines.sort(reverse=True)
+    # ДОЛЯ СЧИТАЕТСЯ ОТ ВСЕЙ ПОЛОСЫ, а не от трёх сильнейших линий. Прежняя
+    # редакция возвращала lines[:3], и делитель брался по этому же списку —
+    # то есть доля была ограничена снизу третью ПО ПОСТРОЕНИЮ. Напечатанные
+    # «39%» и «42%» на деле 7.5% и 17.2%, и первое из них ушло в документ,
+    # по которому принимается решение о замкнутом контуре.
+    lines = [(pw / power if power > 0 else 0.0, f) for pw, f in lines]
     # ДЕЛЕНИЕ НА ШУМОВУЮ ПОЛОСУ ОКНА. Окно Ханна размазывает энергию по
     # соседним бинам, и суммирование бинов её пересчитывает ровно в 1.5 раза.
     # Без этого деления метрика завышала на sqrt(1.5) = 1.225 — одинаково на
     # синусе любой амплитуды и частоты, поэтому по одной проверке ошибку было
     # бы не отличить от калибровки. То же деление стоит в tools/stand/jerk_metric.py.
-    return math.sqrt(power / NEBW_HANN), lines[:3]
+    return math.sqrt(power / NEBW_HANN), lines[:3]   # доли уже нормированы
 
 
 def main():
@@ -121,7 +134,12 @@ def main():
         # размах, и его ошибка даёт ступеньку, которую снятие хода размажет
         # по всей записи как шум.
         raw = [cap_frac(r) for r in rr]
-        runs = split_runs(raw, raw, minlen=200) or [list(range(len(rr)))]
+        # ВТОРЫМ АРГУМЕНТОМ — ГРАДУСЫ, А НЕ ТА ЖЕ СКВАЖНОСТЬ. split_runs режет
+        # ещё и по скачку больше 180 град; при подаче raw (0..1) это условие
+        # тождественно ложно, и защита, специально добавленная в diag_metrics,
+        # в этой ветке была выключена.
+        degs = [isr_deg(r) for r in rr]
+        runs = split_runs(raw, degs, minlen=200) or [list(range(len(rr)))]
         best = max(runs, key=len)
 
         tt = [ts[i] for i in best]
@@ -132,7 +150,7 @@ def main():
         iu = resample(tt, isr, fs)
         rc, lines = band_rms(detrend_line(cu), fs)
         ri, _ = band_rms(detrend_line(iu), fs)
-        top = f"{lines[0][1]:.1f} ({lines[0][0]/sum(p for p,_ in lines)*100:.0f}%)" if lines else "-"
+        top = f"{lines[0][1]:.1f} ({lines[0][0]*100:.1f}%)" if lines else "-"
         print(f"  {w:>9.2f}{len(best):>7}{fs:>8.0f}Гц"
               f"{rc:>10.4f}{ri:>10.4f}{top:>19}")
         out.append((w, rc, ri))
