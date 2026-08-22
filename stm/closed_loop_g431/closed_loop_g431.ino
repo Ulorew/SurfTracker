@@ -82,8 +82,11 @@
  * сработал сторож, причина напечатана.
  *
  * ЗАПУСК:  stm/build.sh closed_loop_g431 --прошить
- *          затем  tools/stand/grab_vcp.py runs/closed_first.txt
- *          разбор tools/stand/jerk_metric.py runs/closed_first.txt
+ *          tools/stand/grab_vcp.sh runs/closed_first.txt
+ *          .venv/bin/python tools/stand/loop_compare.py runs/closed_first.txt
+ *
+ * После прошивки вал СТОИТ и ничего не печатает, пока не подключится захват:
+ * см. ожидание хоста в setup(). Это не зависание.
  */
 #include <SimpleFOC.h>
 #include <CaptureSensor.h>
@@ -252,8 +255,31 @@ void setup() {
   blink(5, 80);
 
   Serial.begin(115200);
-  uint32_t t0 = millis();
-  while (!Serial && millis() - t0 < 1500) { }
+
+  // ЖДЁМ ХОСТА, И БЕЗ НЕГО НЕ ДВИГАЕМСЯ ВОВСЕ.
+  //
+  // Две причины, и обе из практики:
+  //
+  //  1. Прошивка СБРАСЫВАЕТ плату. Если бы скетч стартовал сам, шапка,
+  //     состояние тракта и результат выравнивания напечатались бы в первые
+  //     миллисекунды — то есть до того, как захват успел открыть порт, — и
+  //     пропали бы ровно те строки, ради которых всё печатается.
+  //  2. Вал крутится. Прошивка, которая начинает движение от одного лишь
+  //     включения питания, — это то, чем сейчас занята плата (elzero_g431
+  //     меряет выравнивание при КАЖДОМ включении и дёргает вал на 5-15
+  //     градусов). Здесь движение начинается только по явной команде с
+  //     ноутбука.
+  //
+  // Ожидание БЕЗ ТАЙМАУТА намеренно: истёкший таймаут означал бы движение
+  // вала без единого наблюдателя.
+  while (!Serial.available()) {
+    Serial.println(F("#ЖДУ пришлите любой байт, чтобы начать"));
+    for (uint8_t i = 0; i < 10 && !Serial.available(); i++) {
+      digitalWrite(LED_BUILTIN, i < 1); delay(100);
+    }
+  }
+  while (Serial.available()) Serial.read();
+
   Serial.println();
   Serial.println(F("=== ESC1: первое замыкание контура на тракт захвата ==="));
   Serial.print(F("#ПРОШИВКА closed_loop_g431 w=")); Serial.print(W_TEST, 3);
