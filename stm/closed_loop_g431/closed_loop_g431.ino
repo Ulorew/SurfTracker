@@ -120,13 +120,41 @@ static const float    LPF_TF = 0.005f;
 //
 // Порог 5x от уставки, а не «сколько-нибудь больше»: контур скорости на
 // кванте 0.0438 рад/с шумит, и порог вплотную к уставке ловил бы шум
-// измерения, а не разгон. Выдержка нужна по той же причине.
-static const float    W_ABORT     = 1.0f;      // рад/с
+// измерения, а не разгон.
+static const float    W_ABORT     = 1.0f;      // рад/с, на записи
+// ПОРОГ НА УСТАНОВЛЕНИИ ОТДЕЛЬНЫЙ, И ЭТО НЕ ПОБЛАЖКА. При включении драйвера
+// поле хватает ротор из произвольного положения и рывком тянет к ближайшему
+// электрическому нулю: до половины электрического оборота = 0.03 рад вала за
+// единицы миллисекунд. Это настоящее движение, а не артефакт, и на нём первая
+// редакция сторожа оборвала прогон. Порог 3 рад/с всё ещё вдвое ниже
+// названной границы безопасности вала (6 рад/с), то есть настоящий разгон
+// ловится и здесь.
+static const float    W_ABORT_SETTLE = 3.0f;
 static const uint32_t W_ABORT_MS  = 50;
-// Упор напряжения сам по себе не авария (на трогании он нормален), аварией
-// его делает ДЛИТЕЛЬНОСТЬ.
-static const float    UQ_ABORT_FRAC = 0.98f;
-static const uint32_t UQ_ABORT_MS   = 2000;
+// ОКНО ИЗМЕРЕНИЯ СКОРОСТИ ДЛЯ СТОРОЖА — СВОЁ, 100 мс.
+//
+// Первая редакция сторожила motor.shaft_velocity, и в разомкнутом контуре это
+// была ошибка: velocityOpenloop() присваивает shaft_velocity УСТАВКУ, то есть
+// сторож смотрел на команду и физического разгона не увидел бы вовсе.
+//
+// Брать sensor.getVelocity() тоже нельзя: она считается за кадр 922 мкс, и
+// шум угла 0.037 градуса даёт на нём около 0.7 рад/с — вплотную к порогу
+// 1.0. На окне 100 мс тот же шум даёт 0.007 рад/с, то есть запас в сто
+// с лишним раз, а разгон до 1 рад/с ловится за 150 мс = 8.6 градуса вала.
+static const uint32_t W_WIN_MS = 100;
+// ДОПУСТИМЫЙ РАЗБРОС ВЫРАВНИВАНИЯ, радианы электрические. 0.20 рад = 11.5
+// градусов электрических, потеря момента 1-cos(5.7 град) = 0.5%. Неустойчивость
+// начинается около 90 градусов, так что порог с большим запасом; он ловит не
+// потерю момента, а НЕВОСПРОИЗВОДИМОСТЬ замера — признак того, что мерилось
+// не выравнивание, а трение и качание груза.
+static const float ZEA_SPREAD_MAX = 0.20f;
+// УПОР НАПРЯЖЕНИЯ — НЕ ЗАЩИТА, А ДИАГНОСТИКА, и убивать им прогон неверно.
+// При пределе 2.0 В упор Uq — это ровно то напряжение, которое штатно подаёт
+// разомкнутый контур (velocityOpenloop() возвращает voltage_limit ВСЕГДА),
+// опасности в нём нет никакой. Первая редакция обрывала на нём прогон и
+// оборвала: разомкнутый отрезок не состоялся из-за нормального состояния.
+// Теперь считается доля времени в упоре и печатается в заголовке отрезка.
+static const float    UQ_SAT_FRAC = 0.98f;
 
 CaptureSensor  sensor;
 BLDCMotor      motor  = BLDCMotor(POLE_PAIRS);
@@ -134,8 +162,10 @@ BLDCDriver6PWM driver = BLDCDriver6PWM(A_PHASE_UH, A_PHASE_UL,
                                        A_PHASE_VH, A_PHASE_VL,
                                        A_PHASE_WH, A_PHASE_WL);
 
+static uint16_t n_samp;
+static uint16_t fs_hz;
 static float buf[N_SAMP];
-static const char *abort_why = 0;
+static float w_meas = 0.0f;      //!< измеренная скорость вала, рад/с (см. guard)
 
 static void blink(uint8_t n, uint16_t ms) {
   for (uint8_t i = 0; i < n; i++) {
@@ -153,7 +183,8 @@ static void die(const char *why) {
   motor.disable();
   Serial.println();
   Serial.print(F("#ОТКАЗ ")); Serial.println(why);
-  Serial.print(F("  скорость=")); Serial.print(motor.shaft_velocity, 4);
+  Serial.print(F("  скорость_изм=")); Serial.print(w_meas, 4);
+  Serial.print(F(" скорость_SFOC=")); Serial.print(motor.shaft_velocity, 4);
   Serial.print(F(" Uq="));        Serial.print(motor.voltage.q, 3);
   Serial.print(F(" годен="));     Serial.print(sensor.isHealthy());
   Serial.print(F(" подряд_негодных=")); Serial.println(sensor.badStreak());
@@ -172,23 +203,176 @@ static void die(const char *why) {
 /** Три сторожа, по одному на отказ, который в разомкнутом контуре не страшен.
  *  Вызывается из КАЖДОЙ итерации управления — включая холостые, иначе
  *  выдержки мерились бы в чтениях, а не во времени. */
+static uint32_t w_since = 0, win_t = 0;
+static float    win_a = 0.0f;
+static bool     win_have = false;
+static bool     armed_tight = false;   //!< идёт запись, порог строгий
+static float    w_peak = 0.0f;         //!< наибольшая |скорость| за запись
+static float    w_peak_settle = 0.0f;  //!< то же за установление, отдельно
+static float    zea_mean = 0.0f;       //!< средний электрический ноль по трём замерам
+static uint32_t g_calls = 0, g_sat = 0;
+// ЗНАК Uq, А НЕ ТОЛЬКО МОДУЛЬ. Счётчик упора сигнатуру «регулятор дёргается
+// между упорами» и «регулятор упёрся в одну сторону» не различает вовсе, а
+// это два разных отказа с разными причинами.
+static float uq_min = 0.0f, uq_max = 0.0f;
+
+/** Сбрасывается ПЕРЕД каждым отрезком. Между отрезками идёт выгрузка длиной в
+ *  секунды: не сбросив окно, первую измеренную скорость мы посчитали бы через
+ *  всю паузу, а выдержки — от событий прошлого отрезка. */
+static void guard_reset() {
+  w_since = 0; win_have = false; g_calls = 0; g_sat = 0;
+  w_peak = 0.0f; w_peak_settle = 0.0f; armed_tight = false; w_meas = 0.0f;
+  uq_min = 1e9f; uq_max = -1e9f;
+}
+
+/** Две защиты (разгон, негодный датчик) и один счётчик (упор Uq).
+ *  Вызывается из КАЖДОЙ итерации управления — включая холостые, иначе
+ *  выдержки мерились бы в чтениях, а не во времени. */
 static void guard(bool closed) {
-  static uint32_t w_since = 0, uq_since = 0;
   const uint32_t now = millis();
+  g_calls++;
+  const float uq_now = motor.voltage.q;
+  if (uq_now < uq_min) uq_min = uq_now;
+  if (uq_now > uq_max) uq_max = uq_now;
+  if (fabsf(uq_now) >= UQ_SAT_FRAC * motor.voltage_limit) g_sat++;
 
   // ЗДОРОВЬЕ ДАТЧИКА — только в замкнутом. В разомкнутом датчик не участвует
   // в управлении, и его негодность портит замер, но не разгоняет вал.
   if (closed && !sensor.isHealthy()) die("датчик негоден: см. разбор ниже");
 
-  const float w = fabsf(motor.shaft_velocity);
-  if (w > W_ABORT) { if (!w_since) w_since = now; }
-  else w_since = 0;
-  if (w_since && now - w_since > W_ABORT_MS) die("разгон: скорость выше порога");
+  // Скорость меряется по УГЛУ на окне, а не берётся у библиотеки: см. шапку
+  // W_WIN_MS. В разомкнутом контуре библиотечная величина — это команда.
+  const float a = sensor.getAngle();
+  if (!win_have) { win_t = now; win_a = a; win_have = true; }
+  else if (now - win_t >= W_WIN_MS) {
+    w_meas = (a - win_a) / ((float)(now - win_t) * 1e-3f);
+    win_t = now; win_a = a;
+  }
 
-  const float uq = fabsf(motor.voltage.q);
-  if (uq >= UQ_ABORT_FRAC * VOLTS) { if (!uq_since) uq_since = now; }
-  else uq_since = 0;
-  if (uq_since && now - uq_since > UQ_ABORT_MS) die("напряжение в упоре дольше выдержки");
+  const float aw = fabsf(w_meas);
+  if (armed_tight) { if (aw > w_peak) w_peak = aw; }
+  else             { if (aw > w_peak_settle) w_peak_settle = aw; }
+
+  // СТОРОЖ РАЗГОНА — ТОЛЬКО В ЗАМКНУТОМ, и это не послабление, а исправление.
+  //
+  // В РАЗОМКНУТОМ КОНТУРЕ КОМАНДА И ЕСТЬ ПОТОЛОК СКОРОСТИ ПО ПОСТРОЕНИЮ: поле
+  // вращается ровно с уставкой, и вал не может уйти быстрее синхронного иначе
+  // как рывком при захвате ротора или проскальзыванием — то есть событиями,
+  // которые кончаются сами и напряжением не поддерживаются. Разгон, от
+  // которого сторож защищает, возможен только там, где регулятор способен
+  // держать упор в неверную сторону сколь угодно долго, — в замкнутом.
+  //
+  // Первая редакция обрывала на этом разомкнутый отрезок дважды подряд,
+  // приняв за аварию нормальную физику. Пики теперь МЕРЯЮТСЯ и печатаются
+  // отдельно за установление и за запись — это данные, а не повод для отказа.
+  if (!closed) return;
+  const float lim = armed_tight ? W_ABORT : W_ABORT_SETTLE;
+  if (aw > lim) { if (!w_since) w_since = now; }
+  else w_since = 0;
+  if (w_since && now - w_since > W_ABORT_MS) die("разгон: измеренная скорость выше порога");
+}
+
+
+/**
+ * Проба МОМЕНТА: постоянное Uq, регулятор скорости не участвует вовсе.
+ *
+ * ЗАЧЕМ ОТДЕЛЬНО ОТ КОНТУРА СКОРОСТИ. Восемь сочетаний знака и сдвига нуля
+ * дали ноль хода при Uq в упоре. Пока не отделён FOC от регулятора, это
+ * можно объяснять и настройкой, и отображением угла, и нагрузкой. В режиме
+ * момента объяснений остаётся одно: при верном отображении «датчик ->
+ * электрический угол» постоянное Uq держит поле на четверть оборота впереди
+ * ротора и обязано раскрутить вал. Если вал запирается — сломано
+ * отображение, и настраивать нечего.
+ *
+ * Возвращается ПРОЙДЕННЫЙ УГОЛ, а не скорость: одиночный скачок к точке
+ * запирания средняя скорость за хвост замера не покажет, а он и есть подпись
+ * запирания.
+ */
+static float probe_torque(Direction dir, float uq) {
+  motor.sensor_direction    = dir;
+  motor.zero_electric_angle = zea_mean;
+  motor.controller          = MotionControlType::torque;
+  guard_reset();
+  const float a0 = sensor.getAngle();
+  const uint32_t t0 = millis();
+  while (millis() - t0 < 3000) {
+    motor.loopFOC(); motor.move(uq); guard(false);
+    if (fabsf(w_meas) > 3.0f) break;
+  }
+  const float trav = sensor.getAngle() - a0;
+  motor.move(0.0f); motor.disable(); delay(300); motor.enable();
+  return trav;
+}
+
+/** Внутренности контура вживую. Печатается ДО перебора сдвигов, потому что
+ *  перебор отвечает «какой ноль», а этот отрезок — «шевелится ли вообще то,
+ *  из чего ноль вычисляется». Первый замкнутый прогон дал полное напряжение
+ *  при нулевом ходе, и по одному этому различить нечего. */
+static void diag_closed(float w) {
+  motor.zero_electric_angle = zea_mean;
+  motor.PID_velocity.reset();
+  motor.controller = MotionControlType::velocity;
+  guard_reset();
+  Serial.println(F("#ДИАГ мс цель w_SFOC w_изм Uq эл_угол мех_угол угол годен"));
+  const uint32_t t0 = millis(); uint32_t next = t0;
+  while (millis() - t0 < 2000) {
+    motor.loopFOC(); motor.move(w); guard(false);
+    if ((int32_t)(millis() - next) >= 0) {
+      next += 200;
+      Serial.print(F("#ДИАГ ")); Serial.print(millis() - t0);
+      Serial.print(' '); Serial.print(motor.target, 3);
+      Serial.print(' '); Serial.print(motor.shaft_velocity, 4);
+      Serial.print(' '); Serial.print(w_meas, 4);
+      Serial.print(' '); Serial.print(motor.voltage.q, 3);
+      Serial.print(' '); Serial.print(motor.electrical_angle, 4);
+      Serial.print(' '); Serial.print(sensor.getMechanicalAngle(), 4);
+      Serial.print(' '); Serial.print(sensor.getAngle(), 4);
+      Serial.print(' '); Serial.println(sensor.isHealthy());
+    }
+  }
+  motor.move(0.0f); motor.disable(); delay(300); motor.enable();
+}
+
+/**
+ * Проба электрического нуля: замкнуть контур со сдвигом ZEA и померить,
+ * поехал ли вал.
+ *
+ * ЗАЧЕМ ПЕРЕБОР, А НЕ ДОВЕРИЕ ЗАМЕРУ. Первый замкнутый отрезок 23.08 держал
+ * вал НЕПОДВИЖНО (размах 0.25 градуса = шум датчика) при Uq в упоре 83%
+ * времени. Это подпись сдвинутого нуля: команда, задуманная как момент
+ * (ось q), при сдвиге на 90 градусов ложится на ось d и становится
+ * удерживающей. Разомкнутый прогон это не ловит в принципе:
+ * velocityOpenloop() строит электрический угол из своего интегратора и ZEA
+ * не использует вовсе, поэтому его успех о верности нуля не говорит ничего.
+ *
+ * Проба НЕ УБИВАЕТ прогон при разгоне: неверный сдвиг обязан быть измерен и
+ * напечатан, а не оборвать замер. guard(false) поэтому только считает
+ * скорость; выход за порог прекращает ЭТУ пробу, а не всё.
+ */
+static float probe_zea(Direction dir, float off, float w) {
+  motor.sensor_direction    = dir;
+  motor.zero_electric_angle = _normalizeAngle(zea_mean + off);
+  motor.PID_velocity.reset();
+  motor.controller = MotionControlType::velocity;
+  guard_reset();
+  const uint32_t t_start = millis();
+  uint32_t t0 = 0; float a0 = 0.0f; bool have0 = false;
+  // ЧЕТЫРЕ СЕКУНДЫ, А НЕ ДВЕ С ПОЛОВИНОЙ. Диагностика показала, что при I=5
+  // интегратор набирает упор около двух секунд: замер, начатый раньше, мерил
+  // бы не ход, а разгон напряжения.
+  while (millis() - t_start < 4000) {
+    motor.loopFOC(); motor.move(w);
+    guard(false);
+    if (!have0 && millis() - t_start > 2000) {
+      a0 = sensor.getAngle(); t0 = millis(); have0 = true;
+    }
+    if (fabsf(w_meas) > 3.0f) break;
+  }
+  motor.move(0.0f);
+  const uint32_t dt = millis() - t0;
+  const float v = (have0 && dt > 200) ? (sensor.getAngle() - a0) / (dt * 1e-3f) : 0.0f;
+  motor.disable(); delay(300); motor.enable();   // разрядить интегратор и поле
+  return v;
 }
 
 /**
@@ -204,7 +388,8 @@ static void guard(bool closed) {
  * так что пол меряется тем же трактом и тем же кодом, что и остальное.
  */
 static void record(bool drive, bool closed, float w) {
-  const uint32_t step_us = 1000000UL / FS_HZ;
+  guard_reset();
+  const uint32_t step_us = 1000000UL / fs_hz;
   float w_ramp = 0.0f;
   uint32_t prev = micros();
   uint32_t t0 = millis();
@@ -223,8 +408,13 @@ static void record(bool drive, bool closed, float w) {
     guard(closed);
   }
 
+  // Установление кончилось — сторож переходит на строгий порог, а пик
+  // скорости обнуляется, чтобы в заголовке отрезка стоял пик ЗАПИСИ, а не
+  // рывка при включении поля.
+  armed_tight = true; w_since = 0;
+
   uint32_t next = micros();
-  for (uint16_t i = 0; i < N_SAMP; i++) {
+  for (uint16_t i = 0; i < n_samp; i++) {
     // Крутим и опрашиваем, пока не подошёл момент отсчёта. Спать нельзя:
     // без loopFOC() поле встанет, и мы запишем не плавность, а остановку.
     while ((int32_t)(micros() - next) < 0) {
@@ -241,11 +431,19 @@ static void record(bool drive, bool closed, float w) {
  *  упрётся в сторож, уже снятое не пропадёт. */
 static void dump(const char *tag, bool drive, float w) {
   Serial.print(F("#НАЧАЛО w=")); Serial.print(drive ? w : 0.0f, 4);
-  Serial.print(F(" volts="));    Serial.print(drive ? VOLTS : 0.0f, 2);
-  Serial.print(F(" fs="));       Serial.print(FS_HZ);
-  Serial.print(F(" n="));        Serial.print(N_SAMP);
+  // ФАКТИЧЕСКИЙ предел, а не константа: командой V он меняется, и заголовок,
+  // печатавший VOLTS, врал про условия замера.
+  Serial.print(F(" volts="));    Serial.print(drive ? motor.voltage_limit : 0.0f, 2);
+  Serial.print(F(" fs="));       Serial.print(fs_hz);
+  Serial.print(F(" n="));        Serial.print(n_samp);
+  Serial.print(F(" упор="));     Serial.print(g_calls ? (100.0f * g_sat / g_calls) : 0.0f, 1);
+  Serial.print(F("% w_изм="));   Serial.print(w_meas, 4);
+  Serial.print(F(" w_пик_зап=")); Serial.print(w_peak, 4);
+  Serial.print(F(" w_пик_уст=")); Serial.print(w_peak_settle, 4);
+  Serial.print(F(" Uq=[")); Serial.print(uq_min, 3);
+  Serial.print(','); Serial.print(uq_max, 3); Serial.print(']');
   Serial.print(F(" режим="));    Serial.println(tag);
-  for (uint16_t i = 0; i < N_SAMP; i++) Serial.println(buf[i], 6);
+  for (uint16_t i = 0; i < n_samp; i++) Serial.println(buf[i], 6);
   Serial.println(F("#КОНЕЦ"));
   Serial.flush();
 }
@@ -280,6 +478,12 @@ void setup() {
   }
   while (Serial.available()) Serial.read();
 
+  // Отладочный вывод библиотеки — В ФАЙЛ ЗАМЕРА. Он печатает «sensor dir»,
+  // «PP check: est. pp» и «Zero elec. angle», то есть ровно те промежуточные
+  // величины, по которым видно, был ли замер выравнивания уверенным или
+  // пограничным. Без них расхождение направлений пришлось бы гадать.
+  SimpleFOCDebug::enable(&Serial);
+
   Serial.println();
   Serial.println(F("=== ESC1: первое замыкание контура на тракт захвата ==="));
   Serial.print(F("#ПРОШИВКА closed_loop_g431 w=")); Serial.print(W_TEST, 3);
@@ -290,6 +494,7 @@ void setup() {
   Serial.print(F(" Tf=")); Serial.print(LPF_TF, 4);
   Serial.print(F(" наклон=")); Serial.println(CAPSENS_DEG_PER_DUTY, 3);
 
+  n_samp = N_SAMP; fs_hz = FS_HZ;
   sensor.init();
 
   // ПРОВЕРКА ТРАКТА ДО ПОДАЧИ НАПРЯЖЕНИЯ. Класс впервые работает на железе;
@@ -327,49 +532,212 @@ void setup() {
   motor.controller = MotionControlType::velocity;
   motor.init();
 
-  // ---- отрезок 0: выравнивание. Вал дёрнется. --------------------------
-  Serial.println(F("#ВЫРАВНИВАНИЕ начато (вал дёрнется)"));
-  if (!motor.initFOC()) {
-    Serial.println(F("#ОТКАЗ выравнивание не удалось"));
-    motor.disable(); Serial.println(F("#ВСЁ")); Serial.flush();
-    while (1) blink(3, 200);
-  }
-  Serial.print(F("#ВЫРАВНИВАНИЕ ZEA=")); Serial.print(motor.zero_electric_angle, 5);
-  Serial.print(F(" направление="));
-  Serial.println(motor.sensor_direction == Direction::CW ? F("CW") : F("CCW"));
-
-  // ---- отрезок 1: ПОЛ ПРИБОРА -------------------------------------------
-  motor.disable();
-  blink(1, 200); digitalWrite(LED_BUILTIN, HIGH);
-  record(false, false, 0.0f);
-  digitalWrite(LED_BUILTIN, LOW);
-  dump("пол", false, 0.0f);
-
-  // ---- отрезок 2: РАЗОМКНУТЫЙ -------------------------------------------
-  //
-  // Базовая линия снимается ПЕРЕД замкнутым намеренно: если замкнутый упрётся
-  // в сторож, у нас всё равно останется линия, снятая этим же прибором.
-  motor.enable();
-  motor.controller = MotionControlType::velocity_openloop;
-  blink(2, 200); digitalWrite(LED_BUILTIN, HIGH);
-  record(true, false, W_TEST);
-  digitalWrite(LED_BUILTIN, LOW);
-  motor.move(0.0f);
-  dump("разомкнутый", true, W_TEST);
-
-  // ---- отрезок 3: ЗАМКНУТЫЙ ---------------------------------------------
-  motor.controller = MotionControlType::velocity;
-  motor.PID_velocity.reset();           // интегратор от прошлого отрезка
-  blink(3, 200); digitalWrite(LED_BUILTIN, HIGH);
-  record(true, true, W_TEST);
-  digitalWrite(LED_BUILTIN, LOW);
-  motor.move(0.0f);
-  dump("замкнутый", true, W_TEST);
-
-  motor.disable();
-  Serial.println(F("#ВСЁ"));
-  Serial.flush();
-  while (1) blink(1, 600);
+  Serial.println(F("#ГОТОВ"));
 }
 
-void loop() { }
+// ===========================================================================
+// КОМАНДНЫЙ РЕЖИМ
+//
+// ПОЧЕМУ НЕ ЖЁСТКАЯ ПОСЛЕДОВАТЕЛЬНОСТЬ. Первая редакция гоняла записанный
+// наперёд сценарий, и каждый новый вопрос к железу стоил перепрошивки: сборка,
+// заливка, сброс, ожидание — около сорока секунд на один ответ. За два часа
+// разбора это съело больше времени, чем сами замеры. Здесь прошивка одна, а
+// опыт задаётся строкой в порт.
+//
+// КАЖДАЯ КОМАНДА КОНЧАЕТСЯ #ГОТОВ. Без явной отбивки читающая сторона не
+// знает, дочитала ли она ответ, и вынуждена гадать по таймауту — а таймаут,
+// подобранный под короткую команду, обрезал бы длинную.
+//
+//   F              пол прибора: запись без движения
+//   O<w>           разомкнутый на скорости w, запись
+//   C<w>           замкнутый на скорости w, запись
+//   T<uq>          момент Uq на 3 с: печатает пройденный угол и скорость
+//   L              лестница момента (0.15..0.9 В)
+//   R              лестница разомкнутого по напряжению (0.4..2.0 В)
+//   A              выравнивание трижды, направление берётся текущее
+//   D<w>           замер направления по разомкнутому ходу на скорости w
+//   Z<рад>         сдвинуть электрический ноль
+//   V<В>           предел напряжения
+//   P<x> I<x> J<x> коэффициенты регулятора (J — дифференциальный)
+//   G<с>           постоянная фильтра скорости
+//   N<штук>        сколько отсчётов писать (не больше N_SAMP)
+//   W<Гц>          частота записи
+//   ?              состояние
+// ===========================================================================
+
+
+
+/** Момент с записью ВНУТРЕННОСТЕЙ: механический угол, электрический угол и
+ *  Uq на 200 Гц. Отвечает на единственный оставшийся вопрос — следит ли поле
+ *  за ротором. Разомкнутый контур на 2.0 В вал крутит, а режим момента даже
+ *  на 2.5 В не сдвигает, хотя поле в нём ставится на четверть оборота впереди
+ *  ротора и момент обязан быть максимальным. Одно из двух: либо электрический
+ *  угол не следует за механическим, либо Uq не доходит до фаз. Обе гипотезы
+ *  различаются прямо в этих трёх колонках. */
+static void diag_torque(float uq, uint16_t n) {
+  motor.enable();
+  motor.controller = MotionControlType::torque;
+  guard_reset();
+  Serial.print(F("#ТОРК_ДИАГ Uq=")); Serial.print(uq, 3);
+  Serial.print(F(" n=")); Serial.print(n);
+  Serial.println(F("  колонки: мех эл Uq_факт"));
+  const uint32_t step_us = 1000000UL / 200;
+  uint32_t next = micros();
+  for (uint16_t i = 0; i < n; i++) {
+    while ((int32_t)(micros() - next) < 0) { motor.loopFOC(); motor.move(uq); guard(false); }
+    next += step_us;
+    Serial.print(sensor.getMechanicalAngle(), 4); Serial.print(' ');
+    Serial.print(motor.electrical_angle, 4); Serial.print(' ');
+    Serial.println(motor.voltage.q, 3);
+  }
+  motor.move(0.0f); motor.disable(); delay(200); motor.enable();
+  Serial.println(F("#ТОРК_КОНЕЦ"));
+}
+
+/** Трасса ЗАМКНУТОГО контура: уставка, скорость по библиотеке, Uq, мех. угол.
+ *  Отвечает на вопрос, который счётчик упора закрыть не может: упирается ли
+ *  регулятор в ОДНУ сторону или дёргается между упорами. */
+static void diag_vel(float w, uint16_t n) {
+  motor.enable();
+  motor.controller = MotionControlType::velocity;
+  motor.PID_velocity.reset();
+  guard_reset();
+  Serial.print(F("#ВЕЛ_ДИАГ w=")); Serial.print(w, 3);
+  Serial.print(F(" n=")); Serial.print(n);
+  Serial.println(F("  колонки: w_SFOC Uq мех"));
+  const uint32_t step_us = 1000000UL / 200;
+  uint32_t next = micros();
+  for (uint16_t i = 0; i < n; i++) {
+    while ((int32_t)(micros() - next) < 0) { motor.loopFOC(); motor.move(w); guard(false); }
+    next += step_us;
+    Serial.print(motor.shaft_velocity, 4); Serial.print(' ');
+    Serial.print(motor.voltage.q, 3); Serial.print(' ');
+    Serial.println(sensor.getMechanicalAngle(), 4);
+  }
+  motor.move(0.0f); Serial.println(F("#ВЕЛ_КОНЕЦ"));
+}
+
+static void status() {
+  const CaptureStatus &st = sensor.lastStatus();
+  Serial.print(F("#СОСТ V=")); Serial.print(motor.voltage_limit, 2);
+  Serial.print(F(" P=")); Serial.print(motor.PID_velocity.P, 4);
+  Serial.print(F(" I=")); Serial.print(motor.PID_velocity.I, 4);
+  Serial.print(F(" D=")); Serial.print(motor.PID_velocity.D, 4);
+  Serial.print(F(" Tf=")); Serial.print(motor.LPF_velocity.Tf, 5);
+  Serial.print(F(" знак=")); Serial.print(motor.sensor_direction == Direction::CW ? F("CW") : F("CCW"));
+  Serial.print(F(" ZEA=")); Serial.print(motor.zero_electric_angle, 5);
+  Serial.print(F(" n=")); Serial.print(n_samp);
+  Serial.print(F(" fs=")); Serial.print(fs_hz);
+  Serial.print(F(" годен=")); Serial.print(sensor.isHealthy());
+  Serial.print(F(" угол=")); Serial.print(sensor.getAngle(), 4);
+  Serial.print(F(" период=")); Serial.println(st.period);
+}
+
+/** Разомкнутый ход и знак по нему. Отдельной командой, потому что это ЗАМЕР,
+ *  а не настройка: 12 секунд хода надёжнее двух отсчётов библиотеки. */
+static void measure_dir(float w) {
+  motor.enable();
+  motor.controller = MotionControlType::velocity_openloop;
+  guard_reset();
+  const float a0 = sensor.getAngle();
+  const uint32_t t0 = millis();
+  float wr = 0.0f; uint32_t prev = micros();
+  while (millis() - t0 < 6000) {
+    uint32_t now = micros(); float dt = (now - prev) * 1e-6f; prev = now;
+    if (dt < 0 || dt > 0.05f) dt = 0;
+    float st = 0.2f * dt;
+    if (wr < w) wr = min(wr + st, w); else if (wr > w) wr = max(wr - st, w);
+    motor.loopFOC(); motor.move(wr); guard(false);
+  }
+  const float v = (sensor.getAngle() - a0) / ((millis() - t0) * 1e-3f);
+  motor.move(0.0f);
+  const float sync = fabsf(v) / fabsf(w);
+  motor.sensor_direction = (v * w > 0) ? Direction::CW : Direction::CCW;
+  Serial.print(F("#НАПРАВЛЕНИЕ w_изм=")); Serial.print(v, 4);
+  Serial.print(F(" команда=")); Serial.print(w, 4);
+  Serial.print(F(" синхронизм=")); Serial.print(sync, 3);
+  Serial.print(F(" -> "));
+  Serial.println(motor.sensor_direction == Direction::CW ? F("CW") : F("CCW"));
+}
+
+static void do_align() {
+  float zea[3];
+  for (uint8_t k = 0; k < 3; k++) {
+    motor.zero_electric_angle = NOT_SET;
+    if (!motor.initFOC()) { Serial.println(F("#ОТКАЗ выравнивание не удалось")); return; }
+    zea[k] = motor.zero_electric_angle;
+    Serial.print(F("#ВЫРАВНИВАНИЕ ")); Serial.print(k + 1);
+    Serial.print(F(" ZEA=")); Serial.println(zea[k], 5);
+    delay(200);
+  }
+  float cs = 0.0f, sn = 0.0f;
+  for (uint8_t k = 0; k < 3; k++) { cs += cosf(zea[k]); sn += sinf(zea[k]); }
+  zea_mean = atan2f(sn, cs);
+  float sp = 0.0f;
+  for (uint8_t k = 0; k < 3; k++) {
+    float d = fabsf(atan2f(sinf(zea[k] - zea_mean), cosf(zea[k] - zea_mean)));
+    if (d > sp) sp = d;
+  }
+  sp *= 2.0f;
+  motor.zero_electric_angle = zea_mean;
+  Serial.print(F("#ВЫРАВНИВАНИЕ_ИТОГ ZEA=")); Serial.print(zea_mean, 5);
+  Serial.print(F(" размах=")); Serial.print(sp * 57.2958f, 2);
+  Serial.print(F(" град_эл -> ")); Serial.println(sp <= ZEA_SPREAD_MAX ? F("годен") : F("НЕГОДЕН"));
+}
+
+void loop() {
+  static char cmd[24]; static uint8_t n = 0;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (!n) continue;
+      cmd[n] = 0; n = 0;
+      const char k = cmd[0];
+      const float a = atof(cmd + 1);
+      switch (k) {
+        case 'F': motor.disable(); record(false, false, 0.0f); dump("пол", false, 0.0f); break;
+        case 'O': motor.enable(); motor.controller = MotionControlType::velocity_openloop;
+                  record(true, false, a); motor.move(0.0f); dump("разомкнутый", true, a); break;
+        case 'C': motor.enable(); motor.controller = MotionControlType::velocity;
+                  motor.PID_velocity.reset();
+                  record(true, true, a); motor.move(0.0f); dump("замкнутый", true, a); break;
+        case 'T': { motor.enable();
+                    const float tr = probe_torque(motor.sensor_direction, a);
+                    Serial.print(F("#МОМЕНТ Uq=")); Serial.print(a, 3);
+                    Serial.print(F(" пройдено=")); Serial.print(tr * 57.2958f, 2);
+                    Serial.print(F(" град  w=")); Serial.println(tr / 3.0f, 4); } break;
+        case 'A': motor.enable(); do_align(); break;
+        case 'D': measure_dir(a); break;
+        case 'Z': zea_mean = _normalizeAngle(zea_mean + a); motor.zero_electric_angle = zea_mean;
+                  Serial.print(F("#ZEA=")); Serial.println(zea_mean, 5); break;
+        case 'V': motor.voltage_limit = a; motor.PID_velocity.limit = a;
+                  Serial.print(F("#V=")); Serial.println(a, 2); break;
+        case 'P': motor.PID_velocity.P = a; Serial.println(F("#ok")); break;
+        case 'I': motor.PID_velocity.I = a; Serial.println(F("#ok")); break;
+        case 'J': motor.PID_velocity.D = a; Serial.println(F("#ok")); break;
+        case 'G': motor.LPF_velocity.Tf = a; Serial.println(F("#ok")); break;
+        case 'N': n_samp = min((uint16_t)a, (uint16_t)N_SAMP); Serial.println(F("#ok")); break;
+        case 'W': fs_hz = (uint16_t)a; Serial.println(F("#ok")); break;
+        case 'X': motor.move(0.0f); motor.disable(); Serial.println(F("#стоп")); break;
+        case 'Y': diag_torque(a, 300); break;
+        case 'M': diag_vel(a, 400); break;
+        // ЧИСЛО ПАР ПОЛЮСОВ КОМАНДОЙ. Оно входит в перевод «механический угол
+        // -> электрический», и ошибка в нём копится С ПРОЙДЕННЫМ ПУТЁМ: поле
+        // тянет, пока накопленный сдвиг не переведёт его в удержание. Проверка
+        // библиотеки (est. pp) тут бессильна — её допуск 0.5 рад на оборот, а
+        // ловить надо ровно такую величину.
+        // НАПРЯЖЕНИЕ ВЫРАВНИВАНИЯ ОТДЕЛЬНО ОТ РАБОЧЕГО. Выравнивание держит
+        // ротор неподвижно доли секунды, и трение ему мешает: ротор встаёт
+        // там, где его держит трение, а не в электрическом нуле. Это прямо
+        // портит ZEA, а с ним и весь замкнутый контур.
+        case 'S': motor.voltage_sensor_align = a;
+                  Serial.print(F("#Uвыр=")); Serial.println(a, 2); break;
+        case 'K': motor.pole_pairs = (int)(a + 0.5f);
+                  Serial.print(F("#pp=")); Serial.println(motor.pole_pairs); break;
+        case '?': status(); break;
+        default: Serial.println(F("#? неизвестная команда"));
+      }
+      Serial.println(F("#ГОТОВ"));
+    } else if (n < sizeof(cmd) - 1) cmd[n++] = c;
+  }
+}
