@@ -40,7 +40,17 @@
 # кэша. Проверка воркфлоу это воспроизвела.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-CLI="$HOME/Android/arduino/arduino-cli"
+# arduino-cli ИЩЕТСЯ, А НЕ ПОДРАЗУМЕВАЕТСЯ. Здесь стоял путь ~/Android/arduino,
+# которого нет ни на ноутбуке, ни на lm: скетчи собирались бы ровно на той
+# машине, где я его когда-то распаковал, а на остальных отказ выглядел бы как
+# «нет arduino-cli» — то есть как отсутствие инструмента, а не как неверный путь.
+CLI="${ARDUINO_CLI:-$(command -v arduino-cli || true)}"
+if [ -z "$CLI" ]; then
+    for c in "$HOME/.local/bin/arduino-cli" "$HOME/Android/arduino/arduino-cli" \
+             "$HOME/bin/arduino-cli"; do
+        [ -x "$c" ] && { CLI="$c"; break; }
+    done
+fi
 FQBN="STMicroelectronics:stm32:Disco:pnum=B_G431B_ESC1"
 
 [ -x "$CLI" ] || { echo "нет arduino-cli в $CLI"; exit 1; }
