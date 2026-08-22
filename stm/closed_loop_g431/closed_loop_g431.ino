@@ -130,7 +130,7 @@ static const float    W_ABORT     = 1.0f;      // рад/с, на записи
 // названной границы безопасности вала (6 рад/с), то есть настоящий разгон
 // ловится и здесь.
 static const float    W_ABORT_SETTLE = 3.0f;
-static const uint32_t W_ABORT_MS  = 50;
+static const uint32_t W_ABORT_MS  = 30;
 // ОКНО ИЗМЕРЕНИЯ СКОРОСТИ ДЛЯ СТОРОЖА — СВОЁ, 100 мс.
 //
 // Первая редакция сторожила motor.shaft_velocity, и в разомкнутом контуре это
@@ -141,7 +141,7 @@ static const uint32_t W_ABORT_MS  = 50;
 // шум угла 0.037 градуса даёт на нём около 0.7 рад/с — вплотную к порогу
 // 1.0. На окне 100 мс тот же шум даёт 0.007 рад/с, то есть запас в сто
 // с лишним раз, а разгон до 1 рад/с ловится за 150 мс = 8.6 градуса вала.
-static const uint32_t W_WIN_MS = 100;
+static const uint32_t W_WIN_MS = 40;
 // ДОПУСТИМЫЙ РАЗБРОС ВЫРАВНИВАНИЯ, радианы электрические. 0.20 рад = 11.5
 // градусов электрических, потеря момента 1-cos(5.7 град) = 0.5%. Неустойчивость
 // начинается около 90 градусов, так что порог с большим запасом; он ловит не
@@ -174,11 +174,21 @@ static void blink(uint8_t n, uint16_t ms) {
   }
 }
 
-/** Смертельно: гасит фазы, печатает причину, мигает без конца.
- *  ОСТАНОВ, А НЕ ПРОДОЛЖЕНИЕ С ОГОВОРКОЙ: любая из этих причин означает, что
- *  регулятор работает по недостоверному измерению, и данные после неё
- *  сравнивать не с чем. */
-static void die(const char *why) {
+static bool bailed = false;    //!< сторож сработал; отрезок прерван
+
+/** Сторож сработал: гасит фазы, печатает причину и ВОЗВРАЩАЕТ УПРАВЛЕНИЕ.
+ *
+ *  ПРЕЖДЕ ЗДЕСЬ БЫЛ ВЕЧНЫЙ ЦИКЛ, и это был дефект командного режима: плата
+ *  переставала отвечать вовсе, а управляющий скрипт ждал свой трёхсотсекундный
+ *  таймаут на КАЖДОЙ следующей команде. Со стороны это выглядело как «стенд
+ *  неподвижен, команды крутятся шесть минут». В сценарном режиме останов был
+ *  уместен: там после отказа делать нечего. В командном — наоборот, оператору
+ *  надо сказать, что случилось, и вернуть приглашение.
+ *
+ *  Данные отрезка, на котором сторож сработал, всё равно негодны: любая из
+ *  этих причин означает, что регулятор работал по недостоверному измерению.
+ *  Поэтому отрезок прерывается, а не дописывается. */
+static void bail(const char *why) {
   motor.move(0.0f);
   motor.disable();
   Serial.println();
@@ -195,9 +205,8 @@ static void die(const char *why) {
   Serial.print(F(" фронты="));    Serial.print(st.edges);
   Serial.print(F(" жив="));       Serial.print(st.alive);
   Serial.print(F(" возраст="));   Serial.println(st.age);
-  Serial.println(F("#ВСЁ"));
   Serial.flush();
-  while (1) blink(1, 60);
+  bailed = true;
 }
 
 /** Три сторожа, по одному на отказ, который в разомкнутом контуре не страшен.
@@ -209,6 +218,12 @@ static bool     win_have = false;
 static bool     armed_tight = false;   //!< идёт запись, порог строгий
 static float    w_peak = 0.0f;         //!< наибольшая |скорость| за запись
 static float    w_peak_settle = 0.0f;  //!< то же за установление, отдельно
+// ЗНАК ТЯГИ: в какую сторону меняется УГОЛ ДАТЧИКА при положительном Uq.
+// Меряется пробой момента, а не задаётся. Первая редакция позиционного контура
+// взяла его наобум, получила положительную обратную связь и разогнала вал до
+// 11.6 рад/с — сторож сбил. Величина, которую можно измерить за три секунды,
+// не должна быть предположением.
+static float    drive_sign = -1.0f;
 static float    zea_mean = 0.0f;       //!< средний электрический ноль по трём замерам
 static uint32_t g_calls = 0, g_sat = 0;
 // ЗНАК Uq, А НЕ ТОЛЬКО МОДУЛЬ. Счётчик упора сигнатуру «регулятор дёргается
@@ -222,6 +237,7 @@ static float uq_min = 0.0f, uq_max = 0.0f;
 static void guard_reset() {
   w_since = 0; win_have = false; g_calls = 0; g_sat = 0;
   w_peak = 0.0f; w_peak_settle = 0.0f; armed_tight = false; w_meas = 0.0f;
+  bailed = false;
   uq_min = 1e9f; uq_max = -1e9f;
 }
 
@@ -238,7 +254,7 @@ static void guard(bool closed) {
 
   // ЗДОРОВЬЕ ДАТЧИКА — только в замкнутом. В разомкнутом датчик не участвует
   // в управлении, и его негодность портит замер, но не разгоняет вал.
-  if (closed && !sensor.isHealthy()) die("датчик негоден: см. разбор ниже");
+  if (closed && !sensor.isHealthy()) bail("датчик негоден: см. разбор ниже");
 
   // Скорость меряется по УГЛУ на окне, а не берётся у библиотеки: см. шапку
   // W_WIN_MS. В разомкнутом контуре библиотечная величина — это команда.
@@ -269,7 +285,7 @@ static void guard(bool closed) {
   const float lim = armed_tight ? W_ABORT : W_ABORT_SETTLE;
   if (aw > lim) { if (!w_since) w_since = now; }
   else w_since = 0;
-  if (w_since && now - w_since > W_ABORT_MS) die("разгон: измеренная скорость выше порога");
+  if (w_since && now - w_since > W_ABORT_MS) bail("разгон: измеренная скорость выше порога");
 }
 
 
@@ -293,13 +309,20 @@ static float probe_torque(Direction dir, float uq) {
   motor.zero_electric_angle = zea_mean;
   motor.controller          = MotionControlType::torque;
   guard_reset();
+  // ПРЕКРАЩАЕМ ПО ПРОЙДЕННОМУ ПУТИ, А НЕ ПО ВРЕМЕНИ. Проба отвечает на вопрос
+  // «тянет или держит», и для этого хватает трети шага полюса. Прежняя
+  // редакция крутила вал все три секунды и разгоняла его до 1.5 рад/с — выше
+  // рабочего диапазона (до 1 рад/с), без всякой пользы для ответа.
   const float a0 = sensor.getAngle();
   const uint32_t t0 = millis();
-  while (millis() - t0 < 3000) {
+  const float TRAV_ENOUGH = 0.5f;         // рад, около 29 градусов
+  while (millis() - t0 < 3000 && !bailed) {
     motor.loopFOC(); motor.move(uq); guard(false);
-    if (fabsf(w_meas) > 3.0f) break;
+    if (fabsf(sensor.getAngle() - a0) > TRAV_ENOUGH) break;
   }
+  const uint32_t t_trav = millis() - t0;
   const float trav = sensor.getAngle() - a0;
+  if (fabsf(trav) > 0.2f && fabsf(uq) > 1e-3f) drive_sign = (trav * uq > 0) ? 1.0f : -1.0f;
   motor.move(0.0f); motor.disable(); delay(300); motor.enable();
   return trav;
 }
@@ -394,7 +417,7 @@ static void record(bool drive, bool closed, float w) {
   uint32_t prev = micros();
   uint32_t t0 = millis();
 
-  while (millis() - t0 < SETTLE_MS || (drive && fabsf(w_ramp - w) > 1e-4f)) {
+  while (!bailed && (millis() - t0 < SETTLE_MS || (drive && fabsf(w_ramp - w) > 1e-4f))) {
     uint32_t now = micros();
     float dt = (now - prev) * 1e-6f; prev = now;
     if (dt < 0 || dt > 0.05f) dt = 0;
@@ -414,7 +437,7 @@ static void record(bool drive, bool closed, float w) {
   armed_tight = true; w_since = 0;
 
   uint32_t next = micros();
-  for (uint16_t i = 0; i < n_samp; i++) {
+  for (uint16_t i = 0; i < n_samp && !bailed; i++) {
     // Крутим и опрашиваем, пока не подошёл момент отсчёта. Спать нельзя:
     // без loopFOC() поле встанет, и мы запишем не плавность, а остановку.
     while ((int32_t)(micros() - next) < 0) {
@@ -594,6 +617,166 @@ static void diag_torque(float uq, uint16_t n) {
   Serial.println(F("#ТОРК_КОНЕЦ"));
 }
 
+
+// ===========================================================================
+// СОБСТВЕННЫЙ КОНТУР СКОРОСТИ
+//
+// ЗАЧЕМ ВТОРОЙ КОНТУР, КОГДА ЕСТЬ БИБЛИОТЕЧНЫЙ.
+//
+// ОБОСНОВАНИЕ ОТОЗВАНО 23.08, СРАЗУ ПОСЛЕ ТОГО КАК БЫЛО НАПИСАНО. Здесь
+// стояло: «библиотечная shaft_velocity дала +0.141 рад/с, тогда как вал шёл
+// -0.722 — впятеро и по знаку». Оба числа воспроизводятся, но вывод из них
+// неверен по двум причинам, найденным проверкой:
+//
+//   1. Величина -0.722 создана ОДНОЙ строкой блока: переход от нулевой строки
+//      к первой даёт -1.4086 рад за 5 мс, то есть -282 рад/с. Это 98% всего
+//      «хода» и физически невозможно — строка осталась от предыдущего режима.
+//      Без неё ход вала -0.016 рад/с при средней w_SFOC +0.126: обе величины
+//      около нуля. Вал просто НЕ ПОЕХАЛ под уставку, а обратная связь не врёт
+//      ни впятеро, ни по знаку.
+//   2. Знаки этих двух колонок сравнивать напрямую нельзя ВООБЩЕ:
+//      motor.shaft_velocity умножена на sensor_direction (FOCMotor.cpp:74), а
+//      getMechanicalAngle() — нет. При CCW противоположный знак обязателен по
+//      построению.
+//
+// Контур оставлен как ИНСТРУМЕНТ (оценка по окну устойчивее покадровой на
+// медленном ходу), но не как исправление несуществующего дефекта.
+//
+// Здесь скорость считается ТАК ЖЕ, КАК ЕЁ СЧИТАЛ СТОРОЖ, — приращением угла на
+// окне, — потому что именно эта оценка совпала с действительностью. Окно 20 мс:
+// шум угла 0.0007 рад даёт на нём 0.035 рад/с против уставки 0.2, то есть
+// отношение сигнала к шуму около шести, а запаздывание 10 мс — вдвое меньше
+// кванта кадра датчика, помноженного на цикл.
+//
+// Регулятор ПИ, выход — напряжение по оси q через режим момента. Дифференциала
+// нет намеренно: он делит на такт цикла (30 мкс), а не на кадр (922 мкс).
+static float own_P = 2.0f, own_I = 8.0f, own_win_ms = 20.0f;
+static float own_int = 0.0f, own_w = 0.0f;
+
+static void own_reset() { own_int = 0.0f; own_w = 0.0f; }
+
+/** Один такт собственного контура. Возвращает поданное напряжение. */
+static float own_step(float target, float dt) {
+  static uint32_t t_win = 0; static float a_win = 0.0f; static bool have = false;
+  const uint32_t now = millis();
+  const float a = sensor.getAngle();
+  if (!have) { t_win = now; a_win = a; have = true; }
+  else if (now - t_win >= (uint32_t)own_win_ms) {
+    own_w = (a - a_win) / ((float)(now - t_win) * 1e-3f);
+    t_win = now; a_win = a;
+  }
+  const float err = target - drive_sign * own_w;
+  own_int += own_I * err * dt;
+  own_int = _constrain(own_int, -motor.voltage_limit, motor.voltage_limit);
+  float uq = drive_sign * (own_P * err + own_int);
+  uq = _constrain(uq, -motor.voltage_limit, motor.voltage_limit);
+  motor.move(uq);
+  return uq;
+}
+
+/** Запись отрезка под собственным контуром. Строится по образцу record(), но
+ *  управление своё, поэтому вынесено отдельно, а не флагом внутри record(): в
+ *  одной функции две разные петли управления читались бы хуже, чем две. */
+static void own_record(float w) {
+  guard_reset(); own_reset();
+  motor.enable();
+  motor.controller = MotionControlType::torque;
+  const uint32_t step_us = 1000000UL / fs_hz;
+  uint32_t prev = micros();
+  float wr = 0.0f;
+  const uint32_t t0 = millis();
+  while (!bailed && (millis() - t0 < SETTLE_MS || fabsf(wr - w) > 1e-4f)) {
+    const uint32_t now = micros();
+    float dt = (now - prev) * 1e-6f; prev = now;
+    if (dt < 0 || dt > 0.05f) dt = 0;
+    float st = 0.2f * dt;
+    if (wr < w) wr = min(wr + st, w); else if (wr > w) wr = max(wr - st, w);
+    motor.loopFOC(); own_step(wr, dt); guard(true);
+  }
+  armed_tight = true; w_since = 0;
+  uint32_t next = micros();
+  for (uint16_t i = 0; i < n_samp && !bailed; i++) {
+    while ((int32_t)(micros() - next) < 0 && !bailed) {
+      const uint32_t now = micros();
+      float dt = (now - prev) * 1e-6f; prev = now;
+      if (dt < 0 || dt > 0.05f) dt = 0;
+      motor.loopFOC(); own_step(wr, dt); guard(true);
+    }
+    next += step_us;
+    buf[i] = sensor.getAngle();
+  }
+  motor.move(0.0f);
+  Serial.print(F("#СВОЙ_КОНТУР w_свой=")); Serial.print(own_w, 4);
+  Serial.print(F(" интеграл=")); Serial.println(own_int, 3);
+}
+
+
+// ===========================================================================
+// КОНТУР ПО ПОЛОЖЕНИЮ
+//
+// ПОЧЕМУ ОН, А НЕ КОНТУР СКОРОСТИ. Скорость обратной связи у нас измерена и
+// признана негодной (расхождение впятеро и по знаку, см. own_step). Угол —
+// нет: он абсолютный, читается прямо, и на нём же построены все замеры. То
+// есть позиционный контур опирается ровно на то, что работает, и не опирается
+// на то, что сломано.
+//
+// Для камеры на мачте положение и есть естественная управляемая величина:
+// уставка приходит от кадра как «куда смотреть», а не «как быстро ехать».
+//
+// Закон П по ошибке угла плюс демпфирование по СОБСТВЕННОЙ оценке скорости
+// (own_w, окно 20 мс). Дифференциала по ошибке нет: он делил бы разность
+// на такт цикла 30 мкс вместо кадра 922 мкс и завышал бы в тридцать раз.
+static float pos_P = 6.0f, pos_D = 2.0f;
+
+/** Ведение по положению: уставка едет со скоростью w, вал держится за ней. */
+static void pos_record(float w) {
+  guard_reset(); own_reset();
+  motor.enable();
+  motor.controller = MotionControlType::torque;
+  float ref = sensor.getAngle();
+  uint32_t prev = micros();
+  const uint32_t t0 = millis();
+  uint32_t t_win = millis(); float a_win = sensor.getAngle();
+  float uq = 0.0f;
+
+  // Уставка стартует ОТ ТЕКУЩЕГО УГЛА, а не от нуля: иначе первый же такт
+  // дал бы ошибку в несколько оборотов и бросок напряжения в упор.
+  while (!bailed && millis() - t0 < SETTLE_MS) {
+    const uint32_t now = micros();
+    float dt = (now - prev) * 1e-6f; prev = now;
+    if (dt < 0 || dt > 0.05f) dt = 0;
+    ref += drive_sign * w * dt;
+    const float a = sensor.getAngle();
+    const uint32_t ms = millis();
+    if (ms - t_win >= 20) { own_w = (a - a_win) / ((float)(ms - t_win) * 1e-3f); t_win = ms; a_win = a; }
+    uq = _constrain(drive_sign * (pos_P * (ref - a) - pos_D * own_w),
+                    -motor.voltage_limit, motor.voltage_limit);
+    motor.loopFOC(); motor.move(uq); guard(true);
+  }
+  armed_tight = true; w_since = 0;
+  const uint32_t step_us = 1000000UL / fs_hz;
+  uint32_t next = micros();
+  for (uint16_t i = 0; i < n_samp && !bailed; i++) {
+    while ((int32_t)(micros() - next) < 0 && !bailed) {
+      const uint32_t now = micros();
+      float dt = (now - prev) * 1e-6f; prev = now;
+      if (dt < 0 || dt > 0.05f) dt = 0;
+      ref += drive_sign * w * dt;
+      const float a = sensor.getAngle();
+      const uint32_t ms = millis();
+      if (ms - t_win >= 20) { own_w = (a - a_win) / ((float)(ms - t_win) * 1e-3f); t_win = ms; a_win = a; }
+      uq = _constrain(drive_sign * (pos_P * (ref - a) - pos_D * own_w),
+                      -motor.voltage_limit, motor.voltage_limit);
+      motor.loopFOC(); motor.move(uq); guard(true);
+    }
+    next += step_us;
+    buf[i] = sensor.getAngle();
+  }
+  motor.move(0.0f);
+  Serial.print(F("#ПОЗ_КОНТУР ошибка_хвост=")); Serial.print((ref - sensor.getAngle()) * 57.2958f, 2);
+  Serial.print(F(" град  Uq_хвост=")); Serial.println(uq, 3);
+}
+
 /** Трасса ЗАМКНУТОГО контура: уставка, скорость по библиотеке, Uq, мех. угол.
  *  Отвечает на вопрос, который счётчик упора закрыть не может: упирается ли
  *  регулятор в ОДНУ сторону или дёргается между упорами. */
@@ -628,6 +811,9 @@ static void status() {
   Serial.print(F(" ZEA=")); Serial.print(motor.zero_electric_angle, 5);
   Serial.print(F(" n=")); Serial.print(n_samp);
   Serial.print(F(" fs=")); Serial.print(fs_hz);
+  Serial.print(F(" свои_P=")); Serial.print(own_P, 3);
+  Serial.print(F(" свои_I=")); Serial.print(own_I, 3);
+  Serial.print(F(" окно=")); Serial.print(own_win_ms, 0);
   Serial.print(F(" годен=")); Serial.print(sensor.isHealthy());
   Serial.print(F(" угол=")); Serial.print(sensor.getAngle(), 4);
   Serial.print(F(" период=")); Serial.println(st.period);
@@ -705,7 +891,8 @@ void loop() {
                     const float tr = probe_torque(motor.sensor_direction, a);
                     Serial.print(F("#МОМЕНТ Uq=")); Serial.print(a, 3);
                     Serial.print(F(" пройдено=")); Serial.print(tr * 57.2958f, 2);
-                    Serial.print(F(" град  w=")); Serial.println(tr / 3.0f, 4); } break;
+                    Serial.print(F(" град  w=")); Serial.print(tr / 3.0f, 4);
+                    Serial.print(F(" знак_тяги=")); Serial.println(drive_sign, 0); } break;
         case 'A': motor.enable(); do_align(); break;
         case 'D': measure_dir(a); break;
         case 'Z': zea_mean = _normalizeAngle(zea_mean + a); motor.zero_electric_angle = zea_mean;
@@ -721,6 +908,13 @@ void loop() {
         case 'X': motor.move(0.0f); motor.disable(); Serial.println(F("#стоп")); break;
         case 'Y': diag_torque(a, 300); break;
         case 'M': diag_vel(a, 400); break;
+        case 'Q': own_record(a); dump("свой", true, a); break;
+        case 'H': pos_record(a); dump("позиция", true, a); break;
+        case 'h': pos_P = a; Serial.println(F("#ok")); break;
+        case 'd': pos_D = a; Serial.println(F("#ok")); break;
+        case 'p': own_P = a; Serial.println(F("#ok")); break;
+        case 'i': own_I = a; Serial.println(F("#ok")); break;
+        case 'w': own_win_ms = a; Serial.println(F("#ok")); break;
         // ЧИСЛО ПАР ПОЛЮСОВ КОМАНДОЙ. Оно входит в перевод «механический угол
         // -> электрический», и ошибка в нём копится С ПРОЙДЕННЫМ ПУТЁМ: поле
         // тянет, пока накопленный сдвиг не переведёт его в удержание. Проверка
