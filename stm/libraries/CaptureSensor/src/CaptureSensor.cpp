@@ -78,6 +78,27 @@ bool CaptureSensor::readRaw(CaptureStatus &st) {
   st.period = p; st.high = h;
   st.cc2if = (sr & TIM_SR_CC2IF) != 0;
 
+  // -- ЖИВ ЛИ САМ ТАЙМЕР ---------------------------------------------------
+  //
+  // Единственное, что различает «замерли регистры» и «вал стоит, тракт жив», —
+  // движение СЧЁТЧИКА. Ширина у неподвижного вала постоянна законно, период
+  // постоянен всегда; непрерывно меняется только CNT. Поэтому запоминаем
+  // последнее значение счётчика и момент, когда оно менялось.
+  const unsigned long now_us = micros();
+#ifdef CAPSENS_MUT_NO_FROZEN_CHECK
+  st.alive = true;                       // МУТАЦИЯ: замирание таймера не ловится
+  (void)now_us;
+#else
+  if (!have_cnt_ || age != last_cnt_) {
+    last_cnt_ = age;
+    have_cnt_ = true;
+    cnt_change_us_ = now_us;
+  }
+  // Вычитание беззнаковых — переполнение micros() (каждые 71 минуту) проходит
+  // без особого случая.
+  st.alive = (unsigned long)(now_us - cnt_change_us_) < CAPSENS_FROZEN_US;
+#endif
+
   // -- ДВА РЕЖИМА ЗАЩЁЛКИВАНИЯ, И ОБА ГОДНЫ ------------------------------
   //
   // ЧТО ЗАЩЁЛКНУТО. Пусть нарастающие фронты R0, R1, R2..., кадр k это
@@ -143,7 +164,7 @@ bool CaptureSensor::readRaw(CaptureStatus &st) {
   st.edges = (age <= CAPSENS_AGE_MAX_TICKS);
 #endif
 
-  st.ok = st.paired && st.period_ok && st.width_ok && st.edges;
+  st.ok = st.paired && st.period_ok && st.width_ok && st.edges && st.alive;
   last_ = st;
   return st.ok;
 }
@@ -155,12 +176,23 @@ float CaptureSensor::getSensorAngle() {
   CaptureStatus st;
   // ОДИН ПРОХОД, БЕЗ ОЖИДАНИЯ. Здесь нельзя ни while, ни повторного чтения
   // «а вдруг теперь сойдётся»: эта функция стоит внутри loopFOC().
+  const unsigned long now_us = micros();
   if (!readRaw(st)) {
     good_streak_ = 0;
+    good_since_us_ = now_us;
     if (bad_streak_ < 255) bad_streak_++;
-    if (bad_streak_ >= max_bad_reads) healthy_ = false;
+    // ПОРОГ ВО ВРЕМЕНИ, А НЕ В ЧТЕНИЯХ. В чтениях он был функцией частоты
+    // цикла: при 33 кГц восемь чтений это четверть миллисекунды, а
+    // задумывалось несколько кадров датчика по 922 мкс.
+#ifdef CAPSENS_MUT_HEALTH_BY_READS
+    if (bad_streak_ >= 8) healthy_ = false;          // МУТАЦИЯ: порог в чтениях
+#else
+    if (bad_since_us_ == 0) bad_since_us_ = now_us;
+    if ((unsigned long)(now_us - bad_since_us_) >= bad_us_to_fail) healthy_ = false;
+#endif
     return angle_;   // удержание последнего годного, см. объяснение в .h
   }
+  bad_since_us_ = 0;
 
   const float duty = (float)st.high / (float)st.period;
   // Скважность -> радианы. Смещение CAPSENS_DUTY_MIN задаёт только положение
@@ -179,8 +211,51 @@ float CaptureSensor::getSensorAngle() {
   has_angle_ = true;
   bad_streak_ = 0;
   if (good_streak_ < 255) good_streak_++;
-  if (good_streak_ >= good_reads_to_recover) healthy_ = true;
+#ifdef CAPSENS_MUT_HEALTH_BY_READS
+  if (good_streak_ >= 3) healthy_ = true;            // МУТАЦИЯ: порог в чтениях
+#else
+  if (good_since_us_ == 0) good_since_us_ = now_us;
+  if ((unsigned long)(now_us - good_since_us_) >= good_us_to_recover) healthy_ = true;
+#endif
   return angle_;
+}
+
+// ---------------------------------------------------------------------------
+// МЕТКА ВРЕМЕНИ УГЛА — ПО ФРОНТУ, А НЕ ПО МОМЕНТУ ОПРОСА
+// ---------------------------------------------------------------------------
+//
+// ПОЧЕМУ ЭТО НЕ ОДНА СТРОКА ВНУТРИ getSensorAngle(), как предполагалось в
+// плане. Базовый Sensor::update() устроен так:
+//
+//     float val = getSensorAngle();
+//     if (val < 0) return;
+//     angle_prev_ts = _micros();      <-- ЗАТИРАЕТ всё, что мы записали сами
+//
+// То есть правка внутри getSensorAngle() была бы молча отменена, и метка
+// осталась бы привязанной к опросу. Поэтому поправка вносится ПОСЛЕ вызова
+// базового update().
+//
+// ЧТО ЭТО ЧИНИТ. Отсчёт защёлкнут железом в момент фронта, а опрашивается
+// программой когда придётся: транспортная задержка гуляет от 0 до полутора
+// кадров И ЗАВИСИТ ОТ САМОГО УГЛА (ширина импульса — это и есть угол). Значит
+// в измеряемую плавность вносится помеха ровно раз на оборот — то самое, что
+// контур должен подавлять. На её фоне такт цикла 30 мкс не значит ничего.
+//
+// Возраст переводится из тиков TIM2 в микросекунды делением на 170.
+// ГЕЙТ ПО ГОДНОСТИ ОБЯЗАТЕЛЕН, и стоил он ошибки в первой редакции.
+//
+// Возраст берётся из последнего чтения — но у ЗАБРАКОВАННОГО чтения он
+// произвольный: на севшем датчике CNT уходит от CCR1 на секунды. Поправка без
+// гейта уводила метку назад на 17.6 и 20.0 с (воспроизведено), после чего
+// Sensor::getVelocity() попадал в ветку «переполнение micros()», и первое
+// чтение после восстановления давало 0.000038 рад/с вместо 0.20 — занижение
+// в 5300 раз прямо на входе ПИ-регулятора. То есть сторож живости без этой
+// строки вреднее своего отсутствия.
+void CaptureSensor::update() {
+  Sensor::update();
+#ifndef CAPSENS_MUT_TS_AT_POLL
+  if (last_.ok) angle_prev_ts -= (long)(last_.age / CAPSENS_TICKS_PER_US);
+#endif
 }
 
 bool CaptureSensor::isHealthy() const {
