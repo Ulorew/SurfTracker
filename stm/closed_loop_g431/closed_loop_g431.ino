@@ -480,6 +480,23 @@ static bool     drive_sign_valid = false;
 static float    zea_mean = 0.0f;       //!< средний электрический ноль по трём замерам
 static uint32_t g_calls = 0, g_sat = 0;
 static uint32_t t_reset = 0;   //!< когда началась льгота
+// ДЕТЕКТОР ВИБРАЦИИ. Сторож разгона ловит уход скорости, а КОЛЕБАНИЕ вокруг
+// уставки пропускает по построению: средняя скорость при вибрации нормальная,
+// и порог по |w| не срабатывает, пока вал не разойдётся настолько, что это уже
+// слышно и вредно стенду. Замер это подтвердил: в обвалившихся прогонах пиковая
+// скорость дошла до 1.1..1.23 рад/с, то есть до вмешательства сторожа вал
+// успевал раскачаться.
+//
+// Здесь меряется РАЗМАХ скорости на окне 200 мс. У устойчивых прогонов сетки он
+// не превышал 0.43 рад/с при уставках 0.05..0.20; порог 0.8 даёт запас почти
+// вдвое и срабатывает заметно раньше порога по разгону.
+static const uint32_t VIB_WIN_MS = 200;
+static const float    VIB_LIMIT  = 0.8f;    // рад/с, размах
+// РАЗМАХ ЗА ЗАПИСЬ И ЗА УСТАНОВЛЕНИЕ — ОТДЕЛЬНО. Иначе в отчёт попадает рывок
+// захвата ротора при включении поля, и конфигурация с размахом 0.19 за запись
+// печатается как 4.07 только потому, что в первые полторы секунды вал дёрнуло.
+static float   vib_hi = -1e9f, vib_lo = 1e9f, vib_span = 0.0f, vib_span_settle = 0.0f;
+static uint32_t vib_t0 = 0;
 // ЗНАК Uq, А НЕ ТОЛЬКО МОДУЛЬ. Счётчик упора сигнатуру «регулятор дёргается
 // между упорами» и «регулятор упёрся в одну сторону» не различает вовсе, а
 // это два разных отказа с разными причинами.
@@ -493,6 +510,7 @@ static void guard_reset() {
   w_peak = 0.0f; w_peak_settle = 0.0f; armed_tight = false; w_meas = 0.0f;
   bailed = false;
   uq_min = 1e9f; uq_max = -1e9f; uq_sum = 0.0f; t_reset = millis();
+  vib_hi = -1e9f; vib_lo = 1e9f; vib_span = 0.0f; vib_span_settle = 0.0f; vib_t0 = millis();
 }
 
 /** Две защиты (разгон, негодный датчик) и один счётчик (упор Uq).
@@ -545,6 +563,21 @@ static void guard(bool closed) {
   // Правильное различие не «замкнутый против разомкнутого», а ПОРОГ: в
   // разомкнутом вал не может устойчиво идти быстрее команды, поэтому порог
   // там привязан к команде, а не к рабочему потолку.
+  // Размах скорости на скользящем окне: копим крайние за VIB_WIN_MS, потом
+  // окно сбрасывается. Это грубее скользящего минимума-максимума, но не требует
+  // кольца и ловит колебание за один период окна.
+  if (w_meas > vib_hi) vib_hi = w_meas;
+  if (w_meas < vib_lo) vib_lo = w_meas;
+  if (now - vib_t0 >= VIB_WIN_MS) {
+    const float sp = vib_hi - vib_lo;
+    if (armed_tight) { if (sp > vib_span) vib_span = sp; }
+    else             { if (sp > vib_span_settle) vib_span_settle = sp; }
+    vib_t0 = now; vib_hi = -1e9f; vib_lo = 1e9f;
+    if (armed_tight || now - t_reset >= W_GRACE_MS) {
+      if (sp > VIB_LIMIT) bail("вибрация: размах скорости выше порога");
+    }
+  }
+
   if (!armed_tight && now - t_reset < W_GRACE_MS) return;
   const float lim = armed_tight ? W_ABORT : W_ABORT_SETTLE;
   if (aw > lim) { if (!w_since) w_since = now; }
@@ -708,6 +741,7 @@ static void record(bool drive, bool closed, float w) {
   // скорости обнуляется, чтобы в заголовке отрезка стоял пик ЗАПИСИ, а не
   // рывка при включении поля.
   armed_tight = true; w_since = 0;
+  vib_hi = -1e9f; vib_lo = 1e9f; vib_t0 = millis();
 
   uint32_t next = micros();
   for (uint16_t i = 0; i < n_samp && !bailed; i++) {
@@ -746,6 +780,8 @@ static void dump(const char *tag, bool drive, float w) {
   Serial.print(F("% w_изм="));   Serial.print(w_meas, 4);
   Serial.print(F(" w_пик_зап=")); Serial.print(w_peak, 4);
   Serial.print(F(" w_пик_уст=")); Serial.print(w_peak_settle, 4);
+  Serial.print(F(" вибр=")); Serial.print(vib_span, 3);
+  Serial.print(F(" вибр_уст=")); Serial.print(vib_span_settle, 3);
   Serial.print(F(" Uq=[")); Serial.print(uq_min, 3);
   Serial.print(','); Serial.print(uq_max, 3); Serial.print(']');
   // СРЕДНЕЕ Uq — это и есть напряжение, которое объект требует на этой
