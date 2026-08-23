@@ -235,7 +235,10 @@ static uint32_t acc_n=0, clamp_n=0;
 // неотличим от шума и стоял 3 град; на тракте захвата шум 0.046 град, то есть
 // порог выше него в тридцать раз, а шага полюса (32.7 град) не достигает и
 // вдвадцатеро — срыв на полюс поймается заведомо.
-static const uint8_t SLIP_SLOTS = 10;        // 10 x 100 мс = окно 1 с
+// ОКНО ЧЕСТНО ОДНА СЕКУНДА. При десяти слотах свежий отсчёт занимает слот, и
+// самый старый отстоит на ДЕВЯТЬ шагов, то есть окно было 0.9 с. Одиннадцать
+// слотов дают ровно 1.0 с.
+static const uint8_t SLIP_SLOTS = 11;
 static float   slip_ring[SLIP_SLOTS];
 static uint8_t slip_head = 0;
 static uint32_t slip_t_last = 0;
@@ -260,10 +263,26 @@ static bool    slip_bit = false;             // защёлкивается до 
 // Без этого комментария порог остался бы навсегда «2.5 почему-то».
 static float   slip_thr = 2.5f / 57.2958f;   // радианы вала
 static float   slip_max = 0.0f;              // наибольшая |дельта| за отрезок
+// ВТОРОЙ ПОРОГ: НАКОПЛЕННАЯ ОШИБКА, А НЕ СКОРОСТЬ ЕЁ РОСТА.
+//
+// Оконный порог ловит РЫВОК и по построению слеп к медленному сползанию: при
+// пороге 2.5 град и окне 1 с всё, что медленнее 2.5 град/с, невидимо навсегда,
+// а это до трёх четвертей шага полюса за двенадцатисекундный отрезок. На малых
+// уставках хуже: при 0.05 рад/с полная остановка вала даёт за окно всего
+// 2.6 град, то есть неотличима от штатного хода.
+//
+// Поэтому у того же накопителя второй порог — на саму |e| относительно начала
+// отрезка. Полшага полюса (16.4 град) это уже потеря синхронизма, чем бы она
+// ни была вызвана и как бы медленно ни набралась.
+static float   slip_abs_thr = (180.0f / 11.0f) / 57.2958f;   // полшага полюса
+static float   slip_e0 = 0.0f;
+static bool    slip_e0_set = false;
+static float   slip_abs_max = 0.0f;
 
 static void slip_reset() {
   for (uint8_t i = 0; i < SLIP_SLOTS; i++) slip_ring[i] = 0.0f;
   slip_head = 0; slip_ready = false; slip_bit = false; slip_max = 0.0f;
+  slip_e0 = 0.0f; slip_e0_set = false; slip_abs_max = 0.0f;
   slip_t_last = millis();
 }
 
@@ -275,6 +294,10 @@ static float slip_check(float e, uint32_t now) {
     slip_head = (uint8_t)((slip_head + 1) % SLIP_SLOTS);
     if (slip_head == 0) slip_ready = true;
   }
+  if (!slip_e0_set) { slip_e0 = e; slip_e0_set = true; }
+  const float a = fabsf(e - slip_e0);
+  if (a > slip_abs_max) slip_abs_max = a;
+  if (a > slip_abs_thr) slip_bit = true;      // второй порог: накопленная ошибка
   if (!slip_ready) return 0.0f;
   const float d = e - slip_ring[slip_head];   // значение секунду назад
   if (fabsf(d) > slip_max) slip_max = fabsf(d);
@@ -287,7 +310,38 @@ static float slip_check(float e, uint32_t now) {
 // поэтому печатаются СЫРЫЕ отсчёты АЦП и подписаны как сырые. Для правила
 // «не дольше трёх минут при U >= 2 В» важна не абсолютная температура, а
 // ИЗМЕНЕНИЕ: отсчёт до прогона и после. Пирометр эту строку заменит.
-static int ntc_raw() { return analogRead(A_TEMPERATURE); }
+/**
+ * Тепловой прокси. ЗНАК ПОКА НЕ ОПРЕДЕЛЁН — печатается сырым и подписан.
+ *
+ * ЧТО ИЗВЕСТНО О ТЕРМИСТОРЕ: только имя пина (A_TEMPERATURE = PB14, ADC1_IN5).
+ * Ни номинала, ни беты, ни ПЛЕЧА ДЕЛИТЕЛЯ ни в ядре, ни в SimpleFOC нет. А от
+ * плеча зависит ЗНАК: термистор сверху — нагрев поднимает отсчёт, снизу —
+ * роняет. Значит «573 -> 561» читается одинаково и как нагрев, и как остывание,
+ * и по этому числу нельзя принимать решения, пока знак не измерен.
+ *
+ * КАК ИЗМЕРИТЬ ЗНАК БЕЗ ПИРОМЕТРА: рядом печатается ATEMP — заводски
+ * калиброванный термометр кристалла, у которого знак известен заранее. Он
+ * меряет не ключи, а кристалл, но для определения ЗНАКА и оценки чувствительности
+ * в кодах на градус этого достаточно.
+ *
+ * ТРИ ПОПРАВКИ К САМОМУ ЗАМЕРУ, все найдены разбором:
+ *   - разрешение по умолчанию 10 бит при 12-битном АЦП: три четверти шкалы
+ *     выбрасывались даром;
+ *   - усреднения не было вовсе, а на высокоомном делителе это шумно;
+ *   - опора не учитывалась: просадка питания под ключами въезжает в отсчёт
+ *     неотличимо от температуры, поэтому рядом печатается AVREF.
+ */
+static int ntc_median() {
+  int v[15];
+  for (uint8_t i = 0; i < 15; i++) v[i] = analogRead(A_TEMPERATURE);
+  for (uint8_t i = 1; i < 15; i++) {          // вставками: массив крошечный
+    const int x = v[i]; int8_t j = i - 1;
+    while (j >= 0 && v[j] > x) { v[j+1] = v[j]; j--; }
+    v[j+1] = x;
+  }
+  return v[7];
+}
+static int ntc_raw() { return ntc_median(); }
 
 static float   fld_angle = 0.0f;     //!< электрический угол ПОЛЯ, наш интегратор
 
@@ -640,6 +694,10 @@ static void dump(const char *tag, bool drive, float w) {
   // беда нашего контура — интегратор, вынужденный сам набирать напряжение на
   // преодоление трения и потому раскачивающийся.
   Serial.print(F(" Uq_сред=")); Serial.print(g_calls ? uq_sum / g_calls : 0.0f, 3);
+  // БИТ СРЫВА В ЗАГОЛОВКЕ КАЖДОГО ОТРЕЗКА. Он защёлкивается и переживает
+  // обрыв сторожем, но раньше жил только в отдельной строке — то есть при
+  // разборе данных задним числом было не видно, годен ли отрезок вообще.
+  Serial.print(F(" срыв=")); Serial.print(slip_bit ? 1 : 0);
   Serial.print(F(" режим="));    Serial.println(tag);
   for (uint16_t i = 0; i < n_filled; i++) Serial.println(buf[i], 6);
   Serial.println(F("#КОНЕЦ"));
@@ -693,6 +751,7 @@ void setup() {
   Serial.print(F(" наклон=")); Serial.println(CAPSENS_DEG_PER_DUTY, 3);
 
   n_samp = N_SAMP; fs_hz = FS_HZ;
+  analogReadResolution(12);   // по умолчанию 10 при 12-битном АЦП
   sensor.init();
 
   // ПРОВЕРКА ТРАКТА ДО ПОДАЧИ НАПРЯЖЕНИЯ. Класс впервые работает на железе;
@@ -1312,6 +1371,14 @@ static void manifest() {
   Serial.print(F(" n=")); Serial.print(n_samp);
   Serial.print(F(" fs=")); Serial.print(fs_hz);
   Serial.print(F(" NTC_сырой=")); Serial.print(ntc_raw());
+  Serial.print(F("(знак_не_определён)"));
+#ifdef ATEMP
+  Serial.print(F(" ATEMP=")); Serial.print(analogRead(ATEMP));
+#endif
+#ifdef AVREF
+  Serial.print(F(" AVREF=")); Serial.print(analogRead(AVREF));
+#endif
+  Serial.print(F(" t_мс=")); Serial.print(millis());
   Serial.print(F(" порог_срыва=")); Serial.print(slip_thr * 57.2958f, 2);
   Serial.println(F("°"));
 }
@@ -1459,9 +1526,20 @@ static void blocks_record(float w) {
     ref += wr * dt;
     blocks_step(wr, dt, (now - tus0) * 1e-6f, ref - ol * (sensor.getAngle() - a0));
   }
-  // Ошибка положения считается ОТ КОНЦА УСТАНОВЛЕНИЯ: то, что накопилось за
-  // разгон, к плавности отношения не имеет и только загнало бы интегратор.
-  sensor.update(); a0 = sensor.getAngle(); ref = 0.0f; U_int = 0.0f;
+  // ОТСЧЁТ ИНТЕГРАТОРА ПЕРЕНОСИТСЯ, А НАКОПИТЕЛЬ e — НЕТ.
+  //
+  // Здесь стояло a0 = угол; ref = 0 — то есть e скачком падала на всю
+  // накопленную за разгон величину. Интегратору это и требовалось, но детектор
+  // видит ту же e, и его кольцо ещё 0.9 с держит доперепривязочные значения:
+  // исправный отрезок штатно давал ложный срыв. Замер это подтверждает —
+  // реплей детектора по записанным отрезкам даёт Δmax в 2..4 раза меньше, чем
+  // печатала прошивка, то есть избыток рождался ВНЕ записи.
+  //
+  // Механизм для переноса нуля у интегратора уже есть (e_int_ref, введён ради
+  // реверса). Пользуемся им, а e оставляем непрерывной.
+  sensor.update();
+  e_int_ref = ref - ol * (sensor.getAngle() - a0);
+  U_int = 0.0f;
   armed_tight = true; w_since = 0;
   const uint32_t step_us = 1000000UL / fs_hz;
   uint32_t next = micros();
@@ -1489,6 +1567,7 @@ static void blocks_record(float w) {
   Serial.print(F("% блоки=")); Serial.print(blk);
   Serial.print(F(" срыв=")); Serial.print(slip_bit ? 1 : 0);
   Serial.print(F(" дельта_макс=")); Serial.print(slip_max * 57.2958f, 3);
+  Serial.print(F("° |e|_макс=")); Serial.print(slip_abs_max * 57.2958f, 2);
   Serial.print(F("° NTC=")); Serial.print(ntc_raw());
   Serial.println();
 }
