@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.surftracker.vibelog"
+    android:versionCode="1" android:versionName="1.0">
+  <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="35"/>
+  <uses-permission android:name="android.permission.WAKE_LOCK"/>
+  <!-- Без этого Android 12+ режет частоту сенсоров до 200 Гц (getMinDelay=5000us).
+       Разрешение normal-уровня, выдаётся при установке без запроса. -->
+  <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS"/>
+  <uses-feature android:name="android.hardware.sensor.accelerometer" android:required="true"/>
+  <!-- Отдельное приложение, ничего общего с camfps: только сырой лог
+       акселерометра. Разрешений на хранилище не нужно — пишем в
+       getExternalFilesDir(), оттуда adb pull. -->
+  <application android:label="VibeLog" android:debuggable="true" android:largeHeap="true">
+    <activity android:name=".LogActivity" android:exported="true">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+    </activity>
+  </application>
+</manifest>
