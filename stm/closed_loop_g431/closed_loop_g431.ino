@@ -89,6 +89,7 @@
  * см. ожидание хоста в setup(). Это не зависание.
  */
 #include <SimpleFOC.h>
+#include <string.h>
 #include <CaptureSensor.h>
 
 // ---- что меряем ----------------------------------------------------------
@@ -183,6 +184,38 @@ static float buf[N_SAMP];
 static uint16_t n_filled = 0;   //!< сколько отсчётов реально записано
 static float   duty_buf[1200];
 static uint8_t ok_buf[1200];
+static const uint8_t COG_N = 64;
+static float   cog_tab[COG_N];       //!< ошибка эл. угла, радианы, по фазе ротора
+// ШЕСТЬ ГАРМОНИК, А НЕ ТРИ. Замер 23.08: главная помеха здорового мотора —
+// ШЕСТАЯ гармоника электрического периода (0.061 градуса механических,
+// вчетверо выше следующей), то есть классическая пульсация момента трёхфазной
+// машины. Модель на трёх гармониках объясняла 10% дисперсии профиля, на
+// гармониках 2,3,4,6 — уже 79%.
+//
+// Прежнее отождествление главной помехи с 22-м порядком относилось к мотору с
+// ВЫПАВШЕЙ ФАЗОЙ: там две точки удержания на электрический оборот и порядок
+// действительно 22. На здоровом моторе порядок 66 = 6 x 11.
+static const uint8_t COG_H = 6;
+static float   cog_h[2*COG_H] = {0,0,0,0,0,0,0,0,0,0,0,0};
+static float   cog_G = 1.0f;
+static uint8_t blk = 0;              //!< 1=зубцы, 2=предупр, 4=интеграл, 8=дизер
+static float   ff_u[5] = {0,0,0,0,0};     //!< предуправление в точках ff_w
+static const float ff_w[5] = {0.05f, 0.12f, 0.20f, 0.35f, 0.50f};
+static float   int_Ki = 0.0f, int_clamp = 0.5f, U_int = 0.0f;
+static float   dith_A = 0.0f, dith_f = 25.0f;
+// разложение по слагаемым за отрезок
+static double  acc_base=0, acc_cog=0, acc_ff=0, acc_int=0, acc_dith=0;
+static uint32_t acc_n=0, clamp_n=0;
+static float   fld_angle = 0.0f;     //!< электрический угол ПОЛЯ, наш интегратор
+
+// РАБОЧАЯ ТОЧКА ОТДЕЛЬНО ОТ ПОТОЛКА КЛАМПА.
+//
+// Сперва база бралась равной motor.voltage_limit, то есть стояла ВПЛОТНУЮ к
+// потолку. Тогда любое положительное слагаемое срезается клампом, компенсация
+// проходит только одной полярностью, привод перекашивает — первый же прогон
+// дал кламп 100% и срыв. Слагаемым нужен запас в обе стороны, поэтому база
+// задаётся своей командой (U), а motor.voltage_limit остаётся потолком.
+static float   u_base = 2.5f;
 static float w_meas = 0.0f;      //!< измеренная скорость вала, рад/с (см. guard)
 
 static void blink(uint8_t n, uint16_t ms) {
@@ -963,14 +996,24 @@ static void probe_phases(float u) {
       // звон не осел, оно велико, и замер шага недостоверен — величина должна
       // быть видна рядом с ней самой, а не подразумеваться.
       for (uint16_t i = 0; i < 500; i++) { motor.setPhaseVoltage(u, 0, ang); delay(1); sensor.update(); }
-      float sum = 0.0f, sum2 = 0.0f;
+      // ДИСПЕРСИЯ СЧИТАЕТСЯ ОТ ОПОРНОЙ ТОЧКИ, А НЕ ОТ НУЛЯ ШКАЛЫ.
+      //
+      // Здесь стояло sum2/n - mean^2 по абсолютному углу. При углах порядка
+      // 260 градусов квадраты около 68000, а искомая дисперсия около 0.003 —
+      // в float32 разность тонет целиком, и колонка звона печатала ровно
+      // 0.000. Величина выглядела измеренной, а не мерила ничего. Вычитание
+      // первой точки окна ставит числа в разумный порядок.
+      float sum = 0.0f, sum2 = 0.0f, a_ref = 0.0f;
       for (uint16_t i = 0; i < 500; i++) {
         motor.setPhaseVoltage(u, 0, ang); delay(1); sensor.update();
         const float a = sensor.getAngle() * 57.2958f;
-        sum += a; sum2 += a * a;
+        if (i == 0) a_ref = a;
+        const float dv = a - a_ref;
+        sum += dv; sum2 += dv * dv;
       }
-      const float mean = sum / 500.0f;
-      const float var  = sum2 / 500.0f - mean * mean;
+      const float mean_d = sum / 500.0f;
+      const float mean = a_ref + mean_d;
+      const float var  = sum2 / 500.0f - mean_d * mean_d;
       Serial.print(F("#ФАЗЫ ")); Serial.print(dir > 0 ? '+' : '-');
       Serial.print(' '); Serial.print(k);
       Serial.print(' '); Serial.print(ang, 4);
@@ -1158,6 +1201,174 @@ static void id_closed(float hz) {
   Serial.println(F("#ОТКЛИК_КОНЕЦ"));
 }
 
+#ifndef FW_COMMIT
+#define FW_COMMIT "неизвестен"
+#endif
+
+/** Манифест прогона: чем снято. Без него данные сессии не принимаются —
+ *  правило серии. Печатает коммит прошивки, рабочую точку и все флаги, из
+ *  которых складывается команда на фазы. */
+static void manifest() {
+  Serial.print(F("#МАНИФЕСТ коммит=")); Serial.print(F(FW_COMMIT));
+  Serial.print(F(" U_база=")); Serial.print(u_base, 2);
+  Serial.print(F(" потолок=")); Serial.print(motor.voltage_limit, 2);
+  Serial.print(F(" pp=")); Serial.print(motor.pole_pairs);
+  Serial.print(F(" знак=")); Serial.print(motor.sensor_direction == Direction::CW ? F("CW") : F("CCW"));
+  Serial.print(F(" знак_тяги=")); Serial.print(drive_sign, 0);
+  Serial.print(drive_sign_valid ? F("") : F("(устарел)"));
+  Serial.print(F(" ZEA=")); Serial.print(motor.zero_electric_angle, 5);
+  { float mn = cog_tab[0], mx = cog_tab[0];
+    for (uint8_t i = 1; i < COG_N; i++) { if (cog_tab[i] < mn) mn = cog_tab[i]; if (cog_tab[i] > mx) mx = cog_tab[i]; }
+    Serial.print(F(" зубцы_табл=[")); Serial.print(mn, 5); Serial.print(',');
+    Serial.print(mx, 5); Serial.print(F("] G=")); Serial.print(cog_G, 2); }
+  Serial.print(F(" предупр=")); Serial.print(own_ff, 3);
+  Serial.print(F(" свои_PI=")); Serial.print(own_P, 3); Serial.print('/'); Serial.print(own_I, 3);
+  Serial.print(F(" биб_PI=")); Serial.print(motor.PID_velocity.P, 3);
+  Serial.print('/'); Serial.print(motor.PID_velocity.I, 3);
+  Serial.print(F(" Tf=")); Serial.print(motor.LPF_velocity.Tf, 4);
+  Serial.print(F(" n=")); Serial.print(n_samp);
+  Serial.print(F(" fs=")); Serial.println(fs_hz);
+}
+
+
+// ===========================================================================
+// АДДИТИВНЫЙ ПРИВОД: Uq = U_база + ΔU_зубцы + U_предупр + U_инт + U_дизер
+//
+// ДИСЦИПЛИНА, РАДИ КОТОРОЙ ЭТО НАПИСАНО ОТДЕЛЬНО ОТ БИБЛИОТЕЧНЫХ РЕЖИМОВ:
+//
+//  1. ОДНА ФОРМУЛА КОМАНДЫ. Слагаемые складываются, кламп ОДИН и ПОСЛЕ суммы,
+//     доля клампа считается и печатается. Иначе при странном прогоне не
+//     разобрать, кто именно упёрся.
+//  2. КАЖДОЕ СЛАГАЕМОЕ — ОТДЕЛЬНЫМ ПОЛЕМ ТЕЛЕМЕТРИИ. Среднее каждого пишется
+//     в заголовок отрезка. Это главный приём против «налажать в сборке»:
+//     конфигурация из четырёх блоков без разложения по слагаемым
+//     неотлаживаема.
+//  3. КАЖДЫЙ БЛОК ЗА СВОИМ ФЛАГОМ, любое сочетание валидно, и ВСЕ ВЫКЛ даёт
+//     ровно текущий разомкнутый контур: поле крутится своим интегратором,
+//     Uq = U_база. База остаётся фолбэком навсегда.
+//
+// ПОЛЕ КРУТИМ САМИ, а не через velocityOpenloop, потому что туда нельзя
+// добавить слагаемые к Uq. При всех выключенных блоках это тот же самый
+// закон, и совпадение проверяется прогоном (см. отчёт по блоку 0).
+
+/** Пересобрать таблицу зубцов из гармоник. Считать синусы в цикле управления
+ *  на 33 кГц дорого, а таблица из 64 точек по фазе ротора даёт шаг 5.6
+ *  электрических градусов — на порядок мельче того, что мы компенсируем. */
+static void cog_build() {
+  for (uint8_t i = 0; i < COG_N; i++) {
+    const float ph = _2PI * i / COG_N;
+    float v = 0.0f;
+    for (uint8_t h = 1; h <= COG_H; h++)
+      v += cog_h[2*(h-1)] * cosf(h*ph) + cog_h[2*(h-1)+1] * sinf(h*ph);
+    cog_tab[i] = v;
+  }
+}
+
+/** Фаза ротора в электрической системе, БЕЗ электрического нуля.
+ *  Ноль здесь не нужен: таблица снимается и применяется по одному и тому же
+ *  определению, а какая точка считается началом — безразлично. Зависимость от
+ *  ZEA только добавила бы поводов разъехаться. */
+static inline uint8_t cog_idx() {
+  float ph = sensor.getMechanicalAngle() * motor.pole_pairs;
+  ph -= _2PI * floorf(ph / _2PI);
+  int i = (int)(ph * COG_N / _2PI);
+  return (uint8_t)(i < 0 ? 0 : (i >= COG_N ? COG_N - 1 : i));
+}
+
+/** Предуправление: линейная интерполяция по таблице, за краями — края. */
+static float ff_lookup(float w) {
+  const float a = fabsf(w);
+  if (a <= ff_w[0]) return ff_u[0];
+  for (uint8_t i = 1; i < 5; i++)
+    if (a <= ff_w[i]) {
+      const float t = (a - ff_w[i-1]) / (ff_w[i] - ff_w[i-1]);
+      return ff_u[i-1] + t * (ff_u[i] - ff_u[i-1]);
+    }
+  return ff_u[4];
+}
+
+static void blocks_reset() {
+  U_int = 0.0f;
+  acc_base=acc_cog=acc_ff=acc_int=acc_dith=0; acc_n=0; clamp_n=0;
+}
+
+/** Один такт аддитивного привода. err_pos — ошибка положения в радианах вала
+ *  (уставка минус факт), уже со знаком хода. */
+static float blocks_step(float w, float dt, float t_s, float err_pos) {
+  fld_angle += w * motor.pole_pairs * dt;
+  fld_angle -= _2PI * floorf(fld_angle / _2PI);
+
+  const float ub     = (blk & 2) ? 0.0f : u_base;
+  const float u_ff   = (blk & 2) ? ff_lookup(w) : 0.0f;
+  const float u_cog  = (blk & 1) ? (-cog_G * u_base * cog_tab[cog_idx()]) : 0.0f;
+  if (blk & 4) {
+    U_int += int_Ki * err_pos * dt;
+    U_int = _constrain(U_int, -int_clamp, int_clamp);
+  } else U_int = 0.0f;
+  const float u_int  = (blk & 4) ? U_int : 0.0f;
+  const float u_dith = (blk & 8) ? (dith_A * sinf(_2PI * dith_f * t_s)) : 0.0f;
+
+  float u = ub + u_ff + u_cog + u_int + u_dith;
+  const float lim = motor.voltage_limit;
+  if (u > lim || u < -lim) { clamp_n++; u = _constrain(u, -lim, lim); }
+
+  acc_base += ub; acc_cog += u_cog; acc_ff += u_ff;
+  acc_int += u_int; acc_dith += u_dith; acc_n++;
+
+  motor.setPhaseVoltage(u, 0, fld_angle);
+  return u;
+}
+
+/** Отрезок под аддитивным приводом: установление рампой, потом запись. */
+static void blocks_record(float w) {
+  guard_reset(); blocks_reset(); n_filled = 0;
+  motor.enable();
+  motor.controller = MotionControlType::torque;   // move() не используем
+  const float ol = (motor.sensor_direction == Direction::CW) ? 1.0f : -1.0f;
+  sensor.update();
+  float a0 = sensor.getAngle(), ref = 0.0f, wr = 0.0f;
+  uint32_t prev = micros();
+  const uint32_t t0 = millis();
+  const uint32_t tus0 = micros();
+  while (!bailed && (millis() - t0 < SETTLE_MS || fabsf(wr - w) > 1e-6f)) {
+    const uint32_t now = micros(); float dt = (now - prev) * 1e-6f; prev = now;
+    if (dt < 0 || dt > 0.05f) dt = 0;
+    const float st = 0.2f * dt;
+    if (wr < w) wr = min(wr + st, w); else if (wr > w) wr = max(wr - st, w);
+    sensor.update();
+    ref += wr * dt;
+    blocks_step(wr, dt, (now - tus0) * 1e-6f, ref - ol * (sensor.getAngle() - a0));
+  }
+  // Ошибка положения считается ОТ КОНЦА УСТАНОВЛЕНИЯ: то, что накопилось за
+  // разгон, к плавности отношения не имеет и только загнало бы интегратор.
+  sensor.update(); a0 = sensor.getAngle(); ref = 0.0f; U_int = 0.0f;
+  armed_tight = true; w_since = 0;
+  const uint32_t step_us = 1000000UL / fs_hz;
+  uint32_t next = micros();
+  for (uint16_t i = 0; i < n_samp && !bailed; i++) {
+    while ((int32_t)(micros() - next) < 0 && !bailed) {
+      const uint32_t now = micros(); float dt = (now - prev) * 1e-6f; prev = now;
+      if (dt < 0 || dt > 0.05f) dt = 0;
+      sensor.update();
+      ref += w * dt;
+      blocks_step(w, dt, (now - tus0) * 1e-6f, ref - ol * (sensor.getAngle() - a0));
+      guard(false);
+    }
+    next += step_us;
+    buf[i] = sensor.getAngle();
+    n_filled = i + 1;
+  }
+  motor.setPhaseVoltage(0, 0, fld_angle);
+  const double n = acc_n ? (double)acc_n : 1.0;
+  Serial.print(F("#СЛАГАЕМЫЕ база=")); Serial.print((float)(acc_base/n), 3);
+  Serial.print(F(" зубцы=")); Serial.print((float)(acc_cog/n), 4);
+  Serial.print(F(" предупр=")); Serial.print((float)(acc_ff/n), 3);
+  Serial.print(F(" интеграл=")); Serial.print((float)(acc_int/n), 3);
+  Serial.print(F(" дизер=")); Serial.print((float)(acc_dith/n), 3);
+  Serial.print(F(" кламп=")); Serial.print((float)(100.0*clamp_n/n), 1);
+  Serial.print(F("% блоки=")); Serial.println(blk);
+}
+
 static void status() {
   const CaptureStatus &st = sensor.lastStatus();
   Serial.print(F("#СОСТ V=")); Serial.print(motor.voltage_limit, 2);
@@ -1240,7 +1451,16 @@ void loop() {
       if (!n) continue;
       cmd[n] = 0; n = 0;
       const char k = cmd[0];
-      const float a = atof(cmd + 1);
+      // РАЗБОР ДВУХ ЧИСЕЛ. Здесь стояло strchr(cmd+1, ' '), и это было неверно:
+      // в «y 0 0.00042» первый пробел идёт СРАЗУ ЗА БУКВОЙ, поэтому «вторым
+      // числом» бралось первое, а настоящее второе не читалось вовсе — все
+      // коэффициенты таблицы молча уходили в ноль. Сперва пропускаем пробелы,
+      // потом ищем разделитель ПОСЛЕ первого числа.
+      const char *p1 = cmd + 1; while (*p1 == ' ') p1++;
+      const float a = atof(p1);
+      const char *p2 = p1; while (*p2 && *p2 != ' ') p2++;
+      while (*p2 == ' ') p2++;
+      const float a2 = *p2 ? atof(p2) : 0.0f;
       switch (k) {
         case 'F': motor.disable(); record(false, false, 0.0f); dump("пол", false, 0.0f); break;
         case 'O': motor.enable(); motor.controller = MotionControlType::velocity_openloop;
@@ -1303,6 +1523,22 @@ void loop() {
         case 'K': drive_sign_valid = false; motor.pole_pairs = (int)(a + 0.5f);
                   Serial.print(F("#pp=")); Serial.println(motor.pole_pairs); break;
         case '?': status(); break;
+        case 'm': manifest(); break;
+        // --- аддитивный привод ---
+        case 'U': u_base = a; Serial.print(F("#U_база=")); Serial.println(u_base, 3); break;
+        case 'b': blk = (uint8_t)a; Serial.print(F("#блоки=")); Serial.println(blk); break;
+        case 'y': { const int i = (int)a;            // y <0..11> <значение>
+                    if (i >= 0 && i < 2*COG_H) { cog_h[i] = a2; cog_build(); Serial.println(F("#ok")); }
+                    else Serial.println(F("#? индекс 0..11")); } break;
+        case 's': cog_G = a; Serial.print(F("#G=")); Serial.println(cog_G, 3); break;
+        case 'j': { const int i = (int)a;            // j <0..4> <вольты>
+                    if (i >= 0 && i < 5) { ff_u[i] = a2; Serial.println(F("#ok")); }
+                    else Serial.println(F("#? индекс 0..4")); } break;
+        case 'l': int_Ki = a; Serial.print(F("#Ki=")); Serial.println(int_Ki, 4); break;
+        case 'o': int_clamp = a; Serial.println(F("#ok")); break;
+        case 'c': dith_A = a; Serial.println(F("#ok")); break;
+        case 'q': dith_f = a; Serial.println(F("#ok")); break;
+        case 'z': blocks_record(a); dump("блоки", true, a); break;
         default: Serial.println(F("#? неизвестная команда"));
       }
       Serial.println(F("#ГОТОВ"));

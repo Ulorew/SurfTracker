@@ -93,8 +93,21 @@ echo "== сборка $1 (SimpleFOC $FOCV) =="
 # прошлой удачной сборки.
 OUT="$SKETCH/build"
 rm -rf "$OUT"
-"$CLI" compile -b "$FQBN" --output-dir "$OUT" "$SKETCH" 2>&1 \
+# КОММИТ ЗАШИВАЕТСЯ В ПРОШИВКУ. Манифест прогона обязан называть код, которым
+# он снят; иначе через день не отличить, какой сборкой получено число.
+COMMIT=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo "нет")
+DIRTY=$(git -C "$ROOT" diff --quiet 2>/dev/null && echo "" || echo "+грязь")
+"$CLI" compile -b "$FQBN" --output-dir "$OUT" \
+    --build-property "compiler.cpp.extra_flags=-DFW_COMMIT=\"$COMMIT$DIRTY\"" \
+    "$SKETCH" 2>&1 \
     | grep -vE "^$|pragma message|note:|\^" | tail -6
+# ОШИБКА КОМПИЛЯЦИИ ОБЯЗАНА БЫТЬ ВИДНА. Фильтр выше режет шум, но вместе с ним
+# резал и строки error: — сборка падала, а причина не печаталась вовсе, и
+# приходилось компилировать вручную, чтобы её увидеть.
+if [ ! -s "$OUT/$(basename "$SKETCH").ino.bin" ]; then
+    echo "--- ошибки компиляции ---"
+    "$CLI" compile -b "$FQBN" "$SKETCH" 2>&1 | grep -E "error:" | head -10
+fi
 BIN="$OUT/$(basename "$SKETCH").ino.bin"
 [ -s "$BIN" ] || { echo "ОТКАЗ: бинарь не собрался ($BIN)"; exit 1; }
 echo "  бинарь: $BIN ($(stat -c %s "$BIN") байт)"
@@ -114,5 +127,20 @@ if [ "${2:-}" = "--прошить" ]; then
     # подтверждении, а сообщение выглядело как ошибка ввода пользователя.
     read -r answer
     [ "$answer" = "да" ] || { echo "отменено"; exit 1; }
-    "$CLI" upload -b "$FQBN" --input-dir "$OUT" "$SKETCH" 2>&1 | tail -4
+    # ДВА ПУТИ ЗАЛИВКИ. Штатный идёт через массовое хранилище DIS_G431CB, и он
+    # ломается молча, когда автомонтирование не сработало: «Failed uploading,
+    # exit status 3», а на плате остаётся ПРЕЖНЯЯ прошивка. Это опаснее, чем
+    # отказ: следующий прогон выглядит нормальным, но снят другим кодом.
+    # Поэтому при неудаче пробуем ST-LINK, а если и он не смог — падаем.
+    if ! "$CLI" upload -b "$FQBN" --input-dir "$OUT" "$SKETCH" 2>&1 | tail -4; then :; fi
+    if ! mountpoint -q /media/*/DIS_G431CB 2>/dev/null; then
+        OCD=$(ls "$HOME"/.arduino15/packages/STMicroelectronics/tools/xpack-openocd/*/bin/openocd 2>/dev/null | head -1)
+        if [ -x "$OCD" ]; then
+            echo "== массовое хранилище не смонтировано, заливаю через ST-LINK =="
+            SCR="$(dirname "$(dirname "$OCD")")/openocd/scripts"
+            "$OCD" -s "$SCR" -f interface/stlink.cfg -f target/stm32g4x.cfg \
+                -c "program $OUT/$(basename "$SKETCH").ino.elf verify reset exit" 2>&1 \
+                | grep -E "Verified|Error|error" | tail -3
+        fi
+    fi
 fi
