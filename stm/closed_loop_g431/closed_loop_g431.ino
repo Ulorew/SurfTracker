@@ -202,10 +202,69 @@ static uint8_t blk = 0;              //!< 1=зубцы, 2=предупр, 4=ин
 static float   ff_u[5] = {0,0,0,0,0};     //!< предуправление в точках ff_w
 static const float ff_w[5] = {0.05f, 0.12f, 0.20f, 0.35f, 0.50f};
 static float   int_Ki = 0.0f, int_clamp = 0.5f, U_int = 0.0f;
+// СБРОСЫ У ИНТЕГРАТОРА И ДЕТЕКТОРА РАЗНЫЕ, ХОТЯ НАКОПИТЕЛЬ ОДИН.
+//
+// Спецификация требует сбрасывать ошибку интегратора при смене знака уставки
+// (иначе накопленное на прямом ходу гонит вал на обратном). Детектор при этом
+// сбрасываться НЕ ДОЛЖЕН: срыв на реверсе — реальный случай, и общий сброс его
+// замаскировал бы.
+//
+// Поэтому сама e не сбрасывается никогда, а своя нулевая точка есть только у
+// интегратора: он работает с (e - e_int_ref). Детектор читает сырую e. Так
+// накопитель остаётся один, а поведение при реверсе — разное.
+static float   e_int_ref = 0.0f;
+static float   last_wsgn = 0.0f;
 static float   dith_A = 0.0f, dith_f = 25.0f;
 // разложение по слагаемым за отрезок
 static double  acc_base=0, acc_cog=0, acc_ff=0, acc_int=0, acc_dith=0;
 static uint32_t acc_n=0, clamp_n=0;
+// ===========================================================================
+// ДЕТЕКТОР СРЫВА
+//
+// ОДИН НАКОПИТЕЛЬ, ДВА ПОРОГА. Ошибка положения e = интеграл уставки минус
+// пройденный угол — та же самая величина, что кормит интегратор блока 2.
+// Отдельная реализация для детектора неминуемо разъехалась бы с ней по знаку,
+// по точке обнуления или по единицам; поэтому e считается один раз в
+// blocks_step, а детектор лишь читает её со своим порогом.
+//
+// ОКНО, А НЕ АБСОЛЮТНАЯ ОШИБКА. Срыв — это внезапная потеря, а не медленный
+// уход: без окна детектор при выключенном интеграторе срабатывал бы на любом
+// накопленном рассогласовании. Сравнивается e с её значением секунду назад.
+//
+// ПОРОГ 1.5 градуса. На прежнем тракте (шум 0.72..0.91 град) он был бы
+// неотличим от шума и стоял 3 град; на тракте захвата шум 0.046 град, то есть
+// порог выше него в тридцать раз, а шага полюса (32.7 град) не достигает и
+// вдвадцатеро — срыв на полюс поймается заведомо.
+static const uint8_t SLIP_SLOTS = 10;        // 10 x 100 мс = окно 1 с
+static float   slip_ring[SLIP_SLOTS];
+static uint8_t slip_head = 0;
+static uint32_t slip_t_last = 0;
+static bool    slip_ready = false;
+static bool    slip_bit = false;             // защёлкивается до сброса
+static float   slip_thr = 1.5f / 57.2958f;   // радианы вала
+static float   slip_max = 0.0f;              // наибольшая |дельта| за отрезок
+
+static void slip_reset() {
+  for (uint8_t i = 0; i < SLIP_SLOTS; i++) slip_ring[i] = 0.0f;
+  slip_head = 0; slip_ready = false; slip_bit = false; slip_max = 0.0f;
+  slip_t_last = millis();
+}
+
+/** Читает ту же e, что и интегратор. Возвращает текущую дельту за окно. */
+static float slip_check(float e, uint32_t now) {
+  if (now - slip_t_last >= 100) {
+    slip_t_last = now;
+    slip_ring[slip_head] = e;
+    slip_head = (uint8_t)((slip_head + 1) % SLIP_SLOTS);
+    if (slip_head == 0) slip_ready = true;
+  }
+  if (!slip_ready) return 0.0f;
+  const float d = e - slip_ring[slip_head];   // значение секунду назад
+  if (fabsf(d) > slip_max) slip_max = fabsf(d);
+  if (fabsf(d) > slip_thr) slip_bit = true;
+  return d;
+}
+
 static float   fld_angle = 0.0f;     //!< электрический угол ПОЛЯ, наш интегратор
 
 // РАБОЧАЯ ТОЧКА ОТДЕЛЬНО ОТ ПОТОЛКА КЛАМПА.
@@ -1288,12 +1347,20 @@ static float ff_lookup(float w) {
 }
 
 static void blocks_reset() {
-  U_int = 0.0f;
+  U_int = 0.0f; e_int_ref = 0.0f; last_wsgn = 0.0f; slip_reset();
   acc_base=acc_cog=acc_ff=acc_int=acc_dith=0; acc_n=0; clamp_n=0;
 }
 
-/** Один такт аддитивного привода. err_pos — ошибка положения в радианах вала
- *  (уставка минус факт), уже со знаком хода. */
+/** Один такт аддитивного привода.
+ *
+ *  err_pos — ошибка положения в радианах вала, В НЕПОДВИЖНОЙ СИСТЕМЕ: уставка
+ *  минус пройденный угол, без нормировки знаком хода. Нормировка применяется
+ *  ВНУТРИ, и только к входу интегратора.
+ *
+ *  ПОЧЕМУ ТАК, А НЕ НОРМИРОВАТЬ СНАРУЖИ. Нормированная знаком величина при
+ *  реверсе меняет смысл скачком, и детектор срыва увидел бы этот скачок как
+ *  срыв — то есть реверс порождал бы ложную тревогу, а настоящий срыв на
+ *  реверсе тонул бы в ней. Детектору нужна непрерывная величина. */
 static float blocks_step(float w, float dt, float t_s, float err_pos) {
   fld_angle += w * motor.pole_pairs * dt;
   fld_angle -= _2PI * floorf(fld_angle / _2PI);
@@ -1307,11 +1374,18 @@ static float blocks_step(float w, float dt, float t_s, float err_pos) {
   // потому что оно задаёт жёсткость удержания.
   const float u_drv  = ub + u_ff;
   const float u_cog  = (blk & 1) ? (-cog_G * u_drv * cog_tab[cog_idx()]) : 0.0f;
+  const float wsgn_now = (w >= 0.0f) ? 1.0f : ((w < 0.0f) ? -1.0f : 0.0f);
+  if (wsgn_now != 0.0f && last_wsgn != 0.0f && wsgn_now != last_wsgn) {
+    e_int_ref = err_pos;   // нулевая точка ИНТЕГРАТОРА, детектор не трогаем
+    U_int = 0.0f;
+  }
+  if (wsgn_now != 0.0f) last_wsgn = wsgn_now;
   if (blk & 4) {
-    U_int += int_Ki * err_pos * dt;
+    U_int += int_Ki * wsgn_now * (err_pos - e_int_ref) * dt;
     U_int = _constrain(U_int, -int_clamp, int_clamp);
   } else U_int = 0.0f;
   const float u_int  = (blk & 4) ? U_int : 0.0f;
+  slip_check(err_pos, millis());
   const float u_dith = (blk & 8) ? (dith_A * sinf(_2PI * dith_f * t_s)) : 0.0f;
 
   float u = ub + u_ff + u_cog + u_int + u_dith;
@@ -1344,11 +1418,6 @@ static void blocks_record(float w) {
     return;
   }
   const float ol = (motor.sensor_direction == Direction::CW) ? 1.0f : -1.0f;
-  // ЗНАК ХОДА. Ошибка положения задавалась как ref - ol*(угол - a0), где ref
-  // растёт со знаком уставки. На ОБРАТНОМ ходу это делало обратную связь
-  // положительной: интегратор гнал бы ошибку вместо того, чтобы её убирать.
-  // Приводим ошибку к «положительная = отстаём», умножая на знак уставки.
-  const float wsgn = (w >= 0.0f) ? 1.0f : -1.0f;
   sensor.update();
   float a0 = sensor.getAngle(), ref = 0.0f, wr = 0.0f;
   uint32_t prev = micros();
@@ -1361,7 +1430,7 @@ static void blocks_record(float w) {
     if (wr < w) wr = min(wr + st, w); else if (wr > w) wr = max(wr - st, w);
     sensor.update();
     ref += wr * dt;
-    blocks_step(wr, dt, (now - tus0) * 1e-6f, wsgn * (ref - ol * (sensor.getAngle() - a0)));
+    blocks_step(wr, dt, (now - tus0) * 1e-6f, ref - ol * (sensor.getAngle() - a0));
   }
   // Ошибка положения считается ОТ КОНЦА УСТАНОВЛЕНИЯ: то, что накопилось за
   // разгон, к плавности отношения не имеет и только загнало бы интегратор.
@@ -1375,7 +1444,7 @@ static void blocks_record(float w) {
       if (dt < 0 || dt > 0.05f) dt = 0;
       sensor.update();
       ref += w * dt;
-      blocks_step(w, dt, (now - tus0) * 1e-6f, wsgn * (ref - ol * (sensor.getAngle() - a0)));
+      blocks_step(w, dt, (now - tus0) * 1e-6f, ref - ol * (sensor.getAngle() - a0));
       guard(false);
     }
     next += step_us;
@@ -1390,7 +1459,56 @@ static void blocks_record(float w) {
   Serial.print(F(" интеграл=")); Serial.print((float)(acc_int/n), 3);
   Serial.print(F(" дизер=")); Serial.print((float)(acc_dith/n), 3);
   Serial.print(F(" кламп=")); Serial.print((float)(100.0*clamp_n/n), 1);
-  Serial.print(F("% блоки=")); Serial.println(blk);
+  Serial.print(F("% блоки=")); Serial.print(blk);
+  Serial.print(F(" срыв=")); Serial.print(slip_bit ? 1 : 0);
+  Serial.print(F(" дельта_макс=")); Serial.print(slip_max * 57.2958f, 3);
+  Serial.println(F("°"));
+}
+
+/** Живой тест детектора: едем и печатаем состояние, пока оператор придерживает
+ *  вал рукой. Двадцать пять секунд — этого хватает, чтобы успеть придержать и
+ *  отпустить, и видно, за сколько бит поднялся. */
+static void slip_live(float w) {
+  if (motor.sensor_direction == Direction::UNKNOWN) {
+    Serial.println(F("#ОТКАЗ направление не измерено: сперва D<скорость>")); return;
+  }
+  guard_reset(); blocks_reset();
+  motor.enable(); motor.controller = MotionControlType::torque;
+  const float ol = (motor.sensor_direction == Direction::CW) ? 1.0f : -1.0f;
+  sensor.update();
+  float a0 = sensor.getAngle(), ref = 0.0f, wr = 0.0f;
+  uint32_t prev = micros();
+  const uint32_t t0 = millis(), tus0 = micros();
+  uint32_t next_pr = t0 + 500;
+  Serial.println(F("#СРЫВ_ТЕСТ 25 с, на 12-й секунде РЕВЕРС уставки."));
+  Serial.println(F("#СРЫВ Придержите вал рукой в любой момент, потом отпустите."));
+  Serial.println(F("#СРЫВ колонки: мс ошибка_град дельта_град бит"));
+  while (millis() - t0 < 25000 && !bailed) {
+    const uint32_t now = micros(); float dt = (now - prev) * 1e-6f; prev = now;
+    if (dt < 0 || dt > 0.05f) dt = 0;
+    // РЕВЕРС ПОСРЕДИ ПРОГОНА. Смена знака уставки сбрасывает нулевую точку
+    // интегратора, и надо видеть, что детектор при этом НЕ сбрасывается.
+    const float w_now = (millis() - t0 < 12000) ? w : -w;
+    const float st = 0.2f * dt;
+    if (wr < w_now) wr = min(wr + st, w_now); else if (wr > w_now) wr = max(wr - st, w_now);
+    sensor.update();
+    ref += wr * dt;
+    const float e = ref - ol * (sensor.getAngle() - a0);
+    blocks_step(wr, dt, (now - tus0) * 1e-6f, e);
+    guard(false);
+    if ((int32_t)(millis() - next_pr) >= 0) {
+      next_pr += 500;
+      Serial.print(F("#СРЫВ ")); Serial.print(millis() - t0);
+      Serial.print(' '); Serial.print(e * 57.2958f, 3);
+      Serial.print(' '); Serial.print(slip_check(e, millis()) * 57.2958f, 3);
+      Serial.print(' '); Serial.println(slip_bit ? 1 : 0);
+    }
+  }
+  motor.setPhaseVoltage(0, 0, fld_angle); motor.disable(); delay(200); motor.enable();
+  Serial.print(F("#СРЫВ_ИТОГ бит=")); Serial.print(slip_bit ? 1 : 0);
+  Serial.print(F(" дельта_макс=")); Serial.print(slip_max * 57.2958f, 3);
+  Serial.print(F("° порог=")); Serial.print(slip_thr * 57.2958f, 2);
+  Serial.println(F("°"));
 }
 
 static void status() {
@@ -1563,6 +1681,8 @@ void loop() {
         case 'c': dith_A = a; Serial.println(F("#ok")); break;
         case 'q': dith_f = a; Serial.println(F("#ok")); break;
         case 'z': blocks_record(a); dump("блоки", true, a); break;
+        case 'n': slip_live(a); break;
+        case 't': slip_thr = a / 57.2958f; Serial.print(F("#порог_срыва=")); Serial.println(a, 2); break;
         default: Serial.println(F("#? неизвестная команда"));
       }
       Serial.println(F("#ГОТОВ"));
