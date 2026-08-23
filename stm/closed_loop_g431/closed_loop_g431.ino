@@ -199,8 +199,13 @@ static const uint8_t COG_H = 6;
 static float   cog_h[2*COG_H] = {0,0,0,0,0,0,0,0,0,0,0,0};
 static float   cog_G = 1.0f;
 static uint8_t blk = 0;              //!< 1=зубцы, 2=предупр, 4=интеграл, 8=дизер
-static float   ff_u[5] = {0,0,0,0,0};     //!< предуправление в точках ff_w
-static const float ff_w[5] = {0.05f, 0.12f, 0.20f, 0.35f, 0.50f};
+// УЗЕЛ НА НУЛЕ ДОБАВЛЕН. Прежде нижним узлом был 0.05, а всё ниже получало
+// плато — то есть зона, через которую КАЖДЫЙ отрезок проходит на рампе
+// разгона, была ненастраиваемой в принципе, и несколько разных скоростей
+// получали одно напряжение. На плоской таблице этого не было видно вовсе.
+static const uint8_t FF_N = 6;
+static float   ff_u[FF_N] = {0,0,0,0,0,0};
+static const float ff_w[FF_N] = {0.0f, 0.05f, 0.12f, 0.20f, 0.35f, 0.50f};
 static float   int_Ki = 0.0f, int_clamp = 0.5f, U_int = 0.0f;
 // СБРОСЫ У ИНТЕГРАТОРА И ДЕТЕКТОРА РАЗНЫЕ, ХОТЯ НАКОПИТЕЛЬ ОДИН.
 //
@@ -1430,14 +1435,19 @@ static inline uint8_t cog_idx() {
 
 /** Предуправление: линейная интерполяция по таблице, за краями — края. */
 static float ff_lookup(float w) {
+  // NaN И БЕСКОНЕЧНОСТЬ ОТСЕКАЮТСЯ ЯВНО. Без этой строки все сравнения с NaN
+  // ложны, цикл добегает до конца и возвращает ВЕРХНЕЕ значение таблицы — то
+  // есть худший из возможных ответов на испорченный вход. На плоской таблице
+  // это было неотличимо от нормы, потому что все узлы равны.
+  if (!(w == w) || fabsf(w) > 1e6f) return ff_u[0];
   const float a = fabsf(w);
   if (a <= ff_w[0]) return ff_u[0];
-  for (uint8_t i = 1; i < 5; i++)
+  for (uint8_t i = 1; i < FF_N; i++)
     if (a <= ff_w[i]) {
       const float t = (a - ff_w[i-1]) / (ff_w[i] - ff_w[i-1]);
       return ff_u[i-1] + t * (ff_u[i] - ff_u[i-1]);
     }
-  return ff_u[4];
+  return ff_u[FF_N-1];
 }
 
 static void blocks_reset() {
@@ -1780,9 +1790,9 @@ void loop() {
                     if (i >= 0 && i < 2*COG_H) { cog_h[i] = a2; cog_build(); Serial.println(F("#ok")); }
                     else Serial.println(F("#? индекс 0..11")); } break;
         case 's': cog_G = a; Serial.print(F("#G=")); Serial.println(cog_G, 3); break;
-        case 'j': { const int i = (int)a;            // j <0..4> <вольты>
-                    if (i >= 0 && i < 5) { ff_u[i] = a2; Serial.println(F("#ok")); }
-                    else Serial.println(F("#? индекс 0..4")); } break;
+        case 'j': { const int i = (int)a;            // j <0..5> <вольты>
+                    if (i >= 0 && i < FF_N) { ff_u[i] = a2; Serial.println(F("#ok")); }
+                    else Serial.println(F("#? индекс 0..5")); } break;
         case 'l': int_Ki = a; Serial.print(F("#Ki=")); Serial.println(int_Ki, 4); break;
         case 'o': int_clamp = a; Serial.println(F("#ok")); break;
         case 'c': dith_A = a; Serial.println(F("#ok")); break;
