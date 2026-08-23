@@ -165,6 +165,15 @@ BLDCDriver6PWM driver = BLDCDriver6PWM(A_PHASE_UH, A_PHASE_UL,
 static uint16_t n_samp;
 static uint16_t fs_hz;
 static float buf[N_SAMP];
+// СВЕРКА ДВУХ ТРАКТОВ. Старая лестница (runs/ladder_*.csv) считала угол ПРЯМО
+// из скважности и показала отклонение от команды 0.3..1.1 градуса СКО, а
+// сегодняшние записи через CaptureSensor — 4.8..5.1 на тех же скоростях и том
+// же напряжении. Разница всемеро. Класс на забракованном чтении возвращает
+// ПОСЛЕДНИЙ ГОДНЫЙ угол, поэтому пачка браковок выглядит как «вал стоял, потом
+// прыгнул». Здесь обе величины пишутся ОДНОВРЕМЕННО, чтобы различить свойство
+// стенда и свойство прибора.
+static float   duty_buf[1200];
+static uint8_t ok_buf[1200];
 static float w_meas = 0.0f;      //!< измеренная скорость вала, рад/с (см. guard)
 
 static void blink(uint8_t n, uint16_t ms) {
@@ -800,6 +809,83 @@ static void diag_vel(float w, uint16_t n) {
   motor.move(0.0f); Serial.println(F("#ВЕЛ_КОНЕЦ"));
 }
 
+/** Разомкнутый ход с записью ОБОИХ трактов: угол класса и сырая скважность. */
+static void record_both(float w) {
+  guard_reset();
+  motor.enable();
+  motor.controller = MotionControlType::velocity_openloop;
+  const uint16_t n = min(n_samp, (uint16_t)1200);
+  const uint32_t step_us = 1000000UL / fs_hz;
+  float wr = 0.0f; uint32_t prev = micros();
+  const uint32_t t0 = millis();
+  while (millis() - t0 < SETTLE_MS || fabsf(wr - w) > 1e-4f) {
+    const uint32_t now = micros(); float dt = (now - prev) * 1e-6f; prev = now;
+    if (dt < 0 || dt > 0.05f) dt = 0;
+    float st = 0.2f * dt;
+    if (wr < w) wr = min(wr + st, w); else if (wr > w) wr = max(wr - st, w);
+    motor.loopFOC(); motor.move(wr); guard(false);
+  }
+  uint32_t next = micros();
+  for (uint16_t i = 0; i < n; i++) {
+    while ((int32_t)(micros() - next) < 0) { motor.loopFOC(); motor.move(wr); guard(false); }
+    next += step_us;
+    const CaptureStatus &st = sensor.lastStatus();
+    buf[i]      = sensor.getAngle();
+    duty_buf[i] = st.period ? (float)st.high / (float)st.period : 0.0f;
+    ok_buf[i]   = st.ok ? 1 : 0;
+  }
+  motor.move(0.0f);
+  Serial.print(F("#ОБА w=")); Serial.print(w, 4);
+  Serial.print(F(" n=")); Serial.print(n);
+  Serial.print(F(" fs=")); Serial.print(fs_hz);
+  Serial.println(F("  колонки: угол_класса скважность годен"));
+  for (uint16_t i = 0; i < n; i++) {
+    Serial.print(buf[i], 5); Serial.print(' ');
+    Serial.print(duty_buf[i], 6); Serial.print(' ');
+    Serial.println(ok_buf[i]);
+  }
+  Serial.println(F("#ОБА_КОНЕЦ"));
+}
+
+/**
+ * СТАТИЧЕСКАЯ ПРОВЕРКА ФАЗ: шаг по электрическому углу, без вращения.
+ *
+ * ЗАЧЕМ. Признаки, снятые 23.08, складываются в неисправность, а не в задачу
+ * управления: тяга есть лишь в 1-2 сдвигах нуля из 12 (у исправного мотора
+ * тянет половина круга), вал не берёт 0.5 и 1.0 рад/с даже на 2.0 В, а на
+ * малой скорости идёт срывами. Так выглядит выпавшая или ослабленная фаза.
+ *
+ * ПОЧЕМУ БЕЗ ВРАЩЕНИЯ. Все прежние пробы включали движение, а движение
+ * добавляет к картине трение, инерцию и срыв синхронизма — три причины, по
+ * которым вал может не поехать при исправных фазах. Здесь поле стоит: угол
+ * задаётся, вал притягивается к нему и удерживается. Исправный мотор пройдёт
+ * ровно один шаг полюса за электрический оборот, равными долями. Мёртвый
+ * сектор виден как участок, где вал не сдвинулся вовсе.
+ *
+ * Датчик здесь только СВИДЕТЕЛЬ: угол поля задаётся нами, а не считается из
+ * показаний, поэтому проверка не зависит ни от электрического нуля, ни от
+ * знака, ни от числа пар полюсов.
+ */
+static void probe_phases(float u) {
+  motor.enable();
+  motor.controller = MotionControlType::torque;
+  const uint8_t N = 24;
+  Serial.print(F("#ФАЗЫ U=")); Serial.print(u, 2);
+  Serial.println(F("  колонки: шаг угол_эл угол_вала_град"));
+  // Сперва подтягиваем вал к первой точке подольше, иначе первый шаг вберёт
+  // в себя весь путь от произвольного начального положения.
+  for (uint16_t i = 0; i < 500; i++) { motor.setPhaseVoltage(u, 0, 0.0f); delay(1); sensor.update(); }
+  for (uint8_t k = 0; k < N + 1; k++) {
+    const float ang = _2PI * k / N;
+    for (uint16_t i = 0; i < 250; i++) { motor.setPhaseVoltage(u, 0, ang); delay(1); sensor.update(); }
+    Serial.print(F("#ФАЗЫ ")); Serial.print(k);
+    Serial.print(' '); Serial.print(ang, 4);
+    Serial.print(' '); Serial.println(sensor.getAngle() * 57.2958f, 3);
+  }
+  motor.setPhaseVoltage(0, 0, 0); motor.disable(); delay(200); motor.enable();
+  Serial.println(F("#ФАЗЫ_КОНЕЦ"));
+}
+
 static void status() {
   const CaptureStatus &st = sensor.lastStatus();
   Serial.print(F("#СОСТ V=")); Serial.print(motor.voltage_limit, 2);
@@ -908,6 +994,8 @@ void loop() {
         case 'X': motor.move(0.0f); motor.disable(); Serial.println(F("#стоп")); break;
         case 'Y': diag_torque(a, 300); break;
         case 'M': diag_vel(a, 400); break;
+        case 'R': record_both(a); break;
+        case 'E': probe_phases(a); break;
         case 'Q': own_record(a); dump("свой", true, a); break;
         case 'H': pos_record(a); dump("позиция", true, a); break;
         case 'h': pos_P = a; Serial.println(F("#ok")); break;
