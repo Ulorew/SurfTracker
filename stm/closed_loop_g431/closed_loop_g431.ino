@@ -339,6 +339,14 @@ static float   slip_e0 = 0.0f;
 static bool    slip_e0_set = false;
 static float   slip_abs_max = 0.0f;
 
+/** Перепривязать точку отсчёта АБСОЛЮТНОГО порога, не трогая окно и не сбрасывая
+ *  защёлку. Нужна после установления: во время разгона ошибка положения гуляет
+ *  на десяток градусов, и точка отсчёта, взятая там, даёт ложный срыв ещё до
+ *  начала записи — замерено, бит стоял уже на 500-й мс. Оконный порог этим не
+ *  затронут: он сравнивает с состоянием секундной давности и разгон переживает. */
+static void slip_anchor() { slip_e0_set = false; }
+
+static void slip_reset();
 static void slip_reset() {
   for (uint8_t i = 0; i < SLIP_SLOTS; i++) slip_ring[i] = 0.0f;
   slip_head = 0; slip_ready = false; slip_bit = false; slip_max = 0.0f;
@@ -506,6 +514,11 @@ static float uq_min = 0.0f, uq_max = 0.0f, uq_sum = 0.0f;
  *  секунды: не сбросив окно, первую измеренную скорость мы посчитали бы через
  *  всю паузу, а выдержки — от событий прошлого отрезка. */
 static void guard_reset() {
+  // СБРОС ДЕТЕКТОРА ЖИВЁТ ЗДЕСЬ, а не в blocks_reset. Прежде он звался только
+  // из аддитивного привода, и в замкнутом контуре (путь через record) состояние
+  // детектора переносилось МЕЖДУ ОТРЕЗКАМИ: бит оставался защёлкнутым с прошлого
+  // прогона, а дельта_макс и e_макс печатались одни и те же в разных прогонах.
+  slip_reset();
   w_since = 0; win_have = false; g_calls = 0; g_sat = 0;
   w_peak = 0.0f; w_peak_settle = 0.0f; armed_tight = false; w_meas = 0.0f;
   bailed = false;
@@ -718,6 +731,16 @@ static float probe_zea(Direction dir, float off, float w) {
 static void record(bool drive, bool closed, float w) {
   guard_reset();
   n_filled = 0;
+  // ДЕТЕКТОР СРЫВА ЖИВЁТ И ЗДЕСЬ. Прежде slip_check звался только из
+  // blocks_step, то есть в замкнутом контуре (команда C, путь через record)
+  // детектор не работал ВОВСЕ — а заголовок отрезка исправно печатал «срыв=0»,
+  // и это читалось как «срывов не было». Ошибка положения считается тем же
+  // способом, что и в аддитивном приводе: интеграл уставки минус пройденный
+  // угол, в неподвижной системе.
+  const bool trackable = drive && (motor.sensor_direction != Direction::UNKNOWN);
+  const float ol = (motor.sensor_direction == Direction::CW) ? 1.0f : -1.0f;
+  float e_a0 = 0.0f, e_ref = 0.0f;
+  if (trackable) { sensor.update(); e_a0 = sensor.getAngle(); }
   const uint32_t step_us = 1000000UL / fs_hz;
   float w_ramp = 0.0f;
   uint32_t prev = micros();
@@ -734,6 +757,8 @@ static void record(bool drive, bool closed, float w) {
     }
     motor.loopFOC();
     if (drive) motor.move(w_ramp);
+    if (trackable) { e_ref += w_ramp * dt;
+                     slip_check(e_ref - ol * (sensor.getAngle() - e_a0), millis()); }
     guard(closed);
   }
 
@@ -743,13 +768,22 @@ static void record(bool drive, bool closed, float w) {
   armed_tight = true; w_since = 0;
   vib_hi = -1e9f; vib_lo = 1e9f; vib_t0 = millis();
 
+  // Точка отсчёта абсолютного порога переносится после установления: во время
+  // разгона ошибка гуляет и дала бы ложный срыв ещё до начала записи.
+  if (trackable) { sensor.update(); e_a0 = sensor.getAngle(); e_ref = 0.0f; slip_anchor(); }
+  uint32_t prev2 = micros();
   uint32_t next = micros();
   for (uint16_t i = 0; i < n_samp && !bailed; i++) {
     // Крутим и опрашиваем, пока не подошёл момент отсчёта. Спать нельзя:
     // без loopFOC() поле встанет, и мы запишем не плавность, а остановку.
     while ((int32_t)(micros() - next) < 0) {
+      const uint32_t nw = micros();
+      float dt2 = (nw - prev2) * 1e-6f; prev2 = nw;
+      if (dt2 < 0 || dt2 > 0.05f) dt2 = 0;
       motor.loopFOC();
       if (drive) motor.move(w_ramp);
+      if (trackable) { e_ref += w_ramp * dt2;
+                       slip_check(e_ref - ol * (sensor.getAngle() - e_a0), millis()); }
       guard(closed);
     }
     next += step_us;
@@ -794,6 +828,10 @@ static void dump(const char *tag, bool drive, float w) {
   // обрыв сторожем, но раньше жил только в отдельной строке — то есть при
   // разборе данных задним числом было не видно, годен ли отрезок вообще.
   Serial.print(F(" срыв=")); Serial.print(slip_bit ? 1 : 0);
+  // ЧИСЛА РЯДОМ С БИТОМ. Без них бит неразбираем: неизвестно, какой из двух
+  // порогов сработал и насколько близко к нему прошли остальные прогоны.
+  Serial.print(F(" дельта_макс=")); Serial.print(slip_max * 57.2958f, 2);
+  Serial.print(F(" e_макс=")); Serial.print(slip_abs_max * 57.2958f, 2);
   Serial.print(F(" режим="));    Serial.println(tag);
   for (uint16_t i = 0; i < n_filled; i++) Serial.println(buf[i], 6);
   Serial.println(F("#КОНЕЦ"));
@@ -1552,7 +1590,7 @@ static float ff_lookup(float w) {
 }
 
 static void blocks_reset() {
-  U_int = 0.0f; e_int_ref = 0.0f; last_wsgn = 0.0f; slip_reset();
+  U_int = 0.0f; e_int_ref = 0.0f; last_wsgn = 0.0f;
   acc_base=acc_cog=acc_ff=acc_int=acc_dith=0; acc_n=0; clamp_n=0;
 }
 
@@ -1651,6 +1689,7 @@ static void blocks_record(float w) {
   sensor.update();
   e_int_ref = ref - ol * (sensor.getAngle() - a0);
   U_int = 0.0f;
+  slip_anchor();
   armed_tight = true; w_since = 0;
   const uint32_t step_us = 1000000UL / fs_hz;
   uint32_t next = micros();
@@ -1677,6 +1716,10 @@ static void blocks_record(float w) {
   Serial.print(F(" кламп=")); Serial.print((float)(100.0*clamp_n/n), 1);
   Serial.print(F("% блоки=")); Serial.print(blk);
   Serial.print(F(" срыв=")); Serial.print(slip_bit ? 1 : 0);
+  // ЧИСЛА РЯДОМ С БИТОМ. Без них бит неразбираем: неизвестно, какой из двух
+  // порогов сработал и насколько близко к нему прошли остальные прогоны.
+  Serial.print(F(" дельта_макс=")); Serial.print(slip_max * 57.2958f, 2);
+  Serial.print(F(" e_макс=")); Serial.print(slip_abs_max * 57.2958f, 2);
   Serial.print(F(" дельта_макс=")); Serial.print(slip_max * 57.2958f, 3);
   Serial.print(F("° |e|_макс=")); Serial.print(slip_abs_max * 57.2958f, 2);
   Serial.print(F("° NTC=")); Serial.print(ntc_raw());
@@ -1701,6 +1744,7 @@ static void slip_live(float w) {
   Serial.println(F("#СРЫВ_ТЕСТ 25 с, на 12-й секунде РЕВЕРС уставки."));
   Serial.println(F("#СРЫВ Придержите вал рукой в любой момент, потом отпустите."));
   Serial.println(F("#СРЫВ колонки: мс ошибка_град дельта_град бит"));
+  bool anchored = false;
   while (millis() - t0 < 25000 && !bailed) {
     const uint32_t now = micros(); float dt = (now - prev) * 1e-6f; prev = now;
     if (dt < 0 || dt > 0.05f) dt = 0;
@@ -1714,6 +1758,9 @@ static void slip_live(float w) {
     const float e = ref - ol * (sensor.getAngle() - a0);
     blocks_step(wr, dt, (now - tus0) * 1e-6f, e);
     guard(false);
+    // Рампа 0.2 рад/с^2 до 0.15 рад/с кончается за 0.75 с; двух секунд хватает
+    // с запасом, и до этого момента абсолютный порог смысла не имеет.
+    if (!anchored && millis() - t0 > 2000) { slip_anchor(); slip_bit = false; anchored = true; }
     if ((int32_t)(millis() - next_pr) >= 0) {
       next_pr += 500;
       Serial.print(F("#СРЫВ ")); Serial.print(millis() - t0);
