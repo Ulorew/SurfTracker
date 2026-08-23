@@ -253,7 +253,7 @@ static uint32_t t_reset = 0;   //!< когда началась льгота
 // ЗНАК Uq, А НЕ ТОЛЬКО МОДУЛЬ. Счётчик упора сигнатуру «регулятор дёргается
 // между упорами» и «регулятор упёрся в одну сторону» не различает вовсе, а
 // это два разных отказа с разными причинами.
-static float uq_min = 0.0f, uq_max = 0.0f;
+static float uq_min = 0.0f, uq_max = 0.0f, uq_sum = 0.0f;
 
 /** Сбрасывается ПЕРЕД каждым отрезком. Между отрезками идёт выгрузка длиной в
  *  секунды: не сбросив окно, первую измеренную скорость мы посчитали бы через
@@ -262,7 +262,7 @@ static void guard_reset() {
   w_since = 0; win_have = false; g_calls = 0; g_sat = 0;
   w_peak = 0.0f; w_peak_settle = 0.0f; armed_tight = false; w_meas = 0.0f;
   bailed = false;
-  uq_min = 1e9f; uq_max = -1e9f; t_reset = millis();
+  uq_min = 1e9f; uq_max = -1e9f; uq_sum = 0.0f; t_reset = millis();
 }
 
 /** Две защиты (разгон, негодный датчик) и один счётчик (упор Uq).
@@ -274,6 +274,7 @@ static void guard(bool closed) {
   const float uq_now = motor.voltage.q;
   if (uq_now < uq_min) uq_min = uq_now;
   if (uq_now > uq_max) uq_max = uq_now;
+  uq_sum += uq_now;
   if (fabsf(uq_now) >= UQ_SAT_FRAC * motor.voltage_limit) g_sat++;
 
   // ЗДОРОВЬЕ ДАТЧИКА — только в замкнутом. В разомкнутом датчик не участвует
@@ -517,6 +518,12 @@ static void dump(const char *tag, bool drive, float w) {
   Serial.print(F(" w_пик_уст=")); Serial.print(w_peak_settle, 4);
   Serial.print(F(" Uq=[")); Serial.print(uq_min, 3);
   Serial.print(','); Serial.print(uq_max, 3); Serial.print(']');
+  // СРЕДНЕЕ Uq — это и есть напряжение, которое объект требует на этой
+  // скорости. В контуре с предуправлением оно подаётся заранее, а регулятору
+  // остаётся только остаток; так строят сервоприводы, и так снимается главная
+  // беда нашего контура — интегратор, вынужденный сам набирать напряжение на
+  // преодоление трения и потому раскачивающийся.
+  Serial.print(F(" Uq_сред=")); Serial.print(g_calls ? uq_sum / g_calls : 0.0f, 3);
   Serial.print(F(" режим="));    Serial.println(tag);
   for (uint16_t i = 0; i < n_filled; i++) Serial.println(buf[i], 6);
   Serial.println(F("#КОНЕЦ"));
@@ -703,6 +710,13 @@ static void diag_torque(float uq, uint16_t n) {
 // Регулятор ПИ, выход — напряжение по оси q через режим момента. Дифференциала
 // нет намеренно: он делит на такт цикла (30 мкс), а не на кадр (922 мкс).
 static float own_P = 2.0f, own_I = 8.0f, own_win_ms = 20.0f;
+// ПРЕДУПРАВЛЕНИЕ: напряжение, подаваемое СРАЗУ под заданную скорость, без
+// участия регулятора. Берётся из среднего Uq замкнутого прогона на той же
+// скорости (печатается в заголовке отрезка как Uq_сред). Классический приём
+// сервопривода: регулятор перестаёт быть источником рабочей точки и трудится
+// только над остатком, поэтому ему хватает малого усиления, а малое усиление
+// не усиливает помеху.
+static float own_ff = 0.0f;
 static float own_int = 0.0f, own_w = 0.0f;
 
 // Окно скорости живёт в статиках own_step(); без явного сброса первый такт
@@ -724,7 +738,7 @@ static float own_step(float target, float dt) {
   const float err = target - drive_sign * own_w;
   own_int += own_I * err * dt;
   own_int = _constrain(own_int, -motor.voltage_limit, motor.voltage_limit);
-  float uq = drive_sign * (own_P * err + own_int);
+  float uq = drive_sign * (own_ff + own_P * err + own_int);
   uq = _constrain(uq, -motor.voltage_limit, motor.voltage_limit);
   motor.move(uq);
   return uq;
@@ -1003,6 +1017,147 @@ static void probe_ring(float u) {
   Serial.println(F("#ЗВОН_КОНЕЦ"));
 }
 
+
+// ===========================================================================
+// ОПОЗНАНИЕ ОБЪЕКТА «Uq -> скорость»
+//
+// ЗАЧЕМ. Коэффициенты контура сейчас взяты от другого мотора, и точка перехода
+// через единицу легла ровно на зубцовую помеху 0.7 Гц — оттого замкнутый и
+// усиливает её втрое (замерено: отношение спектров 2.92 в полосе 0.4..0.8 Гц
+// при подавлении 0.29 в полосе 6..10 Гц). Чтобы увести переход в промежуток
+// между помехой 0.7 Гц и резонансом стенда 7.5 Гц, нужно знать не только
+// усиление объекта, но и его ФАЗУ в этой полосе. Статической характеристики
+// для этого мало.
+//
+// ПОЧЕМУ ТОЛЬКО РЕЖИМ МОМЕНТА. В разомкнутом контуре скорость задаётся полем,
+// а не напряжением: объект «Uq -> скорость» там не проявляется вовсе.
+static float id_u0 = 0.6f;    //!< рабочая точка по Uq
+static float id_du = 0.1f;    //!< амплитуда возмущения
+
+/** Лестница момента: установившаяся скорость против Uq. Даёт наклон у рабочей
+ *  точки и порог страгивания. Скорость меряется по последним 1.5 с ступени —
+ *  первые полторы отданы разгону. */
+static void id_static(float umax) {
+  motor.enable();
+  motor.controller = MotionControlType::torque;
+  Serial.println(F("#СТАТИКА колонки: Uq w_уст скорость_пик"));
+  for (uint8_t k = 0; k < 8; k++) {
+    const float u = 0.15f + (umax - 0.15f) * k / 7.0f;
+    guard_reset();
+    const uint32_t t0 = millis();
+    float a1 = 0.0f; uint32_t t1 = 0; bool have = false;
+    while (millis() - t0 < 3000 && !bailed) {
+      motor.loopFOC(); motor.move(u); guard(true);
+      if (!have && millis() - t0 > 1500) { sensor.update(); a1 = sensor.getAngle(); t1 = millis(); have = true; }
+    }
+    const uint32_t dt = millis() - t1;
+    const float v = (have && dt > 200) ? (sensor.getAngle() - a1) / (dt * 1e-3f) : 0.0f;
+    Serial.print(F("#СТАТИКА ")); Serial.print(u, 3);
+    Serial.print(' '); Serial.print(v * drive_sign, 4);
+    Serial.print(' '); Serial.println(w_peak, 3);
+    if (bailed) { Serial.println(F("#СТАТИКА прервана сторожем")); break; }
+  }
+  motor.move(0.0f); motor.disable(); delay(300); motor.enable();
+}
+
+/** Отклик на синусоидальное возмущение Uq у рабочей точки.
+ *
+ *  Пишется УГОЛ, а не скорость: скорость пришлось бы получать
+ *  дифференцированием, а оно поднимает шум датчика ровно в той полосе, где мы
+ *  меряем. Амплитуда и фаза достаются корреляцией угла с синусом и косинусом
+ *  той же частоты уже на ноутбуке.
+ *
+ *  Возмущение начинается ОДНОВРЕМЕННО с записью: фаза считается от нулевого
+ *  отсчёта, и без этого совпадения фазовая часть замера бессмысленна. */
+static void id_sine(float hz) {
+  motor.enable();
+  motor.controller = MotionControlType::torque;
+  guard_reset(); n_filled = 0;
+  // Установление на рабочей точке без возмущения.
+  const uint32_t t0 = millis();
+  while (millis() - t0 < 2500 && !bailed) { motor.loopFOC(); motor.move(id_u0); guard(true); }
+  const uint32_t step_us = 1000000UL / fs_hz;
+  const uint32_t tstart = micros();
+  uint32_t next = tstart;
+  for (uint16_t i = 0; i < n_samp && !bailed; i++) {
+    while ((int32_t)(micros() - next) < 0 && !bailed) {
+      const float tt = (micros() - tstart) * 1e-6f;
+      motor.loopFOC();
+      motor.move(id_u0 + id_du * sinf(_2PI * hz * tt));
+      guard(true);
+    }
+    next += step_us;
+    buf[i] = sensor.getAngle();
+    n_filled = i + 1;
+  }
+  motor.move(0.0f);
+  Serial.print(F("#ОТКЛИК f=")); Serial.print(hz, 3);
+  Serial.print(F(" u0=")); Serial.print(id_u0, 3);
+  Serial.print(F(" du=")); Serial.print(id_du, 3);
+  Serial.print(F(" n=")); Serial.print(n_filled);
+  if (n_filled < n_samp) Serial.print(F(" ОБОРВАН"));
+  Serial.print(F(" fs=")); Serial.println(fs_hz);
+  for (uint16_t i = 0; i < n_filled; i++) Serial.println(buf[i], 6);
+  Serial.println(F("#ОТКЛИК_КОНЕЦ"));
+  motor.disable(); delay(300); motor.enable();
+}
+
+
+/**
+ * ОПОЗНАНИЕ В ЗАМКНУТОМ КОНТУРЕ: возмущение подаётся в УСТАВКУ.
+ *
+ * ПОЧЕМУ НЕ РАЗОМКНУТО ПО Uq, как задумывалось сперва. Лестница момента 23.08
+ * показала, что устойчивой рабочей точки на 0.2 рад/с в режиме момента НЕТ:
+ * 0.15 В держат 0.146 рад/с, а 0.30 В уводят вал на 3.6 рад/с (сторож сбил).
+ * После страгивания трение резко падает, наклон характеристики становится
+ * отрицательным, и разомкнутый режим там неустойчив. Держит эту точку именно
+ * контур — значит и мерить объект надо при работающем контуре.
+ *
+ * ЧТО ПОЛУЧАЕТСЯ. Отклик уставка -> скорость это T = L/(1+L). Отсюда
+ * L = T/(1-T) на каждой частоте, то есть и модуль, и фаза разомкнутой цепи —
+ * ровно то, из чего считается точка перехода и запас по фазе. Прямого
+ * усиления объекта отдельно не нужно: для настройки нужна именно L.
+ *
+ * Возмущение малое (доля уставки), контур держит вал, стенд не трясёт.
+ */
+static float id_w0 = 0.20f;   //!< рабочая скорость
+static float id_dw = 0.05f;   //!< амплитуда возмущения уставки
+
+static void id_closed(float hz) {
+  motor.enable();
+  motor.controller = MotionControlType::velocity;
+  motor.PID_velocity.reset();
+  guard_reset(); n_filled = 0;
+  const uint32_t t0 = millis();
+  while (millis() - t0 < 3000 && !bailed) { motor.loopFOC(); motor.move(id_w0); guard(true); }
+  armed_tight = true; w_since = 0;
+  const uint32_t step_us = 1000000UL / fs_hz;
+  const uint32_t tstart = micros();
+  uint32_t next = tstart;
+  for (uint16_t i = 0; i < n_samp && !bailed; i++) {
+    while ((int32_t)(micros() - next) < 0 && !bailed) {
+      const float tt = (micros() - tstart) * 1e-6f;
+      motor.loopFOC();
+      motor.move(id_w0 + id_dw * sinf(_2PI * hz * tt));
+      guard(true);
+    }
+    next += step_us;
+    buf[i] = sensor.getAngle();
+    n_filled = i + 1;
+  }
+  motor.move(0.0f);
+  Serial.print(F("#ОТКЛИК f=")); Serial.print(hz, 3);
+  Serial.print(F(" w0=")); Serial.print(id_w0, 3);
+  Serial.print(F(" dw=")); Serial.print(id_dw, 3);
+  Serial.print(F(" P=")); Serial.print(motor.PID_velocity.P, 3);
+  Serial.print(F(" I=")); Serial.print(motor.PID_velocity.I, 3);
+  Serial.print(F(" n=")); Serial.print(n_filled);
+  if (n_filled < n_samp) Serial.print(F(" ОБОРВАН"));
+  Serial.print(F(" fs=")); Serial.println(fs_hz);
+  for (uint16_t i = 0; i < n_filled; i++) Serial.println(buf[i], 6);
+  Serial.println(F("#ОТКЛИК_КОНЕЦ"));
+}
+
 static void status() {
   const CaptureStatus &st = sensor.lastStatus();
   Serial.print(F("#СОСТ V=")); Serial.print(motor.voltage_limit, 2);
@@ -1019,6 +1174,7 @@ static void status() {
   Serial.print(F(" свои_P=")); Serial.print(own_P, 3);
   Serial.print(F(" свои_I=")); Serial.print(own_I, 3);
   Serial.print(F(" окно=")); Serial.print(own_win_ms, 0);
+  Serial.print(F(" предупр=")); Serial.print(own_ff, 3);
   Serial.print(F(" годен=")); Serial.print(sensor.isHealthy());
   Serial.print(F(" угол=")); Serial.print(sensor.getAngle(), 4);
   Serial.print(F(" период=")); Serial.println(st.period);
@@ -1117,6 +1273,13 @@ void loop() {
         case 'R': record_both(a); break;
         case 'E': probe_phases(a); break;
         case 'B': probe_ring(a); break;
+        case 'L': id_static(a); break;
+        case 'u': id_u0 = a; Serial.println(F("#ok")); break;
+        case 'a': id_du = a; Serial.println(F("#ok")); break;
+        case 'f': id_sine(a); break;
+        case 'k': id_closed(a); break;
+        case 'v': id_w0 = a; Serial.println(F("#ok")); break;
+        case 'e': id_dw = a; Serial.println(F("#ok")); break;
         case 'r': ph_rev = (uint8_t)max(1.0f, min(a, 8.0f)); Serial.println(F("#ok")); break;
         case 'Q': own_record(a); dump("свой", true, a); break;
         case 'H': pos_record(a); dump("позиция", true, a); break;
@@ -1125,6 +1288,7 @@ void loop() {
         case 'p': own_P = a; Serial.println(F("#ok")); break;
         case 'i': own_I = a; Serial.println(F("#ok")); break;
         case 'w': own_win_ms = a; Serial.println(F("#ok")); break;
+        case 'g': own_ff = a; Serial.println(F("#ok")); break;
         // ЧИСЛО ПАР ПОЛЮСОВ КОМАНДОЙ. Оно входит в перевод «механический угол
         // -> электрический», и ошибка в нём копится С ПРОЙДЕННЫМ ПУТЁМ: поле
         // тянет, пока накопленный сдвиг не переведёт его в удержание. Проверка
