@@ -130,6 +130,14 @@ static const float    W_ABORT     = 1.0f;      // рад/с, на записи
 // названной границы безопасности вала (6 рад/с), то есть настоящий разгон
 // ловится и здесь.
 static const float    W_ABORT_SETTLE = 3.0f;
+// ЛЬГОТНЫЙ ИНТЕРВАЛ ПОСЛЕ ВКЛЮЧЕНИЯ ПОЛЯ. При подаче напряжения поле хватает
+// ротор из произвольного положения и рывком тянет к ближайшему электрическому
+// нулю: замерено 4.7..5.8 рад/с в первые доли секунды. Это настоящее движение
+// и оно кончается само. Первая редакция сторожа обрывала на нём прогон; вторая
+// «решила» это, отключив сторож в разомкнутом режиме ЦЕЛИКОМ, то есть сняв
+// защиту там, где вал как раз и уходил на 11 рад/с. Правильно — не слепота, а
+// окно: полторы секунды разгон не обрывает, но ПИК ЗАПОМИНАЕТСЯ и печатается.
+static const uint32_t W_GRACE_MS = 1500;
 static const uint32_t W_ABORT_MS  = 30;
 // ОКНО ИЗМЕРЕНИЯ СКОРОСТИ ДЛЯ СТОРОЖА — СВОЁ, 100 мс.
 //
@@ -241,6 +249,7 @@ static float    drive_sign = -1.0f;
 static bool     drive_sign_valid = false;
 static float    zea_mean = 0.0f;       //!< средний электрический ноль по трём замерам
 static uint32_t g_calls = 0, g_sat = 0;
+static uint32_t t_reset = 0;   //!< когда началась льгота
 // ЗНАК Uq, А НЕ ТОЛЬКО МОДУЛЬ. Счётчик упора сигнатуру «регулятор дёргается
 // между упорами» и «регулятор упёрся в одну сторону» не различает вовсе, а
 // это два разных отказа с разными причинами.
@@ -253,7 +262,7 @@ static void guard_reset() {
   w_since = 0; win_have = false; g_calls = 0; g_sat = 0;
   w_peak = 0.0f; w_peak_settle = 0.0f; armed_tight = false; w_meas = 0.0f;
   bailed = false;
-  uq_min = 1e9f; uq_max = -1e9f;
+  uq_min = 1e9f; uq_max = -1e9f; t_reset = millis();
 }
 
 /** Две защиты (разгон, негодный датчик) и один счётчик (упор Uq).
@@ -305,6 +314,7 @@ static void guard(bool closed) {
   // Правильное различие не «замкнутый против разомкнутого», а ПОРОГ: в
   // разомкнутом вал не может устойчиво идти быстрее команды, поэтому порог
   // там привязан к команде, а не к рабочему потолку.
+  if (!armed_tight && now - t_reset < W_GRACE_MS) return;
   const float lim = armed_tight ? W_ABORT : W_ABORT_SETTLE;
   if (aw > lim) { if (!w_since) w_since = now; }
   else w_since = 0;
@@ -905,24 +915,92 @@ static void record_both(float w) {
  * показаний, поэтому проверка не зависит ни от электрического нуля, ни от
  * знака, ни от числа пар полюсов.
  */
+static uint8_t ph_rev = 2;      //!< электрических оборотов в проходе
+
 static void probe_phases(float u) {
   motor.enable();
   motor.controller = MotionControlType::torque;
-  const uint8_t N = 24;
+  const uint8_t PER = 24;                     // шагов на электрический оборот
+  const uint16_t TOT = (uint16_t)PER * ph_rev;
   Serial.print(F("#ФАЗЫ U=")); Serial.print(u, 2);
-  Serial.println(F("  колонки: шаг угол_эл угол_вала_град"));
-  // Сперва подтягиваем вал к первой точке подольше, иначе первый шаг вберёт
-  // в себя весь путь от произвольного начального положения.
-  for (uint16_t i = 0; i < 500; i++) { motor.setPhaseVoltage(u, 0, 0.0f); delay(1); sensor.update(); }
-  for (uint8_t k = 0; k < N + 1; k++) {
-    const float ang = _2PI * k / N;
-    for (uint16_t i = 0; i < 250; i++) { motor.setPhaseVoltage(u, 0, ang); delay(1); sensor.update(); }
-    Serial.print(F("#ФАЗЫ ")); Serial.print(k);
-    Serial.print(' '); Serial.print(ang, 4);
-    Serial.print(' '); Serial.println(sensor.getAngle() * 57.2958f, 3);
+  Serial.print(F(" оборотов=")); Serial.print(ph_rev);
+  Serial.print(F(" шагов_на_оборот=")); Serial.println(PER);
+  Serial.println(F("#ФАЗЫ колонки: ход шаг угол_эл угол_вала_град звон_СКО_град"));
+  // Подтяжка к старту подольше: иначе первый шаг вберёт весь путь от
+  // произвольного начального положения.
+  for (uint16_t i = 0; i < 600; i++) { motor.setPhaseVoltage(u, 0, 0.0f); delay(1); sensor.update(); }
+  // ДВА ПРОХОДА, ВПЕРЁД И НАЗАД. Трение покоя смещает точку остановки в
+  // сторону, ОБРАТНУЮ ходу, и на одиночной развёртке это неотличимо от
+  // перекоса фазы. При сложении двух направлений трение сокращается, а
+  // перекос — нет, потому что он привязан к углу поля, а не к направлению.
+  for (int8_t dir = 1; dir >= -1; dir -= 2) {
+    for (uint16_t j = 0; j <= TOT; j++) {
+      const uint16_t k = (dir > 0) ? j : (TOT - j);
+      const float ang = _2PI * (float)k / PER;
+      // ВЫДЕРЖКА И УСРЕДНЕНИЕ ПО ЦЕЛОМУ ПЕРИОДУ КАЧАНИЯ.
+      //
+      // Стенд звенит около 2 Гц (наблюдение владельца 23.08), то есть период
+      // 500 мс. Прежняя редакция держала шаг 150 мс и брала ОДИН отсчёт в
+      // конце — то есть попадала в случайную фазу качания, и разброс шагов
+      // мерил звон, а не перекос фазы. Здесь шаг держится 1000 мс, а угол
+      // усредняется по последним 500 мс: за целый период качание сокращается.
+      //
+      // Заодно считается СКО внутри окна усреднения. Это не украшение: если
+      // звон не осел, оно велико, и замер шага недостоверен — величина должна
+      // быть видна рядом с ней самой, а не подразумеваться.
+      for (uint16_t i = 0; i < 500; i++) { motor.setPhaseVoltage(u, 0, ang); delay(1); sensor.update(); }
+      float sum = 0.0f, sum2 = 0.0f;
+      for (uint16_t i = 0; i < 500; i++) {
+        motor.setPhaseVoltage(u, 0, ang); delay(1); sensor.update();
+        const float a = sensor.getAngle() * 57.2958f;
+        sum += a; sum2 += a * a;
+      }
+      const float mean = sum / 500.0f;
+      const float var  = sum2 / 500.0f - mean * mean;
+      Serial.print(F("#ФАЗЫ ")); Serial.print(dir > 0 ? '+' : '-');
+      Serial.print(' '); Serial.print(k);
+      Serial.print(' '); Serial.print(ang, 4);
+      Serial.print(' '); Serial.print(mean, 3);
+      Serial.print(' '); Serial.println(sqrtf(var > 0 ? var : 0), 3);
+      if (bailed) break;
+    }
+    if (bailed) break;
   }
   motor.setPhaseVoltage(0, 0, 0); motor.disable(); delay(200); motor.enable();
   Serial.println(F("#ФАЗЫ_КОНЕЦ"));
+}
+
+/**
+ * ЗВОН СТЕНДА: резкий шаг поля и запись остаточных колебаний.
+ *
+ * Собственная частота подвеса — величина, вокруг которой строился весь план
+ * замкнутого контура (мишень 5.5..6.5 Гц была выведена КОСВЕННО, отношением
+ * спектров с грузом и без груза). Здесь она меряется прямо: вал подтягивается
+ * к одному углу поля, потом поле скачком уходит на четверть электрического
+ * оборота, и пишется, как вал приходит в новое положение.
+ *
+ * Возбуждение ступенькой широкополосное, поэтому в остатке звенит именно
+ * собственная частота, а не то, чем мы качали.
+ */
+static void probe_ring(float u) {
+  motor.enable();
+  motor.controller = MotionControlType::torque;
+  guard_reset(); n_filled = 0;
+  for (uint16_t i = 0; i < 1500; i++) { motor.setPhaseVoltage(u, 0, 0.0f); delay(1); sensor.update(); }
+  const uint32_t step_us = 1000000UL / fs_hz;
+  uint32_t next = micros();
+  for (uint16_t i = 0; i < n_samp; i++) {
+    while ((int32_t)(micros() - next) < 0) { motor.setPhaseVoltage(u, 0, _PI_2); sensor.update(); }
+    next += step_us;
+    buf[i] = sensor.getAngle();
+    n_filled = i + 1;
+  }
+  motor.setPhaseVoltage(0, 0, 0); motor.disable(); delay(200); motor.enable();
+  Serial.print(F("#ЗВОН U=")); Serial.print(u, 2);
+  Serial.print(F(" n=")); Serial.print(n_filled);
+  Serial.print(F(" fs=")); Serial.println(fs_hz);
+  for (uint16_t i = 0; i < n_filled; i++) Serial.println(buf[i], 6);
+  Serial.println(F("#ЗВОН_КОНЕЦ"));
 }
 
 static void status() {
@@ -1038,6 +1116,8 @@ void loop() {
         case 'M': diag_vel(a, 400); break;
         case 'R': record_both(a); break;
         case 'E': probe_phases(a); break;
+        case 'B': probe_ring(a); break;
+        case 'r': ph_rev = (uint8_t)max(1.0f, min(a, 8.0f)); Serial.println(F("#ok")); break;
         case 'Q': own_record(a); dump("свой", true, a); break;
         case 'H': pos_record(a); dump("позиция", true, a); break;
         case 'h': pos_P = a; Serial.println(F("#ok")); break;
