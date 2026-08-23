@@ -241,7 +241,24 @@ static uint8_t slip_head = 0;
 static uint32_t slip_t_last = 0;
 static bool    slip_ready = false;
 static bool    slip_bit = false;             // защёлкивается до сброса
-static float   slip_thr = 1.5f / 57.2958f;   // радианы вала
+// ПОРОГ ДЕТЕКТОРА — 2.5 ГРАДУСА, И ЭТО ВРЕМЕННОЕ ЗНАЧЕНИЕ.
+//
+// Спецификация называла 1.5 град, исходя из шума тракта (0.046 град). Замер
+// показал, что мерить надо не шум датчика, а ШТАТНУЮ ДЕЛЬТУ: по 25 прогонам
+// пяти конфигураций максимум |Δ| за окно 1 с составил
+//   0.05 рад/с 0.95   0.12 рад/с 0.77   0.20 рад/с 0.91
+//   0.35 рад/с 1.34   0.50 рад/с 1.26
+// то есть на верхних скоростях 1.5 град подпирается вплотную и любая помеха
+// даёт ложняк. При 2.5 запас 1.9x над худшим наблюдённым.
+//
+// ПОЧЕМУ НЕ ПОДНЯТЬ ЕЩЁ И НЕ ДЕЛАТЬ СКОРОСТНОЗАВИСИМЫМ. Дельту на 0.35..0.50
+// раздувает диагностированный дефект — фазовое запаздывание таблицы зубцов.
+// После его починки штатный максимум обязан осесть. ПОРЯДОК ДЕЙСТВИЙ:
+//   1) ввести фазовое упреждение таблицы;
+//   2) перегнать гистограмму Δ по скоростям;
+//   3) если максимум упал ниже 1.5 — вернуть порог к 2.0.
+// Без этого комментария порог остался бы навсегда «2.5 почему-то».
+static float   slip_thr = 2.5f / 57.2958f;   // радианы вала
 static float   slip_max = 0.0f;              // наибольшая |дельта| за отрезок
 
 static void slip_reset() {
@@ -264,6 +281,13 @@ static float slip_check(float e, uint32_t now) {
   if (fabsf(d) > slip_thr) slip_bit = true;
   return d;
 }
+
+// ТЕПЛОВОЙ ПРОКСИ. На плате есть NTC (A_TEMPERATURE = PB14). Пересчёта в
+// градусы у нас нет — делитель и характеристика термистора не проверены, —
+// поэтому печатаются СЫРЫЕ отсчёты АЦП и подписаны как сырые. Для правила
+// «не дольше трёх минут при U >= 2 В» важна не абсолютная температура, а
+// ИЗМЕНЕНИЕ: отсчёт до прогона и после. Пирометр эту строку заменит.
+static int ntc_raw() { return analogRead(A_TEMPERATURE); }
 
 static float   fld_angle = 0.0f;     //!< электрический угол ПОЛЯ, наш интегратор
 
@@ -1286,7 +1310,10 @@ static void manifest() {
   Serial.print('/'); Serial.print(motor.PID_velocity.I, 3);
   Serial.print(F(" Tf=")); Serial.print(motor.LPF_velocity.Tf, 4);
   Serial.print(F(" n=")); Serial.print(n_samp);
-  Serial.print(F(" fs=")); Serial.println(fs_hz);
+  Serial.print(F(" fs=")); Serial.print(fs_hz);
+  Serial.print(F(" NTC_сырой=")); Serial.print(ntc_raw());
+  Serial.print(F(" порог_срыва=")); Serial.print(slip_thr * 57.2958f, 2);
+  Serial.println(F("°"));
 }
 
 
@@ -1462,7 +1489,8 @@ static void blocks_record(float w) {
   Serial.print(F("% блоки=")); Serial.print(blk);
   Serial.print(F(" срыв=")); Serial.print(slip_bit ? 1 : 0);
   Serial.print(F(" дельта_макс=")); Serial.print(slip_max * 57.2958f, 3);
-  Serial.println(F("°"));
+  Serial.print(F("° NTC=")); Serial.print(ntc_raw());
+  Serial.println();
 }
 
 /** Живой тест детектора: едем и печатаем состояние, пока оператор придерживает
