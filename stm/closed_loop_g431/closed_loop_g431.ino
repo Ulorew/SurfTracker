@@ -172,6 +172,7 @@ static float buf[N_SAMP];
 // ПОСЛЕДНИЙ ГОДНЫЙ угол, поэтому пачка браковок выглядит как «вал стоял, потом
 // прыгнул». Здесь обе величины пишутся ОДНОВРЕМЕННО, чтобы различить свойство
 // стенда и свойство прибора.
+static uint16_t n_filled = 0;   //!< сколько отсчётов реально записано
 static float   duty_buf[1200];
 static uint8_t ok_buf[1200];
 static float w_meas = 0.0f;      //!< измеренная скорость вала, рад/с (см. guard)
@@ -233,6 +234,11 @@ static float    w_peak_settle = 0.0f;  //!< то же за установлен�
 // 11.6 рад/с — сторож сбил. Величина, которую можно измерить за три секунды,
 // не должна быть предположением.
 static float    drive_sign = -1.0f;
+// ЗНАК ТЯГИ УСТАРЕВАЕТ при любой смене отображения «датчик -> электрический
+// угол»: команды D, A, Z, K меняют его, а знак тяги остаётся прежним и молча
+// врёт. Раньше он не отзывался вовсе и не печатался в состоянии — отсюда и
+// расхождение, замеченное 23.08 (в состоянии знак=CW при знаке тяги -1).
+static bool     drive_sign_valid = false;
 static float    zea_mean = 0.0f;       //!< средний электрический ноль по трём замерам
 static uint32_t g_calls = 0, g_sat = 0;
 // ЗНАК Uq, А НЕ ТОЛЬКО МОДУЛЬ. Счётчик упора сигнатуру «регулятор дёргается
@@ -290,7 +296,15 @@ static void guard(bool closed) {
   // Первая редакция обрывала на этом разомкнутый отрезок дважды подряд,
   // приняв за аварию нормальную физику. Пики теперь МЕРЯЮТСЯ и печатаются
   // отдельно за установление и за запись — это данные, а не повод для отказа.
-  if (!closed) return;
+  // СТОРОЖ РАБОТАЕТ ВО ВСЕХ РЕЖИМАХ. Здесь стоял выход `if (!closed) return;`,
+  // поставленный ради того, чтобы разомкнутый отрезок не обрывался на рывке
+  // захвата ротора. Побочно он снял защиту с разомкнутого и моментного
+  // режимов ЦЕЛИКОМ: проверки !bailed в их петлях были мертвы, а вал при
+  // сорванном синхронизме уходил на 11 рад/с (наблюдалось 23.08).
+  //
+  // Правильное различие не «замкнутый против разомкнутого», а ПОРОГ: в
+  // разомкнутом вал не может устойчиво идти быстрее команды, поэтому порог
+  // там привязан к команде, а не к рабочему потолку.
   const float lim = armed_tight ? W_ABORT : W_ABORT_SETTLE;
   if (aw > lim) { if (!w_since) w_since = now; }
   else w_since = 0;
@@ -322,6 +336,12 @@ static float probe_torque(Direction dir, float uq) {
   // «тянет или держит», и для этого хватает трети шага полюса. Прежняя
   // редакция крутила вал все три секунды и разгоняла его до 1.5 рад/с — выше
   // рабочего диапазона (до 1 рад/с), без всякой пользы для ответа.
+  // ТОЧКА ОТСЧЁТА ПОСЛЕ ОБНОВЛЕНИЯ ДАТЧИКА. Здесь a0 читался из кэша, не
+  // обновлявшегося с прошлой команды: первый же loopFOC() подтягивал угол на
+  // весь выбег вала за паузу, условие выхода срабатывало на первой итерации,
+  // и «пройденный путь» оказывался этим выбегом. Отсюда 116 и 300 градусов
+  // там, где предел 0.5 рад = 28.6 градуса. Тем же мусором ставился знак тяги.
+  sensor.update();
   const float a0 = sensor.getAngle();
   const uint32_t t0 = millis();
   const float TRAV_ENOUGH = 0.5f;         // рад, около 29 градусов
@@ -331,7 +351,9 @@ static float probe_torque(Direction dir, float uq) {
   }
   const uint32_t t_trav = millis() - t0;
   const float trav = sensor.getAngle() - a0;
-  if (fabsf(trav) > 0.2f && fabsf(uq) > 1e-3f) drive_sign = (trav * uq > 0) ? 1.0f : -1.0f;
+  if (fabsf(trav) > 0.2f && fabsf(uq) > 1e-3f) {
+    drive_sign = (trav * uq > 0) ? 1.0f : -1.0f; drive_sign_valid = true;
+  }
   motor.move(0.0f); motor.disable(); delay(300); motor.enable();
   return trav;
 }
@@ -421,6 +443,7 @@ static float probe_zea(Direction dir, float off, float w) {
  */
 static void record(bool drive, bool closed, float w) {
   guard_reset();
+  n_filled = 0;
   const uint32_t step_us = 1000000UL / fs_hz;
   float w_ramp = 0.0f;
   uint32_t prev = micros();
@@ -456,6 +479,7 @@ static void record(bool drive, bool closed, float w) {
     }
     next += step_us;
     buf[i] = sensor.getAngle();
+    n_filled = i + 1;
   }
 }
 
@@ -467,7 +491,16 @@ static void dump(const char *tag, bool drive, float w) {
   // печатавший VOLTS, врал про условия замера.
   Serial.print(F(" volts="));    Serial.print(drive ? motor.voltage_limit : 0.0f, 2);
   Serial.print(F(" fs="));       Serial.print(fs_hz);
-  Serial.print(F(" n="));        Serial.print(n_samp);
+  // ПЕЧАТАЕТСЯ СТОЛЬКО, СКОЛЬКО РЕАЛЬНО ЗАПИСАНО.
+  //
+  // Здесь всегда печаталось n_samp, и после обрыва отрезка сторожем в файл
+  // уходил ХВОСТ ПРОШЛОГО ОТРЕЗКА как данные текущего. Это не мелочь: именно
+  // так родилась строка «-282 рад/с», на которой держался целый вывод про
+  // негодную обратную связь по скорости, и точка «СКО 29.8 град» в подборе
+  // коэффициентов, которой не существовало — 1168 отсчётов из 1200 там
+  // побайтово совпадали с прошлым прогоном.
+  Serial.print(F(" n="));        Serial.print(n_filled);
+  if (n_filled < n_samp) Serial.print(F(" ОБОРВАН"));
   Serial.print(F(" упор="));     Serial.print(g_calls ? (100.0f * g_sat / g_calls) : 0.0f, 1);
   Serial.print(F("% w_изм="));   Serial.print(w_meas, 4);
   Serial.print(F(" w_пик_зап=")); Serial.print(w_peak, 4);
@@ -475,7 +508,7 @@ static void dump(const char *tag, bool drive, float w) {
   Serial.print(F(" Uq=[")); Serial.print(uq_min, 3);
   Serial.print(','); Serial.print(uq_max, 3); Serial.print(']');
   Serial.print(F(" режим="));    Serial.println(tag);
-  for (uint16_t i = 0; i < n_samp; i++) Serial.println(buf[i], 6);
+  for (uint16_t i = 0; i < n_filled; i++) Serial.println(buf[i], 6);
   Serial.println(F("#КОНЕЦ"));
   Serial.flush();
 }
@@ -662,13 +695,17 @@ static void diag_torque(float uq, uint16_t n) {
 static float own_P = 2.0f, own_I = 8.0f, own_win_ms = 20.0f;
 static float own_int = 0.0f, own_w = 0.0f;
 
-static void own_reset() { own_int = 0.0f; own_w = 0.0f; }
+// Окно скорости живёт в статиках own_step(); без явного сброса первый такт
+// нового отрезка считал скорость за ВСЮ межкомандную паузу и подавал её в ПИ.
+static bool own_win_reset = true;
+static void own_reset() { own_int = 0.0f; own_w = 0.0f; own_win_reset = true; }
 
 /** Один такт собственного контура. Возвращает поданное напряжение. */
 static float own_step(float target, float dt) {
   static uint32_t t_win = 0; static float a_win = 0.0f; static bool have = false;
   const uint32_t now = millis();
   const float a = sensor.getAngle();
+  if (own_win_reset) { have = false; own_win_reset = false; }
   if (!have) { t_win = now; a_win = a; have = true; }
   else if (now - t_win >= (uint32_t)own_win_ms) {
     own_w = (a - a_win) / ((float)(now - t_win) * 1e-3f);
@@ -687,7 +724,7 @@ static float own_step(float target, float dt) {
  *  управление своё, поэтому вынесено отдельно, а не флагом внутри record(): в
  *  одной функции две разные петли управления читались бы хуже, чем две. */
 static void own_record(float w) {
-  guard_reset(); own_reset();
+  guard_reset(); own_reset(); n_filled = 0;
   motor.enable();
   motor.controller = MotionControlType::torque;
   const uint32_t step_us = 1000000UL / fs_hz;
@@ -713,6 +750,7 @@ static void own_record(float w) {
     }
     next += step_us;
     buf[i] = sensor.getAngle();
+    n_filled = i + 1;
   }
   motor.move(0.0f);
   Serial.print(F("#СВОЙ_КОНТУР w_свой=")); Serial.print(own_w, 4);
@@ -739,7 +777,7 @@ static float pos_P = 6.0f, pos_D = 2.0f;
 
 /** Ведение по положению: уставка едет со скоростью w, вал держится за ней. */
 static void pos_record(float w) {
-  guard_reset(); own_reset();
+  guard_reset(); own_reset(); n_filled = 0;
   motor.enable();
   motor.controller = MotionControlType::torque;
   float ref = sensor.getAngle();
@@ -780,6 +818,7 @@ static void pos_record(float w) {
     }
     next += step_us;
     buf[i] = sensor.getAngle();
+    n_filled = i + 1;
   }
   motor.move(0.0f);
   Serial.print(F("#ПОЗ_КОНТУР ошибка_хвост=")); Serial.print((ref - sensor.getAngle()) * 57.2958f, 2);
@@ -894,6 +933,8 @@ static void status() {
   Serial.print(F(" D=")); Serial.print(motor.PID_velocity.D, 4);
   Serial.print(F(" Tf=")); Serial.print(motor.LPF_velocity.Tf, 5);
   Serial.print(F(" знак=")); Serial.print(motor.sensor_direction == Direction::CW ? F("CW") : F("CCW"));
+  Serial.print(F(" знак_тяги=")); Serial.print(drive_sign, 0);
+  Serial.print(drive_sign_valid ? F("") : F("(устарел)"));
   Serial.print(F(" ZEA=")); Serial.print(motor.zero_electric_angle, 5);
   Serial.print(F(" n=")); Serial.print(n_samp);
   Serial.print(F(" fs=")); Serial.print(fs_hz);
@@ -979,9 +1020,10 @@ void loop() {
                     Serial.print(F(" пройдено=")); Serial.print(tr * 57.2958f, 2);
                     Serial.print(F(" град  w=")); Serial.print(tr / 3.0f, 4);
                     Serial.print(F(" знак_тяги=")); Serial.println(drive_sign, 0); } break;
-        case 'A': motor.enable(); do_align(); break;
-        case 'D': measure_dir(a); break;
-        case 'Z': zea_mean = _normalizeAngle(zea_mean + a); motor.zero_electric_angle = zea_mean;
+        case 'A': motor.enable(); do_align(); drive_sign_valid = false; break;
+        case 'D': measure_dir(a); drive_sign_valid = false; break;
+        case 'Z': drive_sign_valid = false;
+                  zea_mean = _normalizeAngle(zea_mean + a); motor.zero_electric_angle = zea_mean;
                   Serial.print(F("#ZEA=")); Serial.println(zea_mean, 5); break;
         case 'V': motor.voltage_limit = a; motor.PID_velocity.limit = a;
                   Serial.print(F("#V=")); Serial.println(a, 2); break;
@@ -1014,7 +1056,7 @@ void loop() {
         // портит ZEA, а с ним и весь замкнутый контур.
         case 'S': motor.voltage_sensor_align = a;
                   Serial.print(F("#Uвыр=")); Serial.println(a, 2); break;
-        case 'K': motor.pole_pairs = (int)(a + 0.5f);
+        case 'K': drive_sign_valid = false; motor.pole_pairs = (int)(a + 0.5f);
                   Serial.print(F("#pp=")); Serial.println(motor.pole_pairs); break;
         case '?': status(); break;
         default: Serial.println(F("#? неизвестная команда"));
