@@ -215,7 +215,7 @@ static float   fld_angle = 0.0f;     //!< электрический угол П
 // проходит только одной полярностью, привод перекашивает — первый же прогон
 // дал кламп 100% и срыв. Слагаемым нужен запас в обе стороны, поэтому база
 // задаётся своей командой (U), а motor.voltage_limit остаётся потолком.
-static float   u_base = 2.5f;
+static float   u_base = VOLTS;   // НЕ выше потолка по умолчанию, см. ниже
 static float w_meas = 0.0f;      //!< измеренная скорость вала, рад/с (см. guard)
 
 static void blink(uint8_t n, uint16_t ms) {
@@ -1300,7 +1300,13 @@ static float blocks_step(float w, float dt, float t_s, float err_pos) {
 
   const float ub     = (blk & 2) ? 0.0f : u_base;
   const float u_ff   = (blk & 2) ? ff_lookup(w) : 0.0f;
-  const float u_cog  = (blk & 1) ? (-cog_G * u_base * cog_tab[cog_idx()]) : 0.0f;
+  // МАСШТАБ ЗУБЦОВ БЕРЁТСЯ ОТ ФАКТИЧЕСКОГО ПИТАНИЯ ПРИВОДА, а не от u_base.
+  // При включённом предуправлении привод питается от u_ff, а u_base не
+  // участвует вовсе — прежняя запись масштабировала компенсацию величиной, к
+  // прогону не относящейся. Требуемое ΔU пропорционально рабочему напряжению,
+  // потому что оно задаёт жёсткость удержания.
+  const float u_drv  = ub + u_ff;
+  const float u_cog  = (blk & 1) ? (-cog_G * u_drv * cog_tab[cog_idx()]) : 0.0f;
   if (blk & 4) {
     U_int += int_Ki * err_pos * dt;
     U_int = _constrain(U_int, -int_clamp, int_clamp);
@@ -1315,6 +1321,12 @@ static float blocks_step(float w, float dt, float t_s, float err_pos) {
   acc_base += ub; acc_cog += u_cog; acc_ff += u_ff;
   acc_int += u_int; acc_dith += u_dith; acc_n++;
 
+  // ТЕЛЕМЕТРИЯ ДОЛЖНА ГОВОРИТЬ О ТОМ, ЧТО ПОДАНО. Здесь setPhaseVoltage
+  // вызывается напрямую, минуя move()/loopFOC(), поэтому motor.voltage.q не
+  // обновляется сам, а guard() считает по нему долю упора, размах и среднее
+  // Uq — и печатал остаток ПРЕДЫДУЩЕЙ команды. Значения в заголовке отрезка
+  // выглядели измеренными и не относились к прогону вовсе.
+  motor.voltage.q = u;
   motor.setPhaseVoltage(u, 0, fld_angle);
   return u;
 }
@@ -1324,7 +1336,19 @@ static void blocks_record(float w) {
   guard_reset(); blocks_reset(); n_filled = 0;
   motor.enable();
   motor.controller = MotionControlType::torque;   // move() не используем
+  // ЗНАК СВЯЗИ «датчик — поле» ОБЯЗАН БЫТЬ ИЗМЕРЕН. До команды D или A
+  // sensor_direction равен UNKNOWN, и прежняя запись молча брала -1, то есть
+  // строила обратную связь на догадке.
+  if (motor.sensor_direction == Direction::UNKNOWN) {
+    Serial.println(F("#ОТКАЗ направление не измерено: сперва D<скорость>"));
+    return;
+  }
   const float ol = (motor.sensor_direction == Direction::CW) ? 1.0f : -1.0f;
+  // ЗНАК ХОДА. Ошибка положения задавалась как ref - ol*(угол - a0), где ref
+  // растёт со знаком уставки. На ОБРАТНОМ ходу это делало обратную связь
+  // положительной: интегратор гнал бы ошибку вместо того, чтобы её убирать.
+  // Приводим ошибку к «положительная = отстаём», умножая на знак уставки.
+  const float wsgn = (w >= 0.0f) ? 1.0f : -1.0f;
   sensor.update();
   float a0 = sensor.getAngle(), ref = 0.0f, wr = 0.0f;
   uint32_t prev = micros();
@@ -1337,7 +1361,7 @@ static void blocks_record(float w) {
     if (wr < w) wr = min(wr + st, w); else if (wr > w) wr = max(wr - st, w);
     sensor.update();
     ref += wr * dt;
-    blocks_step(wr, dt, (now - tus0) * 1e-6f, ref - ol * (sensor.getAngle() - a0));
+    blocks_step(wr, dt, (now - tus0) * 1e-6f, wsgn * (ref - ol * (sensor.getAngle() - a0)));
   }
   // Ошибка положения считается ОТ КОНЦА УСТАНОВЛЕНИЯ: то, что накопилось за
   // разгон, к плавности отношения не имеет и только загнало бы интегратор.
@@ -1351,7 +1375,7 @@ static void blocks_record(float w) {
       if (dt < 0 || dt > 0.05f) dt = 0;
       sensor.update();
       ref += w * dt;
-      blocks_step(w, dt, (now - tus0) * 1e-6f, ref - ol * (sensor.getAngle() - a0));
+      blocks_step(w, dt, (now - tus0) * 1e-6f, wsgn * (ref - ol * (sensor.getAngle() - a0)));
       guard(false);
     }
     next += step_us;
