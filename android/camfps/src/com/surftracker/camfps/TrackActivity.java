@@ -1157,6 +1157,27 @@ public class TrackActivity extends Activity {
             // ---------- модель ----------
             File model = new File(getExternalFilesDir(null), mn);
             if (!flow && !model.exists()) throw new RuntimeException("нет файла модели " + mn);
+            // ПРОВЕРКА ЭФФЕКТОМ, А НЕ КОДОМ. Какое умолчание записано в
+            // RunSettings — не доказательство того, что загрузился именно этот
+            // файл: имя приходит из трёх мест (интент, сохранённый конфиг,
+            // умолчание). Печатаем ИМЯ и отпечаток первых 64К весов прямо из
+            // того File, который сейчас откроется, — эту строку и переносят в
+            // handoff/ВЫЕЗД_КОНФИГ.md.
+            if (!flow) {
+                String sha = "нет";
+                try (java.io.FileInputStream fis = new java.io.FileInputStream(model)) {
+                    byte[] head = new byte[65536];
+                    int got = 0, r;
+                    while (got < head.length && (r = fis.read(head, got, head.length - got)) > 0) got += r;
+                    java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+                    md.update(head, 0, got);
+                    StringBuilder hb = new StringBuilder();
+                    for (byte b : md.digest()) hb.append(String.format("%02x", b));
+                    sha = hb.substring(0, 16) + " (первые " + got + " Б)";
+                } catch (Exception e) { sha = "ошибка: " + e; }
+                Log.i(TAG, "МОДЕЛЬ файл=" + mn + " размер=" + model.length() + " sha256_64k=" + sha);
+                j.append(",\"модель\":\"").append(mn).append("\",\"модель_sha\":\"").append(sha).append("\"");
+            }
             if (flow) { j.append(",\"режим\":\"поток\",\"spin\":").append(fmt(spinW)); }
             // Число потоков и XNNPACK — ПАРАМЕТРЫ, а не константы. Четыре
             // потока с XNNPACK дали 550 мс на кадр, тогда как прежний рабочий

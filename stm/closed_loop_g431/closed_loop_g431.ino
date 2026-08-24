@@ -515,7 +515,12 @@ static uint32_t t_reset = 0;   //!< когда началась льгота
 // не превышал 0.43 рад/с при уставках 0.05..0.20; порог 0.8 даёт запас почти
 // вдвое и срабатывает заметно раньше порога по разгону.
 static const uint32_t VIB_WIN_MS = 200;
-static const float    VIB_LIMIT  = 0.8f;    // рад/с, размах
+// НАСТРАИВАЕМЫЙ, А НЕ КОНСТАНТА. Порог был static const, и единственный способ
+// увидеть срабатывание сторожа на железе был перезалить прошивку с другим
+// числом, потом перезалить обратно — две заливки ради одной проверки, поэтому
+// проверка не делалась ни разу. Команда '!' ставит порог на лету: занизил,
+// увидел #ОТКАЗ, вернул 0.8. Значение печатается в манифесте.
+static float          vib_limit  = 0.8f;    // рад/с, размах
 // РАЗМАХ ЗА ЗАПИСЬ И ЗА УСТАНОВЛЕНИЕ — ОТДЕЛЬНО. Иначе в отчёт попадает рывок
 // захвата ротора при включении поля, и конфигурация с размахом 0.19 за запись
 // печатается как 4.07 только потому, что в первые полторы секунды вал дёрнуло.
@@ -603,7 +608,7 @@ static void guard(bool closed) {
     else             { if (sp > vib_span_settle) vib_span_settle = sp; }
     vib_t0 = now; vib_hi = -1e9f; vib_lo = 1e9f;
     if (armed_tight || now - t_reset >= W_GRACE_MS) {
-      if (sp > VIB_LIMIT) bail("вибрация: размах скорости выше порога");
+      if (sp > vib_limit) bail("вибрация: размах скорости выше порога");
     }
   }
 
@@ -1530,6 +1535,7 @@ static void manifest() {
 #endif
   Serial.print(F(" t_мс=")); Serial.print(millis());
   Serial.print(F(" порог_срыва=")); Serial.print(slip_thr * 57.2958f, 2);
+  Serial.print(F("° порог_вибрации=")); Serial.print(vib_limit, 3);
   Serial.println(F("°"));
 }
 
@@ -1973,6 +1979,9 @@ void loop() {
         case 'z': blocks_record(a); dump("блоки", true, a); break;
         case 'n': slip_live(a); break;
         case 't': slip_thr = a / 57.2958f; Serial.print(F("#порог_срыва=")); Serial.println(a, 2); break;
+        // Порог сторожа вибрации, рад/с размаха. Занижение — способ проверить,
+        // что сторож ЖИВ, не дожидаясь настоящей аварии.
+        case '!': vib_limit = a; Serial.print(F("#порог_вибрации=")); Serial.println(a, 3); break;
         default: Serial.println(F("#? неизвестная команда"));
       }
       Serial.println(F("#ГОТОВ"));
