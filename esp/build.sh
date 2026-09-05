@@ -20,7 +20,40 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CLI="$HOME/Android/arduino/arduino-cli"
-FQBN="esp32:esp32:esp32"
+# ОПЦИИ FQBN ПЕРЕДАЮТСЯ, А НЕ ЗАШИТЫ НАГЛУХО.
+#
+# Зачем: psram_check осмыслен ТОЛЬКО при PSRAM=enabled — иначе ответ «0 байт»
+# приходит на любой плате, включая WROVER, и вердикт «модуль WROOM» становится
+# ложным. Прежде опций не было вовсе, и этот скетч собирали ручным вызовом
+# arduino-cli мимо build.sh; повтор через build.sh дал бы правдоподобный, но
+# ничего не значащий ноль. Ровно тот класс ошибки, который проект ловит:
+# величина выглядит измеренной, а измерения не было.
+#
+# Использование:  esp/build.sh psram_check --опции PSRAM=enabled
+FQBN_BASE="esp32:esp32:esp32"
+FQBN_OPTS=""
+_args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --опции) FQBN_OPTS="$2"; shift 2 ;;
+        *)       _args+=("$1"); shift ;;
+    esac
+done
+set -- "${_args[@]}"
+if [ -n "$FQBN_OPTS" ]; then
+    FQBN="$FQBN_BASE:$FQBN_OPTS"
+    echo "FQBN с опциями: $FQBN"
+else
+    FQBN="$FQBN_BASE"
+fi
+
+# ЗАЩИТА ОТ ЛОЖНОГО ЗАМЕРА PSRAM: без опции этот скетч соберётся и напечатает
+# ноль, который ничего не значит. Лучше отказать, чем выдать пустое число.
+if [ "${1:-}" = "psram_check" ] && [ -z "$FQBN_OPTS" ]; then
+    echo "ОТКАЗ: psram_check без опций даст 0 байт на ЛЮБОЙ плате."
+    echo "       Запускать так:  esp/build.sh psram_check --опции PSRAM=enabled"
+    exit 1
+fi
 
 [ -x "$CLI" ] || { echo "нет arduino-cli в $CLI"; exit 1; }
 
