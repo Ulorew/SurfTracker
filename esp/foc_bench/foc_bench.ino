@@ -78,6 +78,13 @@ static uint32_t rec_next_us = 0, rec_period_us = 1000000UL / FS;
 static uint32_t rec_n = 0, rec_need = 0, settle_until = 0;
 static float    rec_a0 = 0.0f, rec_v = 0.0f;
 static float    uq_sum = 0.0f, uq_max = 0.0f, v_sum = 0.0f;
+// РАЗБРОС Uq — ЗАТРАТЫ УПРАВЛЕНИЯ, а не результат. Метрика угла его не видит:
+// инерция вала сглаживает болтанку напряжения, и до угла она не доходит. А до
+// ОБМОТОК и до КОРПУСА доходит — владелец услышал высокочастотное дрожание и
+// почувствовал его на телефоне раньше, чем оно проявилось хоть в одном числе.
+// Квант оценки скорости 0.192 рад/с при P=4 даёт 0.77 В болтанки, то есть
+// треть доступного напряжения. Мерить это обязательно.
+static double   uq_sq = 0.0;
 
 // ---- ПРЕДПОДАЧА ПО НАПРЯЖЕНИЮ -------------------------------------------
 // Uq_пред = знак(уставки) * (FFA + FFB * |уставка|)
@@ -261,7 +268,7 @@ static void handle(const char* s) {
     field(true);
     settling = true;
     settle_until = millis() + settle;
-    uq_sum = 0; uq_max = 0; v_sum = 0; rec_n = 0;
+    uq_sum = 0; uq_max = 0; uq_sq = 0; v_sum = 0; rec_n = 0;
   } else if (!strncmp(s, "COG", 3)) {
     // COG v=0.628 sec=60 — снять таблицу зубцов.
     //
@@ -484,12 +491,15 @@ void loop() {
     Serial.println(motor.shaft_angle - rec_a0, 6);
     float u = fabsf(motor.voltage.q);
     uq_sum += u; if (u > uq_max) uq_max = u;
+    uq_sq += (double)motor.voltage.q * motor.voltage.q;
     v_sum += motor.shaft_velocity;
     if (++rec_n >= rec_need) {
       rec = false;
       target = 0.0f;
-      Serial.printf("#КОНЕЦ n=%lu uq_avg=%.3f uq_max=%.3f v_est=%.4f\n",
-                    (unsigned long)rec_n, uq_sum / rec_n, uq_max, v_sum / rec_n);
+      Serial.printf("#КОНЕЦ n=%lu uq_avg=%.3f uq_max=%.3f uq_sd=%.4f v_est=%.4f\n",
+                    (unsigned long)rec_n, uq_sum / rec_n, uq_max,
+                    sqrtf(fmaxf((float)(uq_sq/rec_n) - (uq_sum/rec_n)*(uq_sum/rec_n), 0.0f)),
+                    v_sum / rec_n);
     }
   }
 
