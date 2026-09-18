@@ -79,6 +79,46 @@ static uint32_t rec_n = 0, rec_need = 0, settle_until = 0;
 static float    rec_a0 = 0.0f, rec_v = 0.0f;
 static float    uq_sum = 0.0f, uq_max = 0.0f, v_sum = 0.0f;
 
+// ---- ПРЕДПОДАЧА ПО НАПРЯЖЕНИЮ -------------------------------------------
+// Uq_пред = знак(уставки) * (FFA + FFB * |уставка|)
+//
+// Смысл: часть напряжения нужна валу ВСЕГДА и известна заранее — трение
+// (постоянная FFA) и противо-ЭДС (пропорциональная скорости, FFB). Отдав их
+// напрямую, мы снимаем эту работу с ПИ, и шумная оценка скорости перестаёт
+// задавать выход. Это и есть «опираться на экстраполяцию, а не на энкодер»,
+// но БЕЗ платы запаздыванием — в отличие от увеличения окна оценки, которое
+// проверено и разрушает ход (MET=0.02 дал 2 градуса вместо 0.04).
+//
+// ВНИМАНИЕ: feed_forward_voltage.q прибавляется в библиотеке ПОСЛЕ
+// _constrain (FOCMotor.cpp:606), то есть ОБХОДИТ voltage_limit. Поэтому
+// бюджет делим сами: ПИ получает остаток, и сумма не вылезает за потолок.
+static float ff_a = 0.0f, ff_b = 0.0f;
+
+// ---- КОМПЕНСАЦИЯ ЗУБЦОВ ДВУМЯ ГАРМОНИКАМИ --------------------------------
+// Снято 18 сентября на 0.628 рад/с, четыре прогона по две минуты
+// (runs/cog_2026-09-18_2032 и _2045). Таблица ЦЕЛИКОМ не воспроизводится
+// (корреляция 0.83-0.87), а эти две гармоники — да:
+//     44-й: 0.0498 / 0.0495 / 0.0494 / 0.0510 В при 18.3 / 18.4 / 19.4 / 20.6°
+//     22-й: 0.0179 / 0.0204 / 0.0175 / 0.0214 В при 71.2 / 69.7 / 66.4 / 66.1°
+// Нулевой порядок 70.7 (физически невозможный) даёт 0.0073 В — это фон
+// проекции. 44-й выше него в 6.8 раза, 22-й в 2.6. Остальное в корзинах шум,
+// и подавать его обратно в мотор нельзя.
+//
+// СНЯТО НА 0.628, ПРИМЕНЯЕТСЯ НА 0.02-0.11. Зубцовый момент — функция
+// ПОЛОЖЕНИЯ и от скорости не зависит, поэтому перенос законен. Но проверить
+// это надо замером: на медленном ходу связь «Uq -> момент» может отличаться.
+//
+// ЗНАК ОПРЕДЕЛЯЕТСЯ ЗАМЕРОМ, А НЕ РАССУЖДЕНИЕМ. Ошибка знака не ослабляет
+// помеху, а УДВАИВАЕТ её. Поэтому множитель cog_k: 0 выкл, +1 прямая
+// подача, -1 обратная. Правильный знак тот, при котором дрожание падает.
+static const float COG_A44 = 0.0499f, COG_F44 = 19.7f * PI / 180.0f;
+static const float COG_A22 = 0.0193f, COG_F22 = 68.4f * PI / 180.0f;
+static const float COG_MAX = COG_A44 + COG_A22;   // потолок вклада, для бюджета
+static float cog_k = 0.0f;
+static float ff_база = 0.0f;
+
+
+
 // ---- ТАБЛИЦА ЗУБЦОВ ------------------------------------------------------
 // Копится по АБСОЛЮТНОМУ механическому углу, а не по фазе от начала записи:
 // таблица индексируется валом, и две записи обязаны складываться.
@@ -163,11 +203,11 @@ static float arg(const char* s, const char* key, float def) {
 
 static void say_state() {
   Serial.printf("# STATE P=%.3f I=%.3f D=%.3f Tf=%.4f PA=%.2f RAMP=%.0f "
-                "MET=%.4f vlim=%.2f field=%d loop_hz=%lu\n",
-                motor.PID_velocity.P, motor.PID_velocity.I, motor.PID_velocity.D,
+                "MET=%.4f vlim=%.2f FFA=%.3f FFB=%.3f COGK=%.1f field=%d loop_hz=%lu\n",
+  motor.PID_velocity.P, motor.PID_velocity.I, motor.PID_velocity.D,
                 motor.LPF_velocity.Tf, motor.P_angle.P,
                 motor.PID_velocity.output_ramp, sensor.min_elapsed_time,
-                motor.voltage_limit, (int)field_on, (unsigned long)loop_hz);
+                motor.voltage_limit, ff_a, ff_b, cog_k, (int)field_on, (unsigned long)loop_hz);
 }
 
 static void field(bool on) {
@@ -177,6 +217,19 @@ static void field(bool on) {
   digitalWrite(PIN_LED, on);
 }
 
+static void применить_предподачу(float цель) {
+  float ff = ff_a + ff_b * fabsf(цель);
+  if (цель < 0) ff = -ff; else if (цель == 0) ff = 0;
+  // Бюджет учитывает и зубцовую добавку: она тоже идёт мимо ограничителя.
+  float остаток = V_LIMIT - fabsf(ff) - (cog_k != 0.0f ? COG_MAX : 0.0f);
+  if (остаток < 0.3f) {            // ПИ нельзя оставлять совсем без бюджета
+    остаток = 0.3f;
+    ff = (V_LIMIT - 0.3f) * (ff < 0 ? -1.0f : 1.0f);
+  }
+  ff_база = ff;
+  motor.feed_forward_voltage.q = ff;
+  motor.updateVoltageLimit(остаток);   // именно так: прямая запись не трогает PID.limit
+}
 static void handle(const char* s) {
   last_cmd_ms = millis();
   if (!strncmp(s, "SET", 3)) {
@@ -192,6 +245,9 @@ static void handle(const char* s) {
     // от квантования составляет ±0.077 рад/с — почти всю величину. Регулятор
     // в таких условиях не отличает зубцы от собственного шума.
     sensor.min_elapsed_time = arg(s, "MET", sensor.min_elapsed_time);
+    ff_a = arg(s, "FFA", ff_a);
+    ff_b = arg(s, "FFB", ff_b);
+    cog_k = arg(s, "COGK", cog_k);
     // Интегратор сбрасывается при смене коэффициентов. Иначе накопленное
     // прошлым набором доехало бы в следующую ячейку и меряли бы мы историю.
     motor.PID_velocity.reset();
@@ -201,6 +257,7 @@ static void handle(const char* s) {
     rec_need = (uint32_t)(arg(s, "t", 8000.0f) / 1000.0f * FS);
     uint32_t settle = (uint32_t)arg(s, "s", 2000.0f);
     target = rec_v;
+    применить_предподачу(target);
     field(true);
     settling = true;
     settle_until = millis() + settle;
@@ -220,7 +277,7 @@ static void handle(const char* s) {
     cog_on = true; cog_until_ms = millis() + (uint32_t)(sec * 1000.0f);
     Serial.printf("# ЗУБЦЫ старт v=%.3f sec=%.0f корзин=%d\n", v, sec, COG_N);
   } else if (!strncmp(s, "OFF", 3)) {
-    target = 0.0f; field(false); rec = false; settling = false;
+    target = 0.0f; применить_предподачу(0.0f); field(false); rec = false; settling = false;
     Serial.println("# OFF");
   } else if (!strncmp(s, "DEMO", 4)) {
     demo = true; demo_i = 0; demo_t0 = millis();
@@ -287,9 +344,19 @@ void setup() {
   // P=2.0 I=80 Tf=0.05: отставание 0.999, дрожание 0.18°, Uq макс 1.19 из 2.0.
   // Границы рядом с обеих сторон: I=120 срывается на 1 рад/с, P=2.5 с I=80
   // срывается везде, Tf ниже 0.05 уводит контур в насыщение при стоящем вале.
-  motor.PID_velocity.P = 2.0f; motor.PID_velocity.I = 80.0f;
+  // УМОЛЧАНИЯ ПОД МОТОР iFlight 3506, замерено 18 сентября.
+  //
+  // Прежние P=2.0 I=80 — от мотора 4108, и на 3506 они РАЗРУШАЮТ ход выше
+  // 0.3 рад/с: СКО остатка 14.5 град, вал срывается и наверстывает. Оставлять
+  // их умолчанием опасно: любой сброс платы возвращает чужие коэффициенты, и
+  // инструмент, забывший выставить P и I, молча снимает мусор. Так и вышло со
+  // съёмом таблицы зубцов 18 сентября.
+  //
+  // Выбрано началом плато, а не нижней точкой: от P=4 до P=6 выигрыш 5%, а
+  // запас по фазе тает. Tf=0.01 — настоящий минимум, ниже и выше хуже.
+  motor.PID_velocity.P = 4.0f; motor.PID_velocity.I = 5.0f;
   motor.PID_velocity.D = 0.0f; motor.PID_velocity.output_ramp = 200.0f;
-  motor.LPF_velocity.Tf = 0.05f; motor.P_angle.P = 6.0f;
+  motor.LPF_velocity.Tf = 0.01f; motor.P_angle.P = 6.0f;
 
   Serial.println();
   Serial.println("# == стенд контура, команды по serial ==");
@@ -305,6 +372,14 @@ void setup() {
 }
 
 void loop() {
+  // ЗУБЦОВАЯ ДОБАВКА СЧИТАЕТСЯ КАЖДЫЙ ТАКТ по АБСОЛЮТНОМУ углу вала:
+  // помеха привязана к положению, а не ко времени и не к фазе от старта.
+  if (cog_k != 0.0f && field_on) {
+    float th = sensor.getMechanicalAngle();
+    float доб = COG_A44 * cosf(44.0f * th - COG_F44)
+              + COG_A22 * cosf(22.0f * th - COG_F22);
+    motor.feed_forward_voltage.q = ff_база + cog_k * доб;
+  }
   motor.loopFOC();
   motor.move(target);
 
