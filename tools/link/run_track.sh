@@ -42,6 +42,14 @@ else
 fi
 
 adb shell am force-stop com.surftracker.camfps >/dev/null 2>&1 || true
-adb shell am start -n com.surftracker.camfps/.TrackActivity "$@" >/dev/null
+# АДРЕС ПЛАТЫ — ЯВНО, если не задан в аргументах. Телефон с ESP32 не
+# сопряжён (сокет незащищённый), поиск по имени среди сопряжённых пуст
+# всегда, а --ez defaults true отбрасывает адрес из сохранённых настроек.
+# Оставался бы лишь «последний удачный адрес» — запасной путь, который на
+# чистой установке пуст. Замерено 24 сентября: BtLinkActivity без адреса
+# отказал с «устройство не найдено».
+MAC_ARGS=()
+case " $* " in *" mac "*) ;; *) MAC_ARGS=(--es mac 38:18:2B:30:7D:86) ;; esac
+adb shell am start -n com.surftracker.camfps/.TrackActivity "${MAC_ARGS[@]}" "$@" >/dev/null
 echo
 echo "ЗАПУЩЕНО. На телефоне кнопка СТАРТ."

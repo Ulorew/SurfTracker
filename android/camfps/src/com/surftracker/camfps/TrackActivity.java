@@ -1092,6 +1092,19 @@ public class TrackActivity extends Activity {
             rq.addTarget(reader.getSurface());
             if (previewSurface != null) rq.addTarget(previewSurface);
             if (video) { rq.addTarget(recSurface); }
+            final float focusD = cfg.f("focus");
+            if (focusD >= 0.0f) {
+                // Ручной фокус: автофокус выключается, линза ставится на
+                // заданные диоптрии. Применился ли — видно в логе по
+                // LENS_FOCUS_DISTANCE из результата, а не по заказу.
+                try {
+                    rq.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF);
+                    rq.set(CaptureRequest.LENS_FOCUS_DISTANCE, focusD);
+                    Log.i(TAG, "ручной фокус " + focusD + " дптр");
+                } catch (Throwable t) {
+                    Log.e(TAG, "фокус не принят: " + t);
+                }
+            }
             if (zoom > 1.0f) {
                 try {
                     rq.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom);
@@ -1106,6 +1119,7 @@ public class TrackActivity extends Activity {
             // было нечем — а без проверки «зум применился» остаётся
             // предположением. Заодно отсюда берётся метка кадра в тех же
             // терминах, в каких её отдаёт Image.
+            final long[] focusLogS = {-1};
             final java.util.concurrent.ConcurrentHashMap<Long, Float> zoomOf =
                     new java.util.concurrent.ConcurrentHashMap<>();
             final java.util.concurrent.ConcurrentHashMap<Long, Long> expOf =
@@ -1117,6 +1131,11 @@ public class TrackActivity extends Activity {
                         CaptureRequest req, TotalCaptureResult res) {
                     try {
                         Long ts = res.get(CaptureResult.SENSOR_TIMESTAMP);
+                        Float fd = res.get(CaptureResult.LENS_FOCUS_DISTANCE);
+                        if (fd != null && ts != null && (ts / 1_000_000_000L) != focusLogS[0]) {
+                            focusLogS[0] = ts / 1_000_000_000L;
+                            Log.i(TAG, "фокус факт " + fd + " дптр");
+                        }
                         Float z = res.get(CaptureResult.CONTROL_ZOOM_RATIO);
                         // ВЫДЕРЖКА И ЧУВСТВИТЕЛЬНОСТЬ. Без них «света хватало»
                         // остаётся оценкой на глаз: часть механизмов ISP

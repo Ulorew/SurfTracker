@@ -361,7 +361,14 @@ void setup() {
   motor.velocity_limit       = 3.0f;
   motor.PID_velocity.P = 4.0f; motor.PID_velocity.I = 5.0f;
   motor.PID_velocity.D = 0.0f; motor.PID_velocity.output_ramp = 200.0f;
-  motor.LPF_velocity.Tf = 0.01f;
+  // Tf=0.12, А НЕ 0.01 ИЗ foc_bench. Замер 24 сентября акселерометром
+  // телефона в люльке, вал стоит, поле включено, два повтора вперемешку:
+  //   Tf=0.01 -> вибрация x140 от фона; 0.04 -> x26; 0.06 -> x15; 0.12 -> x8.
+  // Ход по энкодеру при этом не меняется: СКО 0.09-0.19 град во всём ряду
+  // 0.04-0.12 на 0.05 / 0.11 / 0.3 рад/с. Tf=0.01 выбирался 18 сентября по
+  // дрожанию угла вала — прибором, который вибрацию люльки не видит, — и в
+  // кадре он съедал резкость в 5-19 раз.
+  motor.LPF_velocity.Tf = 0.12f;
 
   motor.init();
   if (!motor.initFOC()) { Serial.println("# ОТКАЗ: initFOC"); while (1) { digitalWrite(PIN_LED, (millis() >> 6) & 1); } }

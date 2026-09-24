@@ -25,8 +25,14 @@ ADB = __import__("os").path.expanduser("~/Android/sdk/platform-tools/adb")
 PKG = "com.surftracker.camfps"
 DIRP = f"/storage/emulated/0/Android/data/{PKG}/files/link"
 
+SERIAL = None   # КОНКРЕТНОЕ устройство: телефон бывает виден в adb дважды
+                # (mdns и явное подключение), и adb shell без -s отказывает.
+                # Пустой ответ читался как «телефон спит» — ложный отказ.
+
 def adb(*a, t=60):
-    return subprocess.run([ADB, *a], capture_output=True, text=True, timeout=t).stdout
+    cmd = [ADB] + (["-s", SERIAL] if SERIAL else []) + list(a)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=t)
+    return r.stdout + r.stderr
 
 def usb_open():
     port = glob.glob("/dev/serial/by-id/*CP2102*")[0]
@@ -48,12 +54,23 @@ def main():
     ap.add_argument("--period", type=float, default=8.0)
     ap.add_argument("--sec", type=int, default=30)
     ap.add_argument("--out", default="runs/link_field")
+    # MAC платы — явно. Телефон с ESP32 не сопряжён, а поиск по имени идёт
+    # только среди сопряжённых: без MAC приложение пишет «устройство не
+    # найдено» в JSON и молча отдаёт пустой CSV.
+    ap.add_argument("--mac", default="38:18:2B:30:7D:86")
     a = ap.parse_args()
 
-    if "connected" not in adb("connect", a.adb) and a.adb not in adb("devices"):
+    global SERIAL
+    adb("connect", a.adb)
+    if f"{a.adb}\tdevice" not in adb("devices"):
         sys.exit("ОТКАЗ: телефон не подключился по adb")
-    if "mWakefulness=Awake" not in adb("shell", "dumpsys", "power"):
-        sys.exit("ОТКАЗ: телефон спит")
+    SERIAL = a.adb
+    pw = adb("shell", "dumpsys", "power")
+    m = re.search(r"mWakefulness=(\w+)", pw)
+    if not m:
+        sys.exit(f"ОТКАЗ: состояние экрана не прочитано, ответ adb: {pw.strip()[:120]}")
+    if m.group(1) != "Awake":
+        sys.exit(f"ОТКАЗ: телефон спит ({m.group(1)})")
     tag = time.strftime("bt_%m%d_%H%M%S")
     print(f"прогон {tag}: синус {a.amp} рад/с, период {a.period} с, {a.sec} с")
     print("вал не трогать")
@@ -61,7 +78,7 @@ def main():
     s = usb_open()
     adb("shell", "am", "force-stop", PKG)
     adb("shell", "am", "start", "-n", f"{PKG}/.BtLinkActivity",
-        "--es", "tag", tag, "--es", "mode", "sine",
+        "--es", "tag", tag, "--es", "mode", "sine", "--es", "mac", a.mac,
         "--ef", "amp", str(a.amp), "--ef", "period", str(a.period),
         "--ei", "hz", "10", "--ei", "seconds", str(a.sec))
     time.sleep(a.sec / 2)
@@ -79,7 +96,11 @@ def main():
     if not os.path.exists(f"{a.out}/{tag}.csv"):
         sys.exit(f"ОТКАЗ: лог телефона не найден ({DIRP}/{tag}.csv)")
     rows = list(csv.DictReader(open(f"{a.out}/{tag}.csv", encoding="utf-8")))
-    js = json.load(open(f"{a.out}/{tag}.json", encoding="utf-8"))
+    # JSON приложения читается как текст: при отказе он приходит битым
+    # («{,"ok_flag":false,...}»), а причина отказа нужна именно тогда.
+    js = open(f"{a.out}/{tag}.json", encoding="utf-8").read()
+    if '"ok_flag":false' in js or not rows:
+        sys.exit(f"ОТКАЗ ПРИЛОЖЕНИЯ: {js.strip()[:200]}")
 
     print("\n=== СВЯЗЬ ===")
     got = [r for r in rows if r.get("rtt_ms") not in (None, "", "nan")]
