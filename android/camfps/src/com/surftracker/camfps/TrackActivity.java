@@ -1092,6 +1092,17 @@ public class TrackActivity extends Activity {
             rq.addTarget(reader.getSurface());
             if (previewSurface != null) rq.addTarget(previewSurface);
             if (video) { rq.addTarget(recSurface); }
+            final int ois = cfg.i("ois"), eis = cfg.i("eis");
+            if (ois >= 0) try {
+                rq.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, ois == 0
+                        ? CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF
+                        : CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON);
+            } catch (Throwable t) { Log.e(TAG, "OIS не принят: " + t); }
+            if (eis >= 0) try {
+                rq.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, eis == 0
+                        ? CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+                        : CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON);
+            } catch (Throwable t) { Log.e(TAG, "EIS не принят: " + t); }
             final float focusD = cfg.f("focus");
             if (focusD >= 0.0f) {
                 // Ручной фокус: автофокус выключается, линза ставится на
@@ -1134,7 +1145,9 @@ public class TrackActivity extends Activity {
                         Float fd = res.get(CaptureResult.LENS_FOCUS_DISTANCE);
                         if (fd != null && ts != null && (ts / 1_000_000_000L) != focusLogS[0]) {
                             focusLogS[0] = ts / 1_000_000_000L;
-                            Log.i(TAG, "фокус факт " + fd + " дптр");
+                            Log.i(TAG, "фокус факт " + fd + " дптр, OIS факт "
+                                    + res.get(CaptureResult.LENS_OPTICAL_STABILIZATION_MODE)
+                                    + ", EIS факт " + res.get(CaptureResult.CONTROL_VIDEO_STABILIZATION_MODE));
                         }
                         Float z = res.get(CaptureResult.CONTROL_ZOOM_RATIO);
                         // ВЫДЕРЖКА И ЧУВСТВИТЕЛЬНОСТЬ. Без них «света хватало»
@@ -1508,7 +1521,28 @@ public class TrackActivity extends Activity {
             final InputStream fis = is;
             final boolean fdry = dry;
             final List<Double> flat = lat;
+            final boolean fsmooth = cfg.b("smooth");
             Thread sender = new Thread(() -> {
+                // ПРОФИЛЬ УСТАВКИ, кусочно-линейный (при smooth=true).
+                //
+                // Зрение даёт команду раз в такт (~213 мс), канал шлёт на 10 Гц.
+                // Прежде между кадрами повторялось одно число с w_dot=0, и
+                // скорость вала шла лестницей: рампа платы отрабатывала скачок
+                // за 70 мс, дальше вал стоял на ступеньке до следующего кадра.
+                //
+                // Теперь новая команда не прыжок, а ОТРЕЗОК: от значения
+                // профиля в момент прихода к новой команде за один такт
+                // зрения. Интерполяция, не экстраполяция: вал никогда не
+                // едет дальше того, что просило зрение, — запаздывание на
+                // полтакта вместо выбега за цель. Владелец: для съёмки
+                // запаздывание лучше колебания.
+                //
+                // В пакет — значение профиля СЕЙЧАС и наклон ДО СЛЕДУЮЩЕГО
+                // пакета: плата экстраполирует по w_dot между пакетами и
+                // встречает следующий пакет ровно там, где профиль будет.
+                final long period = 100_000_000L;      // шаг канала, 10 Гц — как ниже
+                long segT0 = 0, segT1 = 0, lastCmdNs = 0;
+                float segW0 = 0.0f, segW1 = 0.0f;
                 byte[] sreq = new byte[ProtoV2.REQ_LEN];
                 byte[] buf = new byte[4096];
                 int bn = 0;
@@ -1536,13 +1570,38 @@ public class TrackActivity extends Activity {
                             // механизм не срабатывал, тогда как механизма не
                             // было вовсе.
                             float wSend = wCmd;
+                            float wdSend = 0.0f;
+                            long nowNs = System.nanoTime();
+                            boolean stale = false;
                             if (wCmdNs == 0) {
                                 wSend = 0.0f;          // команды ещё не было
-                            } else if (System.nanoTime() - wCmdNs > staleNs) {
+                                stale = true;
+                            } else if (nowNs - wCmdNs > staleNs) {
                                 if (wSend != 0.0f) staleZeros++;
                                 wSend = 0.0f;
+                                stale = true;
                             }
-                            ProtoV2.buildReq(sreq, q, wSend, 0.0f);
+                            if (fsmooth) {
+                                if (stale) {
+                                    // Протухло — ноль сразу, профиль сброшен:
+                                    // плавность не повод крутить вслепую.
+                                    segW0 = segW1 = 0.0f; segT0 = segT1 = nowNs;
+                                    lastCmdNs = wCmdNs;
+                                } else {
+                                    long c = wCmdNs;
+                                    if (c != lastCmdNs) {
+                                        float cur = profileAt(segT0, segW0, segT1, segW1, nowNs);
+                                        long T = (long) (Math.max(100.0, Math.min(400.0, tickAvgMs)) * 1e6);
+                                        segT0 = nowNs; segW0 = cur;
+                                        segT1 = nowNs + T; segW1 = wCmd;
+                                        lastCmdNs = c;
+                                    }
+                                    wSend = profileAt(segT0, segW0, segT1, segW1, nowNs);
+                                    float wNext = profileAt(segT0, segW0, segT1, segW1, nowNs + period);
+                                    wdSend = (wNext - wSend) / (period * 1e-9f);
+                                }
+                            }
+                            ProtoV2.buildReq(sreq, q, wSend, wdSend);
                             sendNs[q] = System.nanoTime();
                             fos.write(sreq); fos.flush();
                             sq++;
@@ -1574,7 +1633,7 @@ public class TrackActivity extends Activity {
                                 if (p > 0) { System.arraycopy(buf, p, buf, 0, bn - p); bn -= p; }
                             }
                         }
-                        next += 100_000_000L;
+                        next += period;
                         long sl = next - System.nanoTime();
                         if (sl > 0) Thread.sleep(sl / 1_000_000L, (int) (sl % 1_000_000L));
                         else next = System.nanoTime();
@@ -2623,6 +2682,13 @@ public class TrackActivity extends Activity {
      * getExtras().get(key) — иначе --ei seconds 180 из скрипта пришёл бы как
      * Integer, getString вернул бы null, и параметр молча уехал бы в умолчание.
      */
+    /** Значение кусочно-линейного профиля уставки в момент t (нс). */
+    static float profileAt(long t0, float w0, long t1, float w1, long t) {
+        if (t >= t1 || t1 <= t0) return w1;
+        if (t <= t0) return w0;
+        return w0 + (w1 - w0) * (float) ((double) (t - t0) / (double) (t1 - t0));
+    }
+
     static final class Cfg {
         private final RunSettings.Source intent, saved;
 

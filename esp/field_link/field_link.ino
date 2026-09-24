@@ -58,7 +58,7 @@ static const int PIN_SCK = 14, PIN_MISO = 27, PIN_MOSI = 26, PIN_CS = 25;
 static const int PIN_LED = 2;
 
 static const float POLE_PAIRS = 11;       // замерено, не из паспорта
-static const float V_SUPPLY   = 12.0f;
+static const float V_SUPPLY   = 11.7f;     // аккумулятор через понизитель, 24.09
 static const float V_LIMIT    = 2.0f;     // правило владельца для долгой работы
 static const float V_ALIGN    = 1.0f;
 
