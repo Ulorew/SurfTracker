@@ -68,7 +68,10 @@ static const float V_ALIGN    = 1.0f;
 // часовой, если смотреть сверху. Спецификация требует обратного. Проводка
 // фаз с тех пор не менялась, а направление move() задаётся именно ею: initFOC
 // подгоняет знак датчика под поле, а не наоборот.
-// ГЛАЗАМИ НЕ ПОДТВЕРЖДЁН — до подтверждения это вывод, а не замер.
+// ПОДТВЕРЖДЁН ЖИВЫМ СЛЕЖЕНИЕМ 24 сентября (runs/field_2609/260924_1025_live1):
+// 90 с, человек ходит в 2-3 м, на цели 99.5%, потерь 0, вал прошёл 69°,
+// ошибка при ходьбе 8-11° в среднем, стоя 1.2°. С обратным знаком ошибка
+// разошлась бы до края кадра за секунды.
 static const int DIR = -1;
 
 static const char* BT_NAME = "SurfTracker-Link";
@@ -388,7 +391,7 @@ void setup() {
   C.init(cp);
 
   SerialBT.begin(BT_NAME);
-  Serial.printf("# field_link ГОТОВ: %s, DIR=%d (вывод из видео, глазами не подтверждён), dirS=%d zea=%.4f vlim=%.2f\n",
+  Serial.printf("# field_link ГОТОВ: %s, DIR=%d, dirS=%d zea=%.4f vlim=%.2f\n",
                 BT_NAME, DIR, dirS, motor.zero_electric_angle, V_LIMIT);
   loop_prev_us = micros();
   loop_t0 = millis();
