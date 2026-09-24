@@ -38,13 +38,15 @@
  *   TEST v=0.3 t=3000      подать уставку через ТОТ ЖЕ путь, что у телефона
  *                          (accept -> рампа -> DIR -> мотор). Отказ, если
  *                          телефон подключён: два источника не смешиваются.
- *   SET P= I= Tf= COGK=    правка на месте, без перепрошивки
+ *   SET P= I= Tf= COGK=    правка на месте, без перепрошивки (до сброса)
+ *   SET ACC=0.3            рампа, рад/с^2; ХРАНИТСЯ в памяти платы
  *
  * Сборка:  esp/build.sh field_link [--прошить]
  */
 
 #include <SimpleFOC.h>
 #include "BluetoothSerial.h"
+#include <Preferences.h>
 #include <proto_v2.h>
 #include <control_v2.h>
 
@@ -107,6 +109,16 @@ MagneticSensorSPI sensor = MagneticSensorSPI(AS5048_SPI, PIN_CS);
 SPIClass          spi(VSPI);
 BluetoothSerial   SerialBT;
 static ctl::Ctl   C;
+Preferences       prefs;
+
+// РАМПА НАСТРАИВАЕТСЯ В ПОЛЕ и ПЕРЕЖИВАЕТ СБРОС. Живое слежение 24 сентября
+// дало «резковатое» движение: телефон шлёт уставку раз в 213 мс и всегда с
+// w_dot=0, скачок за такт до 0.07 рад/с (p90), а рампа 1.0 рад/с^2 отрабатывает
+// его за 70 мс — дальше скорость стоит до следующего такта. Лестница 4.7 Гц.
+// Мягче рампа — непрерывнее скорость, но медленнее реакция на рывок цели.
+// Подбирать на воде: SET ACC=0.3. Хранится в NVS, потому что открытие
+// USB-порта перезагружает плату и несохранённая правка пропала бы.
+static const float ACC_MIN = 0.05f, ACC_MAX = 2.0f;
 
 static int      dirS = 1;              // sensor_direction после initFOC
 static bool     field_on = false;
@@ -289,7 +301,7 @@ static float arg(const char* s, const char* key, float def) {
 static void sayState() {
   Serial.printf("# STATE DIR=%d dirS=%d zea=%.4f field=%d link=%d wd=%d w_ramp=%.4f "
                 "theta=%.4f enc_ok=%d enc_fault=%d slip=%d rx=%lu tx=%lu crc=%lu "
-                "loop_hz=%lu loop_max_us=%lu P=%.2f I=%.2f Tf=%.4f COGK=%.1f vlim=%.2f\n",
+                "loop_hz=%lu loop_max_us=%lu P=%.2f I=%.2f Tf=%.4f COGK=%.1f ACC=%.2f vlim=%.2f\n",
                 DIR, dirS, motor.zero_electric_angle, (int)field_on,
                 (int)SerialBT.hasClient(), (int)C.st_watchdog, C.w_ramp, thetaProto(),
                 (int)encoderOk(), (int)enc_fault, (int)C.st_slip,
@@ -297,7 +309,7 @@ static void sayState() {
                 (unsigned long)crc_err_count, (unsigned long)loop_hz,
                 (unsigned long)loop_max_shown,
                 motor.PID_velocity.P, motor.PID_velocity.I, motor.LPF_velocity.Tf,
-                cog_k, V_LIMIT);
+                cog_k, C.p.max_accel, V_LIMIT);
 }
 
 static void handle(const char* s) {
@@ -317,6 +329,12 @@ static void handle(const char* s) {
     motor.PID_velocity.I  = arg(s, "I", motor.PID_velocity.I);
     motor.LPF_velocity.Tf = arg(s, "Tf", motor.LPF_velocity.Tf);
     cog_k                 = arg(s, "COGK", cog_k);
+    float acc = arg(s, "ACC", C.p.max_accel);
+    if (acc != C.p.max_accel) {
+      acc = constrain(acc, ACC_MIN, ACC_MAX);
+      C.p.max_accel = acc;
+      prefs.putFloat("acc", acc);          // переживает сброс платы
+    }
     motor.PID_velocity.reset();
     sayState();
   } else {
@@ -388,11 +406,13 @@ void setup() {
   if (!rec_th || !rec_w || !rec_fl) Serial.println("# запись в память недоступна: нет кучи");
 
   ctl::Params cp = ctl::defaults();          // значения спецификации §4
+  prefs.begin("field_link", false);
+  cp.max_accel = constrain(prefs.getFloat("acc", cp.max_accel), ACC_MIN, ACC_MAX);
   C.init(cp);
 
   SerialBT.begin(BT_NAME);
-  Serial.printf("# field_link ГОТОВ: %s, DIR=%d, dirS=%d zea=%.4f vlim=%.2f\n",
-                BT_NAME, DIR, dirS, motor.zero_electric_angle, V_LIMIT);
+  Serial.printf("# field_link ГОТОВ: %s, DIR=%d, dirS=%d zea=%.4f vlim=%.2f ACC=%.2f\n",
+                BT_NAME, DIR, dirS, motor.zero_electric_angle, V_LIMIT, C.p.max_accel);
   loop_prev_us = micros();
   loop_t0 = millis();
 }
