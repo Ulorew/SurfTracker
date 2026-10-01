@@ -1,4 +1,4 @@
-"""Перевод пиксели <-> углы (тикет "ночь", п.2.0).
+"""Перевод пиксели <-> углы.
 
 Главный тест — тождество пиксель -> угол -> пиксель по ВСЕМУ кадру, включая
 углы: именно там малоугловое приближение расходится с честным atan, и именно
@@ -65,7 +65,8 @@ class TestNotSmallAngleApproximation:
 class TestIntrinsicsTable:
     def test_every_clip_folder_resolves(self):
         import os
-        root = "/home/ulorew/Projects/SurfTracker/Data/frames/val_manual"
+        root = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "..", "..", "Data", "frames", "val_manual")
         if not os.path.isdir(root):
             pytest.skip("нет папки клипов")
         for name in sorted(os.listdir(root)):
@@ -119,7 +120,8 @@ class TestIntrinsicsTable:
         import os
 
         import cv2
-        root = "/home/ulorew/Projects/SurfTracker/Data/frames/val_manual"
+        root = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "..", "..", "Data", "frames", "val_manual")
         if not os.path.isdir(root):
             pytest.skip("нет папки клипов")
         seen = set()

@@ -35,6 +35,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+# Корень репозитория: умолчания путей считаются от него, а не от cwd.
+REPO = Path(__file__).resolve().parent.parent
+
 VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".mts", ".webm"}
 
 
@@ -193,9 +196,9 @@ def main() -> int:
         description="Extract every Nth frame from videos, filtering duplicates and blur.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--src", type=Path, default=Path("/home/ulorew/Projects/SurfTracker/Data/videos"),
+    p.add_argument("--src", type=Path, default=REPO / "Data" / "videos",
                    help="video file, or directory to scan for videos")
-    p.add_argument("--out", type=Path, default=Path("/home/ulorew/Projects/SurfTracker/Data/frames/labeled"),
+    p.add_argument("--out", type=Path, default=REPO / "Data" / "frames" / "labeled",
                    help="output directory for JPEGs")
     p.add_argument("--step", type=int, default=15,
                    help="keep every Nth frame")

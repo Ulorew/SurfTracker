@@ -114,7 +114,7 @@ class Placement(NamedTuple):
 
 def resolve_placement(square: Square, frame_w: int, frame_h: int,
                        window_size: "Optional[int]" = None) -> Placement:
-    """Без паддинга (тикет "пробные прогоны", правка 1): никогда не берём
+    """Без паддинга: никогда не берём
     меньше window_size РЕАЛЬНЫХ пикселей кадра — вместо докрашивания серым
     расширяем область захвата. Сдвигаем внутрь кадра (clamp_box_to_frame),
     сжимаем сторону до размера кадра только если сам запрошенный квадрат

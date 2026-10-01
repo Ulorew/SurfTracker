@@ -16,7 +16,7 @@
 Открытие USB-порта ПЕРЕЗАГРУЖАЕТ плату, поэтому порт открывается ДО старта
 приложения и держится открытым до конца.
 
-    bt_sine.py --adb 192.168.1.6:PORT [--amp 0.2 --period 8 --sec 30]
+    bt_sine.py --adb <IP>:PORT [--amp 0.2 --period 8 --sec 30]
 """
 import argparse, csv, glob, io, json, math, subprocess, sys, time, re
 import numpy as np, serial

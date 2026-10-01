@@ -6,7 +6,7 @@
 # съёмки. Это грубая статистика для сравнения со стресс-подборкой, а не
 # вердикт о трекере.
 set -u
-cd /home/ulorew/Projects/SurfTracker
+cd "$(dirname "$0")/../.."
 PY=.venv/bin/python
 W=models/night_legacy_s3_best.pt
 OUT=tools/windowing/output/yt_pass

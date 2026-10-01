@@ -62,7 +62,7 @@ def test_no_upscale_keeps_native_resolution():
 
 
 def test_undersized_square_expands_to_real_content_not_padding():
-    """Паддинга больше нет (тикет "пробные прогоны", правка 1): сторона < 640
+    """Паддинга больше нет: сторона < 640
     -> область захвата расширяется до WINDOW_SIZE реальных пикселей кадра,
     а не докрашивается заливкой."""
     frame = make_frame(2000, 1600)

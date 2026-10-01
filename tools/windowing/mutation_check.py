@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Мутационный прогон (тикет "ночь", блок 3).
+"""Мутационный прогон.
 
 Единственный известный способ отличить тест, который что-то проверяет, от
 теста, который просто выполняется. Меняет исходник в одном месте и смотрит,
@@ -27,7 +27,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# Модули, написанные/переписанные в ночном тикете: по регламенту выживший
+# Модули, написанные/переписанные в ночной серии: по регламенту выживший
 # мутант здесь — блокер, в остальном коде идёт в список долга.
 NEW_TONIGHT = ["angles.py", "track_kalman.py", "track_logic.py", "track_filters.py",
                "sample_window.py", "online_dataset.py", "dataset_gen.py", "track_run.py"]
@@ -187,7 +187,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--files", nargs="+", default=None)
     ap.add_argument("--all-new", action="store_true",
-                     help=f"модули ночного тикета: {' '.join(NEW_TONIGHT)}")
+                     help=f"модули ночной серии: {' '.join(NEW_TONIGHT)}")
     ap.add_argument("--tests", nargs="+", default=["tests"])
     ap.add_argument("--jobs", "-j", type=int, default=max(1, (os.cpu_count() or 4) - 2))
     ap.add_argument("--limit-per-file", type=int, default=None,

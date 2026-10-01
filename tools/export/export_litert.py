@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Экспорт модели в LiteRT (.tflite) — тикет "экспорт на телефон", п.1.
+"""Экспорт модели в LiteRT (.tflite) для телефона.
 
 Новый официальный путь ultralytics: format="litert" (litert_torch, torch ->
 LiteRT напрямую). Старый путь через onnx2tf/saved_model объявлен deprecated и

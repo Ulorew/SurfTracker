@@ -148,7 +148,7 @@ class TestBoxCenterAndSize:
 
 class TestResolvePlacement:
     def test_no_padding_expands_undersized_square_to_window(self):
-        """Контракт "без паддинга" (тикет "пробные прогоны"): запрошенная
+        """Контракт "без паддинга": запрошенная
         сторона меньше window_size -> реально вырезаемая область всё равно
         ровно window_size (расширение захвата, не докраска)."""
         placement = resolve_placement(Square(cx=500, cy=500, side=50), 2000, 1600, window_size=640)

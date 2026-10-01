@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Обучение в боевом режиме — 640, окна из dataset_gen.py (тикет, п.6).
+"""Обучение в боевом режиме — 640, окна из dataset_gen.py.
 
 Переиспользует проверенный рецепт гиперпараметров Datasets/dataset_v1/train.py
 (single_cls, degrees=3, flipud=0, hsv_h=0.005, close_mosaic=20, patience=30) —
@@ -28,7 +28,7 @@ def config_hash(config_path: str = DEF_CONFIG_PATH) -> str:
 
 def frame_list_hash(data_yaml_path: str) -> "str | None":
     """Хеш отсортированного списка имён train-картинок — фиксирует ровно
-    то, на чём училась модель (тикет "подготовка ночи", патч 5)."""
+    то, на чём училась модель."""
     import yaml
     cfg = yaml.safe_load(open(data_yaml_path))
     base = cfg.get("path", ".")
@@ -58,10 +58,10 @@ def labeling_version(data_yaml_path: str):
 
 def describe_optimizer(optimizer) -> str:
     """Реальная строка оптимизатора из живого torch-объекта после
-    model.train(), а не из args.yaml (тикет "патч v2", п.1): args.yaml
+    model.train(), а не из args.yaml: args.yaml
     фиксирует что попросили, не что сработало — при optimizer='auto'
     ultralytics пересчитывает lr/momentum сам и печатает только в лог, не
-    в args.yaml (см. "ignoring lr0=..." в истории этой сессии)."""
+    в args.yaml (см. строку "ignoring lr0=..." в логе обучения)."""
     pg = optimizer.param_groups[0]
     lr = pg.get("lr")
     if "momentum" in pg:
@@ -77,7 +77,7 @@ def effective_mismatches(desc: str, want_optimizer: str, want_lr0: float,
                           lr_tol: float = 1e-9) -> "list[str]":
     """Расхождения между тем, что попросили, и тем, что реально построилось.
 
-    Регламент (тикет "ночь", блок 3): прогон, у которого effective расходится
+    Регламент: прогон, у которого effective расходится
     с заявкой, обязан падать НА СТАРТЕ, а не давать через час результат, из
     которого потом делают выводы. Так уже случилось: с optimizer='auto'
     ultralytics молча игнорировал переданный lr0 ("ignoring lr0=..." в логе),
@@ -102,7 +102,7 @@ def effective_mismatches(desc: str, want_optimizer: str, want_lr0: float,
 
 
 def weight_hash(module) -> str:
-    """SHA256 по всем float-параметрам модели (тикет "патч v2", п.1) —
+    """SHA256 по всем float-параметрам модели —
     сравнение весов после эпохи 1 между прогонами ловит случаи, когда
     CLI-параметр был принят, но не подействовал на само обучение (то, что
     args.yaml и даже 'эффективный' лог-текст не поймают, если сама
@@ -139,8 +139,7 @@ def make_online_trainer_class(frames_dir: str, variants_dir: str, neg_ratio: flo
     class OnlineCropTrainer(DetectionTrainer):
         def build_dataset(self, img_path: str, mode: str = "train", batch=None):
             if mode != "train":
-                # val — без изменений, статичный сплит из --data yaml
-                # (тикет "патч v2", п.5: "Валидация без изменений").
+                # val — без изменений, статичный сплит из --data yaml.
                 return super().build_dataset(img_path, mode, batch)
             gs = max(int(unwrap_model(self.model).stride.max()), 32)
             return OnlineCropYOLODataset(
@@ -206,16 +205,16 @@ def main():
                      help="сохранять веса каждые N эпох (weights/epochN.pt); -1 = не сохранять")
     ap.add_argument("--copy-paste", type=float, default=0.0, help="ultralytics default 0.0")
     ap.add_argument("--patience", type=int, default=30,
-                     help="0 отключает раннюю остановку (тикет 'подготовка ночи', патч 6 — "
+                     help="0 отключает раннюю остановку ("
                           "фиксированные epochs, отбор чекпойнта по кривой оценки, не по best.pt)")
     ap.add_argument("--config-path", default=DEF_CONFIG_PATH,
                      help="какой config.py хешировать (записывается рядом с весами)")
     ap.add_argument("--baseline-run", default=None,
                      help="путь к run_dir другого прогона (с windowing_config.json) — если "
                           "задан, effective.epoch1_weight_hash сравнивается с его хешем "
-                          "автоматически (тикет 'патч v2', п.1: ловит 'параметр не применился')")
+                          "автоматически (ловит 'параметр не применился')")
     ap.add_argument("--online-crop", action="store_true",
-                     help="тикет 'патч v2', п.5 (вариант D): train-сплит кропится на лету из "
+                     help="вариант D: train-сплит кропится на лету из "
                           "офлайн-фильтрованных полнокадровых версий (online_variants.py), вместо "
                           "чтения статичной нарезки из --data. val — как обычно, из --data yaml")
     ap.add_argument("--online-frames-dir", default=None,
@@ -288,7 +287,7 @@ def main():
         # momentum=..)" в лог старта. Если читать trainer.optimizer уже
         # ПОСЛЕ model.train() (как было раньше), там окажется lr после
         # затухания по расписанию за все эпохи, а не стартовый — не то,
-        # чем "подтверждается в логе старта" (тикет "патч v2", п.1).
+        # чем "подтверждается в логе старта".
         if "start" not in epoch1_state:
             epoch1_state["start"] = describe_optimizer(trainer.optimizer)
             bad = effective_mismatches(epoch1_state["start"], args.optimizer, args.lr0)
@@ -338,8 +337,7 @@ def main():
     run_dir = str(model.trainer.save_dir)
 
     # Полные аргументы, реально применённые ultralytics, — уже лежат рядом
-    # в args.yaml; переносим их сюда же, чтобы не открывать два файла
-    # (тикет "подготовка ночи", патч 5).
+    # в args.yaml; переносим их сюда же, чтобы не открывать два файла.
     ultralytics_args = None
     args_yaml_path = os.path.join(run_dir, "args.yaml")
     if os.path.exists(args_yaml_path):

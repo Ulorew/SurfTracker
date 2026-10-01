@@ -2,7 +2,7 @@
 # Замер режимов ограничения убеждения полем зрения на ютубном материале.
 # База ("off") — уже снятый прогон yt_pass: он делался кодом БЕЗ ограничения.
 set -u
-cd /home/ulorew/Projects/SurfTracker
+cd "$(dirname "$0")/../.."
 PY=.venv/bin/python
 W=models/night_legacy_s3_best.pt
 FLAGS="--enable-a --filter-level 2 --enable-gate --score-form distance"

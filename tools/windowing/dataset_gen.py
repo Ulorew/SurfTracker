@@ -6,12 +6,12 @@
         [--horizon-overrides horizon.csv] [--seed N] [--augment]
 
 `--split-file` (CSV `stem,split`) и `--incomplete-frames-file` (список
-stem'ов, по одному на строку) — списки, которых пока нет ("списки будут
-позже", тикет). Параметры проведены через весь конвейер уже сейчас: без
+stem'ов, по одному на строку) — списки, которых пока нет (появятся
+позже). Параметры проведены через весь конвейер уже сейчас: без
 --split-file все окна идут в один сплит config.DEFAULT_SPLIT_NAME, без
 --incomplete-frames-file негативы генерируются на всех кадрах.
 
-`--incomplete-frames-file` относится ТОЛЬКО к негативам (тикет, п.4): такой
+`--incomplete-frames-file` относится ТОЛЬКО к негативам: такой
 кадр может содержать неразмеченный парус, значит область "без целей" на нём
 ненадёжна. Позитивы с уже размеченных боксов этого кадра по-прежнему валидны
 и генерируются как обычно.
@@ -58,8 +58,8 @@ def load_frame_boxes(json_path: str):
 
 
 def split_target_ignore(boxes: "list[IntBox]"):
-    """Боксы мельче config.MIN_TARGET_SIZE — ignore-зона, не цель (тикет
-    "подготовка ночи", патч 1): не позитивы, не подходящее место под
+    """Боксы мельче config.MIN_TARGET_SIZE — ignore-зона, не цель:
+    не позитивы, не подходящее место под
     негатив, не штрафуются как ложные при оценке."""
     targets = [b for b in boxes if target_size(b) >= config.MIN_TARGET_SIZE]
     ignore = [b for b in boxes if target_size(b) < config.MIN_TARGET_SIZE]
@@ -101,7 +101,7 @@ def clip_box_to_window(box_frame: IntBox, placement, window_size: int):
     """box_frame (координаты кадра) -> (cx,cy,w,h) нормированные в холсте окна.
 
     None, если после обрезки видимая часть меньше config.MIN_VISIBLE_BOX_PX
-    по любой оси — это уже неразличимая полоска, а не цель (тикет, п.3:
+    по любой оси — это уже неразличимая полоска, а не цель (правило:
     "возвращать координаты всех рамок, попавших в окно").
     """
     ib = placement.src_box
@@ -149,7 +149,7 @@ def stream_rng(seed: int, stem: str, stream: str) -> random.Random:
 # картинки. Раньше --augment применялся к любому сплиту без разбора; на
 # практике не выстрелило только потому, что все оконные датасеты состоят из
 # одного train, а val (dataset_v6) режется другим инструментом из целых
-# кадров. Тикет "ночь", п.1.4.
+# кадров.
 AUGMENTED_SPLITS = ("train",)
 
 
@@ -195,8 +195,8 @@ def process_frame(stem, jpg_path, json_path, out_dir, split, seed,
             for cx, cy, w, h in yolo_boxes:
                 f.write(f"0 {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
         # Метаданные вставки окна в исходный кадр — нужны eval_640.py, чтобы
-        # определить положение ложного срабатывания относительно горизонта
-        # (тикет, п.7): у самого окна после вырезки нет понятия "кадр".
+        # определить положение ложного срабатывания относительно горизонта:
+        # у самого окна после вырезки нет понятия "кадр".
         ib = placement.src_box
         meta = {
             "source_frame": stem,
@@ -231,7 +231,7 @@ def process_frame(stem, jpg_path, json_path, out_dir, split, seed,
     if generate_negatives:
         base = n_pos if n_pos > 0 else config.EMPTY_FRAME_NEGATIVE_COUNT
         neg_count = round(base * neg_ratio)
-        # и target, и ignore блокируют место под негатив (тикет, патч 1) —
+        # и target, и ignore блокируют место под негатив —
         # ignore-зона не подтверждённый фон, туда негатив ставить нельзя.
         neg_squares = sample_negatives(img_w, img_h, targets + ignore, neg_count, rng_neg,
                                        horizon_y=horizon_y)
@@ -275,7 +275,7 @@ def main():
               "boxes_total": 0, "boxes_zero_windows": 0, "windows_per_box_sum": 0,
               "ignore_boxes_total": 0}
 
-    # Отпечаток версии разметки (тикет "подготовка ночи", патч 5) — хеш
+    # Отпечаток версии разметки — хеш
     # содержимого всех json, реально вошедших в нарезку. Меняется, если хоть
     # один бокс поправили руками, даже если состав файлов тот же.
     labeling_hasher = hashlib.sha256()

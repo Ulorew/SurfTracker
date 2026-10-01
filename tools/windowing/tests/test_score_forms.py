@@ -1,4 +1,4 @@
-"""Формы счёта кандидата (тикет "счёт кандидата", п.4).
+"""Формы счёта кандидата.
 
 Проверяется, что каждая форма делает то, чем отличается от соседней:
   maha        — размер участвует в счёте наравне с положением, через
@@ -69,7 +69,7 @@ class TestSizeIsPartOfTheScore:
 
     def test_alpha_beta_branch_uses_log_size_term(self):
         """В ветке без ковариации размер входит слагаемым |log(s/s_pred)| —
-        так предписано тикетом. Проверяем, что оно там ЕСТЬ."""
+        так задано постановкой. Проверяем, что оно там ЕСТЬ."""
         from track_filters import AlphaBetaFilter
         f = AlphaBetaFilter(0.6, 0.3, cfg())
         f.seed(0.0, 0.0)
@@ -220,7 +220,7 @@ class TestDirectionTerm:
 class TestConfidenceIsNotUsed:
     @pytest.mark.parametrize("form", ALL_FORMS)
     def test_confidence_does_not_change_any_score(self, form):
-        """Прямое требование тикета: уверенность в счёт выбора НЕ входит ни в
+        """Прямое требование: уверенность в счёт выбора НЕ входит ни в
         одной форме (она только в порогах теневых)."""
         f = moving_filter()
         c = cfg(SCORE_FORM=form)

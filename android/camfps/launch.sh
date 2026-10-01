@@ -10,7 +10,8 @@
 #     30 секунд — если запись не растёт, падаем сразу, а не через 25 минут.
 set -eu
 . ~/Android/env.sh
-D=${DEV:-192.168.0.14:5555}
+# Адрес устройства adb обязателен: DEV=<ip:порт> ./launch.sh ...
+D=${DEV:?задайте DEV=<ip:порт> — адрес телефона для adb}
 C=com.surftracker.camfps
 COMBO=$1; SECONDS_RUN=$2; SEGBYTES=${3:-0}; HZ=${4:-3}
 F=/sdcard/Android/data/$C/files

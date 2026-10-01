@@ -59,7 +59,7 @@ static const int PIN_LED = 2;
 
 static const float POLE_PAIRS = 11;       // замерено, не из паспорта
 static const float V_SUPPLY   = 11.7f;     // аккумулятор через понизитель, 24.09
-static const float V_LIMIT    = 2.0f;     // правило владельца для долгой работы
+static const float V_LIMIT    = 2.0f;     // правило проекта для долгой работы
 static const float V_ALIGN    = 1.0f;
 
 // ЗНАК: +1 или -1. Применяется к команде И к углу телеметрии одновременно,

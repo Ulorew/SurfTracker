@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Оценка в режиме слежения — окно вокруг известной цели (тикет "переоценка
-в режиме слежения", дополнено тикетом "подготовка ночи").
+"""Оценка в режиме слежения — окно вокруг известной цели.
 
 Для каждой истинной рамки-цели строим Square: S = k*размер_цели (k
 фиксирован — середина рабочего диапазона), центр = центр истины + случайный
@@ -9,17 +8,17 @@
 обратно в пиксели ИСХОДНОГО кадра через ту же resolve_placement, что строила
 окно, — сравнение с истиной идёт в кадровых пикселях.
 
-Ignore-зона (config.MIN_TARGET_SIZE, "подготовка ночи" патч 1): боксы мельче
+Ignore-зона (config.MIN_TARGET_SIZE): боксы мельче
 порога — не цель для оценки (не считаются ни найденными, ни пропущенными),
 и детекция, совпавшая с ignore-боксом, не штрафуется как ложная.
 
-Патч 4 ("подготовка ночи"): каждый target-бокс оценивается
+Реализации: каждый target-бокс оценивается
 config.EVAL_REALIZATIONS_PER_BOX независимыми окнами (свой джиттер на
 каждое) — полнота усредняется по реализациям, конкретное смещение не влияет
 на сравнение прогонов. Разброс полноты между реализациями одного бокса
 логируется отдельно (чувствительность к промаху предсказания положения).
 
-Патч 3 ("подготовка ночи"): детекция идёт на низком conf (--low-conf), порог
+Выровненный порог: детекция идёт на низком conf (--low-conf), порог
 применяется потом, в памяти — так можно найти порог, дающий фиксированную
 частоту ложных на окно (config.EVAL_TARGET_FP_PER_WINDOW), и посчитать
 полноту при нём (основная метрика). Полнота при --fixed-conf (0.25, был
@@ -35,7 +34,7 @@ config.EVAL_REALIZATIONS_PER_BOX независимыми окнами (свой
         [--low-conf 0.01] [--fixed-conf 0.25]
         [--viz-dir DIR] [--viz-n 10] [--out report.json]
 
-Метрики отчёта (тикет "патч v2", п.2) — одна главная, остальные диагностика:
+Метрики отчёта — одна главная, остальные диагностика:
 
     completeness_aligned   ГЛАВНАЯ метрика решений: полнота по корзинам при
                             пороге, выровненном под aligned_fp_per_window
@@ -68,16 +67,16 @@ from eval_640 import bin_name, box_center, box_size, center_dist_ratio, iou, loa
 from geometry import Square, resolve_placement
 
 
-# Критерии сопоставления детекция<->истина. Главный — радиальный (тикет
-# "камерное зрение": задача наведение, а не обводка). IoU остаётся колонкой
+# Критерии сопоставления детекция<->истина. Главный — радиальный
+# (задача — наведение, а не обводка). IoU остаётся колонкой
 # LEGACY по §5 регламента, радиусы 0.4/0.6 — проверка чувствительности:
 # если порядок рецептов зависит от радиуса в этом диапазоне, значит и
 # радиальный критерий их не разрешает.
 #
 # ВНИМАНИЕ, расхождение с трекером: track_eval использует
-# GT_HIT_RADIAL_FRAC = 0.6, а здесь тикетом задано 0.5. По ФОРМЕ критерии
-# совпали, по КОНСТАНТЕ — нет. Оставлено как есть (тикет явный), 0.6 всё
-# равно считается соседней колонкой; сведение констант — решение владельца.
+# GT_HIT_RADIAL_FRAC = 0.6, а здесь задано 0.5. По ФОРМЕ критерии
+# совпали, по КОНСТАНТЕ — нет. Оставлено как есть (0.5 задано явно), 0.6 всё
+# равно считается соседней колонкой; сведение констант — отдельное решение.
 MAIN_CRITERION = f"radial_{config.EVAL_CENTER_HIT_THRESHOLD:g}"
 LEGACY_CRITERION = f"iou_{config.EVAL_IOU_MATCH_THR:g}"
 CRITERIA = {MAIN_CRITERION: ("radial", config.EVAL_CENTER_HIT_THRESHOLD),
@@ -311,7 +310,7 @@ def evaluate_track(weights, images_dir, labels_dir, k=3.5, jitter_frac=0.15, see
 
             box_counter += 1
 
-    # --- патч 4: полнота на бокс = доля реализаций-хитов (при fixed_conf) ---
+    # --- полнота на бокс = доля реализаций-хитов (при fixed_conf) ---
     per_box_rate = {k: (sum(v) / len(v) if v else 0.0) for k, v in per_box_hits_fixed.items()}
     jitter_spread = statistics.pstdev(per_box_rate.values()) if per_box_rate else float("nan")
     n_partial_boxes = sum(1 for v in per_box_rate.values() if 0 < v < 1)
@@ -380,7 +379,7 @@ def evaluate_track(weights, images_dir, labels_dir, k=3.5, jitter_frac=0.15, see
     # близкий центр); отдельная точная метрика center_ratio считается ниже
     # по первой реализации каждого бокса для медианного IoU/размера.
 
-    # --- медианная уверенность на найденной цели, по корзинам (патч 3.3) ---
+    # --- медианная уверенность на найденной цели, по корзинам ---
     conf_by_bin = {}
     for t in trials:
         mc = t["by"][MAIN_CRITERION]["match_conf"]
@@ -389,7 +388,7 @@ def evaluate_track(weights, images_dir, labels_dir, k=3.5, jitter_frac=0.15, see
     conf_median = {b: statistics.median(v) for b, v in conf_by_bin.items()}
 
     # --- вывод: главная метрика (completeness_aligned) первой колонкой,
-    # остальное — диагностика (тикет "патч v2", п.2) ---
+    # остальное — диагностика ---
     print(f"{'корзина':>10} {'ПОЛНОТА@aligned':>16} {'compl@fixed_conf':>17} {'conf_median':>12}")
     for lo, hi in config.EVAL_SIZE_BINS_PX:
         b = f"{lo}-{int(hi)}" if hi != float("inf") else f"{lo}+"
@@ -447,7 +446,7 @@ def evaluate_track(weights, images_dir, labels_dir, k=3.5, jitter_frac=0.15, see
         "aligned_threshold_LEGACY_iou": per_criterion[LEGACY_CRITERION]["aligned_threshold"],
         # --- чувствительность к радиусу: все критерии целиком ---
         "by_criterion": per_criterion,
-        # --- диагностика (переименовано, тикет "патч v2", п.2) ---
+        # --- диагностика (переименовано) ---
         "fixed_conf": fixed_conf,
         "fp_at_fixed_conf": fp_at_fixed_conf,
         "completeness_at_fixed_conf": {b: {"found": f_, "total": t} for b, (f_, t) in completeness_fixed.items()},

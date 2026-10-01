@@ -29,7 +29,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.tensorflow.lite.Interpreter;
 
 /**
- * Практический прогон комбинации потоков (тикет "телефон", п.4б и 4в).
+ * Практический прогон комбинации потоков.
  *
  * isSessionConfigurationSupported говорит "поддержано" — это ЗАЯВЛЕНИЕ. Здесь
  * меряется фактическое: сколько кадров в секунду реально отдаёт каждый поток
@@ -118,7 +118,7 @@ public class MainActivity extends Activity {
      * координат на два).
      */
     /**
-     * Профилирование пути кропа по стадиям (тикет "ночь", блок 1.1).
+     * Профилирование пути кропа по стадиям.
      *
      * Вложенные таймеры вокруг участков в наносекунды исказили бы сами
      * участки, поэтому стадии разделяются ВАРИАНТАМИ: A — только чтение
@@ -135,7 +135,7 @@ public class MainActivity extends Activity {
         long t0 = System.nanoTime();
         cropArrivedNs.set(t0);
         // Сам перевод — в Yuv.convert, ОДНОЙ реализацией со стендом сверки
-        // (тикет "камерное зрение"): скопированный "такой же" цикл разъехался
+        // камерного зрения: скопированный "такой же" цикл разъехался
         // бы на первой правке, и доказательство зрения перестало бы
         // относиться к боевому пути.
         sink += Yuv.crop(im, cropOut, cropX, cropY, cropSide, 640, cropStage);
@@ -233,7 +233,7 @@ public class MainActivity extends Activity {
             // Параметры записи — из ПРОФИЛЯ УСТРОЙСТВА, а не назначенные руками.
             // Руками заданные 3840x2160 @ 40 Мбит/с давали ошибку дорожки
             // (-1011) на девятой секунде и вешали весь конвейер: производитель
-            // знает про свой кодировщик больше, чем я.
+            // знает про свой кодировщик больше, чем мы.
             android.media.CamcorderProfile prof =
                     android.media.CamcorderProfile.hasProfile(0, android.media.CamcorderProfile.QUALITY_2160P)
                     ? android.media.CamcorderProfile.get(0, android.media.CamcorderProfile.QUALITY_2160P)
@@ -281,7 +281,7 @@ public class MainActivity extends Activity {
             targets.add(recSurf);
 
             // Контроль: тот же прогон без YUV или с YUV поменьше. Без него
-            // нельзя отличить "устройство не тянет комбинацию" от "мой код
+            // нельзя отличить "устройство не тянет комбинацию" от "наш код
             // затыкает конвейер", а это разные выводы.
             String yuvMode = getIntent().getStringExtra("yuv");
             if (yuvMode == null) yuvMode = "max";

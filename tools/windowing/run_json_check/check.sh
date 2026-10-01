@@ -4,8 +4,8 @@ set -e
 cd "$(dirname "$0")"
 D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
 SRC=../../../android/camfps/src
-JAVAC=$(command -v javac || echo /home/ulorew/Android/jdk/bin/javac)
-JAVA=$(command -v java || echo /home/ulorew/Android/jdk/bin/java)
+JAVAC=$(command -v javac || echo "$HOME"/Android/jdk/bin/javac)
+JAVA=$(command -v java || echo "$HOME"/Android/jdk/bin/java)
 # Сначала — РАЗЛИЧАЮЩАЯ СИЛА. Три порчи разбора, каждая обязана быть поймана.
 # Стенд, который не ловит подмену, объявил бы исправность и при настоящей
 # поломке; в этом проекте так уже случалось не раз.

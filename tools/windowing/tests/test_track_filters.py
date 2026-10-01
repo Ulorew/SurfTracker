@@ -1,4 +1,4 @@
-"""track_filters.py — тикет "трекинг", п.3, уровни 0 и 1."""
+"""track_filters.py — уровни 0 и 1."""
 import pytest
 
 from track_filters import AlphaBetaFilter, Level0Filter, dist, make_filter

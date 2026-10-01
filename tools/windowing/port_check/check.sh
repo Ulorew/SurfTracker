@@ -13,8 +13,8 @@ cd "$(dirname "$0")"
 D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
 SRC=../../../android/camfps/src
 PY=$(cd ../../.. && pwd)/.venv/bin/python
-JAVAC=$(command -v javac || echo /home/ulorew/Android/jdk/bin/javac)
-JAVA=$(command -v java || echo /home/ulorew/Android/jdk/bin/java)
+JAVAC=$(command -v javac || echo "$HOME"/Android/jdk/bin/javac)
+JAVA=$(command -v java || echo "$HOME"/Android/jdk/bin/java)
 A=$SRC/com/surftracker/camfps
 
 echo "== сборка =="

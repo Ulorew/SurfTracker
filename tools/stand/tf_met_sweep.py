@@ -25,7 +25,7 @@ from jerk_metric import jitter
 PORT = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0"
 ORDER_LO, ORDER_HI = 5.0, 300.0
 
-# Объявлено ДО прогона. Владелец назвал рабочие точки: 0.25 об/с дома,
+# Объявлено ДО прогона. Рабочие точки: 0.25 об/с дома,
 # 0.1 об/с в проде -> 1.571 и 0.628 рад/с.
 ПРЕДСКАЗАНИЯ = """
   правило SimpleFOC (срез = 5x частота вала):  Tf = 0.127 дома, 0.318 в проде

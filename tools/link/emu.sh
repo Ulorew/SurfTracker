@@ -10,7 +10,7 @@
 # камеры и падает. Этого хватает для проверки экранов, настроек и записи
 # прогон.json, но НЕ для проверки слежения — оно проверяется на телефоне.
 set -eu
-export ANDROID_HOME=${ANDROID_HOME:-/home/ulorew/Android/sdk}
+export ANDROID_HOME=${ANDROID_HOME:-$HOME/Android/sdk}
 AVD=${AVD:-surf}
 PORT=${PORT:-5560}
 case "${1:-старт}" in

@@ -1,6 +1,6 @@
 {
   "источник": {
-    "файл": "/home/ulorew/Projects/SurfTracker/models/yolo11n.pt",
+    "файл": "models/yolo11n.pt",
     "sha256": "0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1",
     "рецепт": "AdamW lr0=0.0003, size-bins-floor=20, онлайн-кроп, yolo11n",
     "оговорка": "лучший сид из восьми; выбор максимума по восьми — отбор на шуме, а не измеренное превосходство рецепта"
@@ -20,7 +20,7 @@
   },
   "сборки": {
     "fp32": {
-      "файл": "/home/ulorew/Projects/SurfTracker/export/models_person/surf_fp32.tflite",
+      "файл": "export/models_person/surf_fp32.tflite",
       "sha256": "cd8644db578fc64da709bf08ed830d09e33df15a8a0c5c6c8d7b53ab6eb458d4",
       "байт": 10763699,
       "аргументы": {
@@ -31,7 +31,7 @@
       "секунд": 9.7
     },
     "w8a32": {
-      "файл": "/home/ulorew/Projects/SurfTracker/export/models_person/surf_w8a32.tflite",
+      "файл": "export/models_person/surf_w8a32.tflite",
       "sha256": "ad894462cf722df87bee318da18d674adb2f2acf8da67f0bbb5c70bcc4c7defe",
       "байт": 3039349,
       "аргументы": {

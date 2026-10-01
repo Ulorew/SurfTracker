@@ -1,4 +1,4 @@
-"""Граница "петля в углах <-> кадр в пикселях" (тикет "ночь", п.2.0).
+"""Граница "петля в углах <-> кадр в пикселях".
 
 Сам перевод проверяет test_angles.py, геометрию петли — test_track_logic.py.
 Здесь проверяется ровно стык: track_run переводит детекции в углы на входе,
@@ -146,7 +146,7 @@ class TestNoPixelsLeakIntoTheLoop:
         assert dets[r.chosen[5]] == dets[1], "выбран не ближайший к предсказанию"
 
     def test_state_is_stored_in_radians_not_pixels(self):
-        """Прямая проверка утверждения тикета: внутреннее состояние — углы."""
+        """Прямая проверка основного утверждения: внутреннее состояние — углы."""
         ts = make_state(960, 540, 100)
         assert abs(ts.filter.cx) < math.pi
         assert ts.filtered_size == pytest.approx(ang.px_size_to_angle(100, INTR))

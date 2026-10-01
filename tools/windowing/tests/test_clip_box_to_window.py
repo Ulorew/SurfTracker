@@ -124,7 +124,7 @@ class TestClipping:
 class TestBoxOutsideStaysOutside:
     def test_neighbour_target_in_the_same_window_is_included(self):
         """В окно попадают ВСЕ рамки, а не только та, вокруг которой оно
-        построено (тикет п.3) — иначе соседний сёрфер оказывается
+        построено — иначе соседний сёрфер оказывается
         неразмеченным позитивом, то есть учит модель его не видеть."""
         pl = place(960, 540, 640)
         neighbour = box(1100, 600, 60)

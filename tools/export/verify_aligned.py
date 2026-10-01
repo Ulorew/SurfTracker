@@ -2,7 +2,7 @@
 """Полнота экспорта ШТАТНОЙ метрикой проекта (eval_track), а не упрощённой.
 
 Зачем отдельный файл. В verify_laptop.py полнота считается при ФИКСИРОВАННОМ
-пороге conf=0.25. Тикет требует "полнота той же оценкой", а штатная оценка
+пороге conf=0.25. Требование — "полнота той же оценкой", а штатная оценка
 проекта — eval_track.completeness_aligned — устроена иначе:
 
   - порог подбирается ПОД КАЖДУЮ МОДЕЛЬ так, чтобы ложных срабатываний было
@@ -184,7 +184,7 @@ def main():
             if label in report:
                 v = frac(report[label]["completeness_aligned"])
                 print(f"  {label:6s} {v:.4f}  падение {base - v:+.4f}  "
-                      f"(допуск тикета 0.01)")
+                      f"(допуск 0.01)")
 
     if args.out:
         json.dump(report, open(args.out, "w"), indent=2, ensure_ascii=False)

@@ -1,10 +1,10 @@
 #!/bin/bash
-# Пункт 1 тикета целиком: установка, заливка пакета, прогон, сверка.
+# Сверка целиком: установка, заливка пакета, прогон, сверка.
 # Ничего интерактивного — только числа в файлы.
 set -eu
 . ~/Android/env.sh
 PKG=com.surftracker.verify
-REPO=/home/ulorew/Projects/SurfTracker
+REPO=$(cd "$(dirname "$0")/../.." && pwd)
 PACK=$REPO/export/phone_pack
 DEV=/sdcard/Android/data/$PKG/files
 THREADS=${1:-1}
