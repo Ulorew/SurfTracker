@@ -23,7 +23,7 @@ models/phone/
 *.pyc
 __pycache__/
 .pytest_cache/
-reports/v1_viz/
+docs/journal/v1_viz/
 runs/
 tools/stand/out/
 tools/windowing/output/
@@ -50,3 +50,25 @@ stm/*/build/
 # Каталоги сборки ESP32: 42-47 МБ на скетч, 222 МБ суммарно.
 # Без этой строки репозиторий распухнет необратимо.
 esp/*/build/
+
+# --- 1 октября 2026, подготовка к публикации ---
+# Сборки Android: только исходники и build.sh. APK, dex, .class и чужие .so
+# (LiteRT) собираются локально; 82 версии APK раздули историю до ~1 ГиБ.
+android/*/build/
+android/vibelog/build_shell/
+android/vibelog/data/
+# Выводы прогонов и замеров — на диске, не в git.
+output/
+runs/
+calib/
+tools/link/*.json
+tools/link/*.csv
+# Генерируется в nms_check/check.sh из gen_cases.py.
+tools/windowing/nms_check/cases.txt
+# Старые данные с чужими датасетами (лица, кадры с YouTube). Прежде было
+# закрыто только в .git/info/exclude — правило локальное и в клон не
+# переносится. Здесь — для всех.
+/old/
+/Data/
+/Datasets/
+/models/

@@ -11,7 +11,7 @@
 #     ST-LINK у ESP32 нет. Порт ищется по by-id, а не по /dev/ttyUSB0:
 #     номер уезжает при каждом перетыкании, и залить можно не туда.
 #
-#  2. --libraries ../stm/libraries. Заголовок протокола ОДИН на обе прошивки
+#  2. --libraries ../lib. Заголовок протокола ОДИН на обе прошивки
 #     (см. шапку bt_link.ino); копия здесь однажды разошлась бы по CRC.
 #
 #  3. Заливка на ESP32 ПЕРЕЗАПИСЫВАЕТ мост bt_link, а вместе с ним канал
@@ -74,7 +74,7 @@ OUT="$SKETCH/build"
 rm -rf "$OUT"
 # --input-dir при заливке обязателен по той же причине, что и в stm/build.sh:
 # без него upload берёт бинарь из кэша, возможно от прошлой сборки.
-"$CLI" compile -b "$FQBN" --libraries "$ROOT/stm/libraries" \
+"$CLI" compile -b "$FQBN" --libraries "$ROOT/lib" \
        --output-dir "$OUT" "$SKETCH" 2>&1 \
     | grep -vE "^$|pragma message|note:|\^" | tail -6
 BIN="$OUT/$(basename "$SKETCH").ino.bin"

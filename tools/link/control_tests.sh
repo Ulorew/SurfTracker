@@ -6,7 +6,7 @@
 # коде, и на сломанном, различающей силы не имеет и ничего не проверяет.
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-INC="$ROOT/stm/libraries/SurfProtoV2/src"
+INC="$ROOT/lib/SurfProtoV2/src"
 SRC="$ROOT/tools/link/control_tests.cpp"
 OUT=$(mktemp -d); trap 'rm -rf "$OUT"' EXIT
 
