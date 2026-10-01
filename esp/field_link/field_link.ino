@@ -324,6 +324,14 @@ static void handle(const char* s) {
     test_on = true; test_until = millis() + t; test_next = 0;
     rec_on = true; rec_n = 0; rec_next_us = micros(); rec_t0_ms = millis();
     Serial.printf("# ТЕСТ v=%.3f t=%lu\n", test_v, (unsigned long)t);
+  } else if (!strncmp(s, "REC", 3)) {
+    // Запись угла ВО ВРЕМЯ БОЕВОГО ПРОГОНА с телефона: энкодер как свидетель,
+    // не видящий ни сцены, ни камеры. Выгрузка — по окончании, как у TEST.
+    uint32_t t = (uint32_t)arg(s, "t", 20000.0f);
+    if (t > 29000) t = 29000;
+    rec_on = true; rec_n = 0; rec_next_us = micros(); rec_t0_ms = millis();
+    rec_stop_ms = millis() + t;
+    Serial.printf("# REC t=%lu\n", (unsigned long)t);
   } else if (!strncmp(s, "SET", 3)) {
     motor.PID_velocity.P  = arg(s, "P", motor.PID_velocity.P);
     motor.PID_velocity.I  = arg(s, "I", motor.PID_velocity.I);
